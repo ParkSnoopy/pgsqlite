@@ -1257,7 +1257,6 @@ name = "pgsqlite"
 version = "0.0.22"
 dependencies = [
  "anyhow",
- "arbitrary",
  "async-trait",
  "bitflags",
  "byteorder",
@@ -1265,7 +1264,6 @@ dependencies = [
  "chrono",
  "clap",
  "config",
- "criterion",
  "env_logger",
  "futures",
  "hex",
@@ -1277,7 +1275,6 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "postgres-protocol",
- "pretty_assertions",
  "prometheus",
  "rand 0.9.2",
  "rcgen",
@@ -1295,6 +1292,35 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "pgsqlite-tests"
+version = "0.0.22"
+dependencies = [
+ "arbitrary",
+ "bytes",
+ "chrono",
+ "clap",
+ "criterion",
+ "env_logger",
+ "futures",
+ "hex",
+ "itoa",
+ "pgsqlite",
+ "pretty_assertions",
+ "rand 0.9.2",
+ "rusqlite",
+ "rust_decimal",
+ "serde_json",
+ "sqlparser",
+ "tempfile",
+ "tokio",
+ "tokio-postgres",
  "tokio-util",
  "tracing",
  "tracing-subscriber",

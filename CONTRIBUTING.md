@@ -101,7 +101,7 @@ Follow this complete checklist to ensure code quality:
 - [ ] Run `cargo fmt` - code is formatted
 - [ ] Update documentation if needed
 - [ ] Add tests for new functionality
-- [ ] Update TODO.md if applicable (mark completed tasks, add new discoveries)
+- [ ] Update [the backlog](docs/backlog.md) if applicable (mark completed tasks, add new discoveries)
 
 **Pre-commit checklist**: Run ALL of these before committing:
 1. `cargo check` - No errors or warnings
@@ -124,11 +124,11 @@ Follow this complete checklist to ensure code quality:
 - `perf: Optimize query cache lookup`
 - `docs: Update SSL configuration guide`
 
-## Working with TODO.md
+## Working with the backlog
 
 When working on pgsqlite:
 
-1. Check `TODO.md` for planned work
+1. Check [the backlog](docs/backlog.md) for planned work
 2. Mark items as `[x]` when completed
 3. Add new items discovered during development
 4. Document partial progress with notes

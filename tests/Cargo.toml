@@ -1,0 +1,168 @@
+[package]
+name              = "pgsqlite-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish           = false
+
+[dependencies]
+pgsqlite           = { path = ".." }
+bytes              = "1.9.0"
+chrono             = "0.4.39"
+clap               = { version = "4.5.25", features = ["derive", "env"] }
+env_logger         = "0.11.5"
+futures            = "0.3"
+hex                = "0.4"
+itoa               = "1.0"
+rand               = "0.9"
+rusqlite           = { version = "0.36.0", features = ["bundled", "uuid", "serde_json", "functions", "collation", "vtab", "column_decltype"] }
+rust_decimal       = { version = "1.35.0", features = ["serde", "db-postgres"] }
+serde_json         = "1.0.134"
+sqlparser          = { version = "0.57.0", features = ["serde", "visitor"] }
+tempfile           = "3.14.0"
+tokio              = { version = "1.46", features = ["full"] }
+tokio-postgres     = { version = "0.7.12", features = ["with-chrono-0_4", "with-serde_json-1"] }
+tokio-util         = { version = "0.7.15", features = ["codec"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid               = { version = "1.11.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+criterion         = "0.6"
+pretty_assertions = "1.4"
+arbitrary         = "1.3"
+
+[[bench]]
+name    = "simple_query_bench"
+path    = "performance/rust/simple_query_bench.rs"
+harness = false
+
+[[bin]]
+name = "benchmark_pooling"
+path = "performance/rust/benchmark_pooling.rs"
+
+[[bin]]
+name = "rusqlite_test"
+path = "performance/rust/rusqlite_test.rs"
+
+[[test]]
+name = "arithmetic_aliasing_test"
+path = "integration/arithmetic/arithmetic_aliasing_test.rs"
+[[test]]
+name = "arithmetic_complex_test"
+path = "integration/arithmetic/arithmetic_complex_test.rs"
+[[test]]
+name = "arithmetic_edge_cases_test"
+path = "integration/arithmetic/arithmetic_edge_cases_test.rs"
+[[test]]
+name = "arithmetic_null_test"
+path = "integration/arithmetic/arithmetic_null_test.rs"
+[[test]]
+name = "arithmetic_subquery_test"
+path = "integration/arithmetic/arithmetic_subquery_test.rs"
+[[test]]
+name = "json_agg_test"
+path = "integration/json/json_agg_test.rs"
+[[test]]
+name = "jsonb_delete_test"
+path = "integration/json/jsonb_delete_test.rs"
+[[test]]
+name = "jsonb_insert_test"
+path = "integration/json/jsonb_insert_test.rs"
+[[test]]
+name = "jsonb_pretty_test"
+path = "integration/json/jsonb_pretty_test.rs"
+[[test]]
+name = "json_each_test"
+path = "integration/json/json_each_test.rs"
+[[test]]
+name = "json_each_text_test"
+path = "integration/json/json_each_text_test.rs"
+[[test]]
+name = "json_existence_operators_test"
+path = "integration/json/json_existence_operators_test.rs"
+[[test]]
+name = "json_object_agg_test"
+path = "integration/json/json_object_agg_test.rs"
+[[test]]
+name = "json_operator_test"
+path = "integration/json/json_operator_test.rs"
+[[test]]
+name = "json_test"
+path = "integration/json/json_test.rs"
+[[test]]
+name = "protocol_fuzzing_test"
+path = "integration/protocol/protocol_fuzzing_test.rs"
+[[test]]
+name = "protocol_test"
+path = "integration/protocol/protocol_test.rs"
+
+[[test]]
+name = "benchmark_baseline"
+path = "performance/rust/benchmark_baseline.rs"
+[[test]]
+name = "benchmark_batch_insert"
+path = "performance/rust/benchmark_batch_insert.rs"
+[[test]]
+name = "benchmark_batch_operations"
+path = "performance/rust/benchmark_batch_operations.rs"
+[[test]]
+name = "benchmark_cache_effectiveness"
+path = "performance/rust/benchmark_cache_effectiveness.rs"
+[[test]]
+name = "benchmark_concurrent"
+path = "performance/rust/benchmark_concurrent.rs"
+[[test]]
+name = "benchmark_concurrent_simple"
+path = "performance/rust/benchmark_concurrent_simple.rs"
+[[test]]
+name = "benchmark_extended_protocol"
+path = "performance/rust/benchmark_extended_protocol.rs"
+[[test]]
+name = "benchmark_fast_path"
+path = "performance/rust/benchmark_fast_path.rs"
+[[test]]
+name = "benchmark_pooling_comparison"
+path = "performance/rust/benchmark_pooling_comparison.rs"
+[[test]]
+name = "benchmark_pooling_enabled"
+path = "performance/rust/benchmark_pooling_enabled.rs"
+[[test]]
+name = "benchmark_pooling_simple"
+path = "performance/rust/benchmark_pooling_simple.rs"
+[[test]]
+name = "benchmark_portal_direct"
+path = "performance/rust/benchmark_portal_direct.rs"
+[[test]]
+name = "benchmark_portal_management"
+path = "performance/rust/benchmark_portal_management.rs"
+[[test]]
+name = "benchmark_portal_realistic"
+path = "performance/rust/benchmark_portal_realistic.rs"
+[[test]]
+name = "benchmark_portal_simple"
+path = "performance/rust/benchmark_portal_simple.rs"
+[[test]]
+name = "benchmark_profiling"
+path = "performance/rust/benchmark_profiling.rs"
+[[test]]
+name = "benchmark_protocol_serialization"
+path = "performance/rust/benchmark_protocol_serialization.rs"
+[[test]]
+name = "benchmark_select_detailed"
+path = "performance/rust/benchmark_select_detailed.rs"
+[[test]]
+name = "benchmark_select_simple"
+path = "performance/rust/benchmark_select_simple.rs"
+[[test]]
+name = "insert_detailed_analysis"
+path = "performance/rust/insert_detailed_analysis.rs"
+[[test]]
+name = "insert_performance_benchmark"
+path = "performance/rust/insert_performance_benchmark.rs"
+[[test]]
+name = "profile_protocol_overhead"
+path = "performance/rust/profile_protocol_overhead.rs"
+[[test]]
+name = "protocol_overhead_analysis"
+path = "performance/rust/protocol_overhead_analysis.rs"

@@ -13,8 +13,8 @@ __pycache__/
 *.egg-info/
 
 # Benchmarks
-benchmarks/.venv/
-benchmarks/bench.log
+tests/performance/python/.venv/
+tests/performance/python/bench.log
 
 sqlite.db*
 

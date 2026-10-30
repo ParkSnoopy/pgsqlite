@@ -113,11 +113,11 @@ jobs:
 
       - name: Build (cargo)
         if: matrix.use_cross == false
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build -p pgsqlite --release --target "${{ matrix.target }}"
 
       - name: Build (cross)
         if: matrix.use_cross == true
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build -p pgsqlite --release --target "${{ matrix.target }}"
 
       - name: Strip binary (Unix)
         if: matrix.os != 'windows-latest'

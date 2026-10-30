@@ -54,7 +54,7 @@ When modifying pgsqlite's internal tables, you must create a migration:
 
 1. Add to `src/migration/registry.rs`
 2. Define migration with up/down SQL
-3. Update CLAUDE.md with new migration info
+3. Update the migration documentation
 4. Test with both new and existing databases
 
-See the [development guide](../CLAUDE.md) for detailed instructions.
+See the [development guide](development.md) for detailed instructions.
