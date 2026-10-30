@@ -31,10 +31,10 @@ bytes              = "1.12"
 postgres-protocol  = "0.6"
 
 # SQLite
-rusqlite           = { version = "0.36", features = ["bundled", "uuid", "serde_json", "functions", "collation", "vtab", "column_decltype"] }
+rusqlite           = { version = "0.41", features = ["bundled", "uuid", "serde_json", "functions", "collation", "vtab", "column_decltype"] }
 
 # SQL parsing
-sqlparser          = { version = "0.57", features = ["serde", "visitor"] }
+sqlparser          = { version = "0.63", features = ["serde", "visitor"] }
 
 # Types
 uuid               = { version = "1.29", features = ["v4", "serde"] }
@@ -54,16 +54,16 @@ anyhow             = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait        = "0.1"
-rand               = "0.9"
+rand               = "0.10"
 futures            = "0.3"
 hex                = "0.4"
 regex              = "1.13"
 byteorder          = "1.5"
-parking_lot        = "0.12"
+parking_lot        = "0.13"
 memchr             = "2.8"
 itoa               = "1.0"
 bitflags           = "2.13"
-lru                = "0.18"
+lru                = "0.19"
 
 # Memory mapping for zero-copy operations
 memmap2            = "0.9"
@@ -75,7 +75,7 @@ clap               = { version = "4", features = ["derive", "env"] }
 lazy_static        = "1"
 
 # Cryptography for migration checksums
-sha2               = "0.10"
+sha2               = "0.11"
 
 # Metrics
 prometheus         = "0.14"
@@ -84,7 +84,7 @@ prometheus         = "0.14"
 tokio-rustls       = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 rustls             = { version = "0.23", default-features = false, features = ["logging", "tls12", "ring"] }
 rustls-pki-types   = { version = "1.15", features = ["std"] }
-rcgen              = "0.13"
+rcgen              = "0.14"
 
 # ============================================
 # RUST-MAGIC-LINTER (maximum preset)
