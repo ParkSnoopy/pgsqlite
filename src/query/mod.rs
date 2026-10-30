@@ -27,7 +27,7 @@ pub use fast_path::{
     clear_decimal_cache, FastPathQuery, FastPathOperation, WhereClause
 };
 pub use query_type_detection::{QueryTypeDetector, QueryType};
-pub use comment_stripper::strip_sql_comments;
+pub use comment_stripper::{strip_sql_comments, split_sql_statements};
 pub use lazy_processor::LazyQueryProcessor;
 pub use set_handler::SetHandler;
 pub use query_processor::process_query;

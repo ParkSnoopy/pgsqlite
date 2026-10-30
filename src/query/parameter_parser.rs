@@ -177,6 +177,78 @@ impl ParameterParser {
         Ok(result)
     }
     
+    /// Convert PostgreSQL-style $1, $2 parameter placeholders to SQLite-style ?1, ?2,
+    /// properly preserving string literals and double-quoted identifiers.
+    pub fn convert_dollar_to_numbered_params(sql: &str) -> String {
+        let mut result = String::with_capacity(sql.len());
+        let mut chars = sql.char_indices().peekable();
+        
+        while let Some((_i, ch)) = chars.next() {
+            match ch {
+                '\'' => {
+                    result.push(ch);
+                    while let Some((_, inner_ch)) = chars.next() {
+                        result.push(inner_ch);
+                        if inner_ch == '\'' {
+                            if let Some((_, next_ch)) = chars.peek()
+                                && *next_ch == '\'' {
+                                    result.push(chars.next().unwrap().1);
+                                    continue;
+                                }
+                            break;
+                        }
+                    }
+                }
+                '"' => {
+                    result.push(ch);
+                    while let Some((_, inner_ch)) = chars.next() {
+                        result.push(inner_ch);
+                        if inner_ch == '"' {
+                            if let Some((_, next_ch)) = chars.peek()
+                                && *next_ch == '"' {
+                                    result.push(chars.next().unwrap().1);
+                                    continue;
+                                }
+                            break;
+                        }
+                    }
+                }
+                '$' => {
+                    let mut param_num = String::new();
+                    let mut collected_chars = Vec::new();
+                    
+                    while let Some((_, next_ch)) = chars.peek() {
+                        if next_ch.is_ascii_digit() {
+                            collected_chars.push(*next_ch);
+                            param_num.push(*next_ch);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    if !param_num.is_empty()
+                        && let Ok(param_number) = param_num.parse::<usize>()
+                            && param_number > 0 {
+                                result.push('?');
+                                result.push_str(&param_num);
+                                continue;
+                            }
+                    
+                    result.push('$');
+                    for collected_char in collected_chars {
+                        result.push(collected_char);
+                    }
+                }
+                _ => {
+                    result.push(ch);
+                }
+            }
+        }
+        
+        result
+    }
+    
     /// Find all Python-style parameter placeholders (%(name)s) in a SQL query, ignoring them inside string literals
     pub fn find_python_parameters(sql: &str) -> Vec<String> {
         let mut parameters = HashSet::new();
@@ -548,5 +620,12 @@ mod tests {
         // Parameters in string literals should be ignored
         assert_eq!(ParameterParser::count_python_parameters("SELECT 'test %(param)s' FROM users"), 0);
         assert_eq!(ParameterParser::count_python_parameters("SELECT 'test %(param)s' FROM users WHERE id = %(real_param)s"), 1);
+    }
+
+    #[test]
+    fn test_convert_dollar_to_numbered_params() {
+        let sql = "SELECT $3, $4, $5, '$1 literal', \"$2 identifier\" WHERE id = $1 AND val = $2";
+        let converted = ParameterParser::convert_dollar_to_numbered_params(sql);
+        assert_eq!(converted, "SELECT ?3, ?4, ?5, '$1 literal', \"$2 identifier\" WHERE id = ?1 AND val = ?2");
     }
 }

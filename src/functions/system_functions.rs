@@ -1,6 +1,18 @@
 use rusqlite::{Connection, Result, functions::FunctionFlags};
 use tracing::debug;
 
+thread_local! {
+    static CONFLICT_FLAG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn mark_conflict_flag() {
+    CONFLICT_FLAG.with(|c| c.set(true));
+}
+
+pub fn reset_conflict_flag() -> bool {
+    CONFLICT_FLAG.with(|c| c.replace(false))
+}
+
 /// Register PostgreSQL system information functions
 pub fn register_system_functions(conn: &Connection) -> Result<()> {
     debug!("Registering system functions");
@@ -460,6 +472,408 @@ pub fn register_system_functions(conn: &Connection) -> Result<()> {
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |_ctx| {
             Ok(Option::<String>::None)
+        },
+    )?;
+
+    // Advisory lock functions for PostgreSQL compatibility
+    conn.create_scalar_function(
+        "pg_advisory_lock",
+        1,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let key = ctx.get::<i64>(0)?;
+            let session_id = crate::session::get_current_session().unwrap_or(uuid::Uuid::nil());
+            crate::session::ADVISORY_LOCK_MANAGER.lock(session_id, key, false);
+            Ok(Option::<i32>::None)
+        },
+    )?;
+    conn.create_scalar_function(
+        "pg_advisory_lock",
+        2,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let k1 = ctx.get::<i32>(0)?;
+            let k2 = ctx.get::<i32>(1)?;
+            let key = ((k1 as i64) << 32) | ((k2 as u32) as i64);
+            let session_id = crate::session::get_current_session().unwrap_or(uuid::Uuid::nil());
+            crate::session::ADVISORY_LOCK_MANAGER.lock(session_id, key, false);
+            Ok(Option::<i32>::None)
+        },
+    )?;
+    conn.create_scalar_function(
+        "pg_advisory_unlock",
+        1,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let key = ctx.get::<i64>(0)?;
+            let session_id = crate::session::get_current_session().unwrap_or(uuid::Uuid::nil());
+            let ok = crate::session::ADVISORY_LOCK_MANAGER.unlock(session_id, key);
+            Ok(if ok { 1i32 } else { 0i32 })
+        },
+    )?;
+    conn.create_scalar_function(
+        "pg_advisory_unlock",
+        2,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let k1 = ctx.get::<i32>(0)?;
+            let k2 = ctx.get::<i32>(1)?;
+            let key = ((k1 as i64) << 32) | ((k2 as u32) as i64);
+            let session_id = crate::session::get_current_session().unwrap_or(uuid::Uuid::nil());
+            let ok = crate::session::ADVISORY_LOCK_MANAGER.unlock(session_id, key);
+            Ok(if ok { 1i32 } else { 0i32 })
+        },
+    )?;
+    conn.create_scalar_function(
+        "pg_advisory_xact_lock",
+        1,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let key = ctx.get::<i64>(0)?;
+            let session_id = crate::session::get_current_session().unwrap_or(uuid::Uuid::nil());
+            crate::session::ADVISORY_LOCK_MANAGER.lock(session_id, key, true);
+            Ok(Option::<i32>::None)
+        },
+    )?;
+    conn.create_scalar_function(
+        "pg_advisory_xact_lock",
+        2,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let k1 = ctx.get::<i32>(0)?;
+            let k2 = ctx.get::<i32>(1)?;
+            let key = ((k1 as i64) << 32) | ((k2 as u32) as i64);
+            let session_id = crate::session::get_current_session().unwrap_or(uuid::Uuid::nil());
+            crate::session::ADVISORY_LOCK_MANAGER.lock(session_id, key, true);
+            Ok(Option::<i32>::None)
+        },
+    )?;
+    conn.create_scalar_function(
+        "pg_try_advisory_lock",
+        1,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let key = ctx.get::<i64>(0)?;
+            let session_id = crate::session::get_current_session().unwrap_or(uuid::Uuid::nil());
+            let ok = crate::session::ADVISORY_LOCK_MANAGER.try_lock(session_id, key, false);
+            Ok(if ok { 1i32 } else { 0i32 })
+        },
+    )?;
+    conn.create_scalar_function(
+        "pg_try_advisory_lock",
+        2,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let k1 = ctx.get::<i32>(0)?;
+            let k2 = ctx.get::<i32>(1)?;
+            let key = ((k1 as i64) << 32) | ((k2 as u32) as i64);
+            let session_id = crate::session::get_current_session().unwrap_or(uuid::Uuid::nil());
+            let ok = crate::session::ADVISORY_LOCK_MANAGER.try_lock(session_id, key, false);
+            Ok(if ok { 1i32 } else { 0i32 })
+        },
+    )?;
+    conn.create_scalar_function(
+        "pg_try_advisory_xact_lock",
+        1,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let key = ctx.get::<i64>(0)?;
+            let session_id = crate::session::get_current_session().unwrap_or(uuid::Uuid::nil());
+            let ok = crate::session::ADVISORY_LOCK_MANAGER.try_lock(session_id, key, true);
+            Ok(if ok { 1i32 } else { 0i32 })
+        },
+    )?;
+    conn.create_scalar_function(
+        "pg_try_advisory_xact_lock",
+        2,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let k1 = ctx.get::<i32>(0)?;
+            let k2 = ctx.get::<i32>(1)?;
+            let key = ((k1 as i64) << 32) | ((k2 as u32) as i64);
+            let session_id = crate::session::get_current_session().unwrap_or(uuid::Uuid::nil());
+            let ok = crate::session::ADVISORY_LOCK_MANAGER.try_lock(session_id, key, true);
+            Ok(if ok { 1i32 } else { 0i32 })
+        },
+    )?;
+    conn.create_scalar_function(
+        "pg_advisory_unlock_all",
+        0,
+        FunctionFlags::SQLITE_UTF8,
+        |_ctx| {
+            let session_id = crate::session::get_current_session().unwrap_or(uuid::Uuid::nil());
+            crate::session::ADVISORY_LOCK_MANAGER.release_all_session_locks(&session_id);
+            Ok(Option::<i32>::None)
+        },
+    )?;
+
+    // try_inet(text) - Returns inet or NULL
+    conn.create_scalar_function(
+        "try_inet",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let val: Option<String> = ctx.get(0)?;
+            Ok(val)
+        },
+    )?;
+
+    // pg_mark_conflict - internal helper to detect ON CONFLICT DO UPDATE executions
+    conn.create_scalar_function(
+        "pg_mark_conflict",
+        1,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            mark_conflict_flag();
+            let val: rusqlite::types::Value = ctx.get(0)?;
+            Ok(val)
+        },
+    )?;
+
+    conn.create_scalar_function(
+        "pg_mark_conflict",
+        0,
+        FunctionFlags::SQLITE_UTF8,
+        |_ctx| {
+            mark_conflict_flag();
+            Ok(1i64)
+        },
+    )?;
+
+    // pg_is_insert() - returns 1 if row was newly inserted, 0 if conflict occurred
+    conn.create_scalar_function(
+        "pg_is_insert",
+        0,
+        FunctionFlags::SQLITE_UTF8,
+        |_ctx| {
+            let conflict = reset_conflict_flag();
+            Ok(if conflict { 0i64 } else { 1i64 })
+        },
+    )?;
+
+    // array_to_json(val)
+    conn.create_scalar_function(
+        "array_to_json",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let val: Option<String> = ctx.get(0)?;
+            match val {
+                None => Ok(None),
+                Some(s) => {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() || trimmed == "{}" || trimmed == "[]" {
+                        return Ok(Some("[]".to_string()));
+                    }
+                    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                        return Ok(Some(trimmed.to_string()));
+                    }
+                    if let Some(json_val) = crate::functions::array_functions::parse_array_to_json_val(trimmed) {
+                        return Ok(serde_json::to_string(&json_val).ok());
+                    }
+                    Ok(Some(trimmed.to_string()))
+                }
+            }
+        },
+    )?;
+
+    // masklen(net)
+    conn.create_scalar_function(
+        "masklen",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let val: Option<String> = ctx.get(0)?;
+            match val {
+                None => Ok(None),
+                Some(s) => {
+                    let trimmed = s.trim();
+                    if let Some(pos) = trimmed.rfind('/') {
+                        if let Ok(len) = trimmed[pos + 1..].parse::<i32>() {
+                            return Ok(Some(len));
+                        }
+                    }
+                    if trimmed.contains(':') {
+                        Ok(Some(128))
+                    } else {
+                        Ok(Some(32))
+                    }
+                }
+            }
+        },
+    )?;
+
+    // regexp_replace(source, pattern, replacement)
+    conn.create_scalar_function(
+        "regexp_replace",
+        3,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let src: Option<String> = ctx.get(0)?;
+            let pat: Option<String> = ctx.get(1)?;
+            let repl: Option<String> = ctx.get(2)?;
+            match (src, pat, repl) {
+                (Some(s), Some(p), Some(r)) => {
+                    let clean_pat = p.replace("[[:space:]]", r"\s");
+                    match regex::Regex::new(&clean_pat) {
+                        Ok(re) => Ok(Some(re.replace(&s, r.as_str()).into_owned())),
+                        Err(_) => Ok(Some(s)),
+                    }
+                }
+                _ => Ok(None),
+            }
+        },
+    )?;
+
+    // regexp_replace(source, pattern, replacement, flags)
+    conn.create_scalar_function(
+        "regexp_replace",
+        4,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let src: Option<String> = ctx.get(0)?;
+            let pat: Option<String> = ctx.get(1)?;
+            let repl: Option<String> = ctx.get(2)?;
+            let flags: Option<String> = ctx.get(3)?;
+            match (src, pat, repl) {
+                (Some(s), Some(p), Some(r)) => {
+                    let clean_pat = p.replace("[[:space:]]", r"\s");
+                    let flags_str = flags.unwrap_or_default();
+                    let builder_pat = if flags_str.contains('i') {
+                        format!("(?i){clean_pat}")
+                    } else {
+                        clean_pat
+                    };
+                    match regex::Regex::new(&builder_pat) {
+                        Ok(re) => {
+                            if flags_str.contains('g') {
+                                Ok(Some(re.replace_all(&s, r.as_str()).into_owned()))
+                            } else {
+                                Ok(Some(re.replace(&s, r.as_str()).into_owned()))
+                            }
+                        }
+                        Err(_) => Ok(Some(s)),
+                    }
+                }
+                _ => Ok(None),
+            }
+        },
+    )?;
+
+    // pg_inet_contains_or_equals(cidr, ip)
+    conn.create_scalar_function(
+        "pg_inet_contains_or_equals",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let cidr_str: Option<String> = ctx.get(0)?;
+            let ip_str: Option<String> = ctx.get(1)?;
+            match (cidr_str, ip_str) {
+                (Some(cidr), Some(ip)) => {
+                    let ip_clean = ip.trim();
+                    let cidr_clean = cidr.trim();
+                    if ip_clean.is_empty() || cidr_clean.is_empty() {
+                        return Ok(0i64);
+                    }
+                    let target_ip: std::net::IpAddr = match ip_clean.parse() {
+                        Ok(addr) => addr,
+                        Err(_) => return Ok(0i64),
+                    };
+                    let (base_ip_str, prefix_len) = if let Some(slash) = cidr_clean.find('/') {
+                        let base = &cidr_clean[..slash];
+                        let prefix = cidr_clean[slash + 1..].parse::<u32>().unwrap_or(32);
+                        (base, prefix)
+                    } else {
+                        (cidr_clean, if cidr_clean.contains(':') { 128 } else { 32 })
+                    };
+                    let base_ip: std::net::IpAddr = match base_ip_str.parse() {
+                        Ok(addr) => addr,
+                        Err(_) => return Ok(0i64),
+                    };
+                    match (target_ip, base_ip) {
+                        (std::net::IpAddr::V4(t_v4), std::net::IpAddr::V4(b_v4)) => {
+                            let prefix = prefix_len.min(32);
+                            let mask = if prefix == 0 { 0u32 } else { (!0u32) << (32 - prefix) };
+                            let matches = (u32::from(t_v4) & mask) == (u32::from(b_v4) & mask);
+                            Ok(if matches { 1i64 } else { 0i64 })
+                        }
+                        (std::net::IpAddr::V6(t_v6), std::net::IpAddr::V6(b_v6)) => {
+                            let prefix = prefix_len.min(128);
+                            let mask = if prefix == 0 { 0u128 } else { (!0u128) << (128 - prefix) };
+                            let matches = (u128::from(t_v6) & mask) == (u128::from(b_v6) & mask);
+                            Ok(if matches { 1i64 } else { 0i64 })
+                        }
+                        _ => Ok(0i64),
+                    }
+                }
+                _ => Ok(0i64),
+            }
+        },
+    )?;
+
+    // pg_array_distinct_cat(a, b)
+    conn.create_scalar_function(
+        "pg_array_distinct_cat",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let a_str: Option<String> = ctx.get(0)?;
+            let b_str: Option<String> = ctx.get(1)?;
+            let mut items: Vec<serde_json::Value> = Vec::new();
+
+            for opt_s in [a_str, b_str] {
+                if let Some(s) = opt_s {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() || trimmed == "NULL" || trimmed == "{}" || trimmed == "[]" {
+                        continue;
+                    }
+                    if let Some(parsed) = crate::functions::array_functions::parse_array_to_json_val(trimmed) {
+                        match parsed {
+                            serde_json::Value::Array(arr) => items.extend(arr),
+                            val => items.push(val),
+                        }
+                    }
+                }
+            }
+
+            let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut order: Vec<serde_json::Value> = Vec::new();
+
+            for item in items {
+                let key = if let serde_json::Value::Object(map) = &item {
+                    if let Some(port) = map.get("port") {
+                        format!("port:{port}")
+                    } else if let (Some(loc), Some(name)) = (map.get("location"), map.get("name")) {
+                        format!("param:{loc}:{name}")
+                    } else {
+                        serde_json::to_string(&item).unwrap_or_default()
+                    }
+                } else {
+                    serde_json::to_string(&item).unwrap_or_default()
+                };
+
+                if let Some(&idx) = seen.get(&key) {
+                    if let (serde_json::Value::Object(old_map), serde_json::Value::Object(new_map)) = (&order[idx], &item) {
+                        if let Some(new_srv) = new_map.get("service").and_then(|v| v.as_str()) {
+                            let old_srv_empty = old_map.get("service").and_then(|v| v.as_str()).map_or(true, |s| s.is_empty());
+                            if !new_srv.is_empty() && old_srv_empty {
+                                order[idx] = item;
+                            }
+                        } else if let Some(new_val) = new_map.get("value").and_then(|v| v.as_str()) {
+                            let old_val_empty = old_map.get("value").and_then(|v| v.as_str()).map_or(true, |s| s.is_empty());
+                            if !new_val.is_empty() && old_val_empty {
+                                order[idx] = item;
+                            }
+                        }
+                    }
+                } else {
+                    seen.insert(key, order.len());
+                    order.push(item);
+                }
+            }
+
+            let json_str = serde_json::to_string(&order).unwrap_or_else(|_| "[]".to_string());
+            Ok(Some(json_str))
         },
     )?;
 

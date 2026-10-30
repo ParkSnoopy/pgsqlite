@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use parking_lot::{RwLock, Mutex};
@@ -7,6 +8,27 @@ use crate::config::Config;
 use crate::PgSqliteError;
 use crate::session::ThreadLocalConnectionCache;
 use tracing::{warn, debug, info};
+
+thread_local! {
+    pub static CURRENT_SESSION: Cell<Option<Uuid>> = const { Cell::new(None) };
+}
+
+pub struct CurrentSessionGuard(Option<Uuid>);
+
+impl Drop for CurrentSessionGuard {
+    fn drop(&mut self) {
+        CURRENT_SESSION.with(|s| s.set(self.0));
+    }
+}
+
+pub fn set_current_session(session_id: Uuid) -> CurrentSessionGuard {
+    let prev = CURRENT_SESSION.with(|s| s.replace(Some(session_id)));
+    CurrentSessionGuard(prev)
+}
+
+pub fn get_current_session() -> Option<Uuid> {
+    CURRENT_SESSION.with(|s| s.get())
+}
 
 /// Manages per-session SQLite connections for true isolation
 pub struct ConnectionManager {
@@ -104,6 +126,8 @@ impl ConnectionManager {
     where
         F: FnOnce(&Connection) -> Result<R, rusqlite::Error>
     {
+        let _guard = set_current_session(*session_id);
+
         // First try thread-local cache (fast path)
         if let Some(conn_arc) = ThreadLocalConnectionCache::get(session_id) {
             let conn = conn_arc.lock();
@@ -151,6 +175,8 @@ impl ConnectionManager {
         // Remove from thread-local cache first
         ThreadLocalConnectionCache::remove(session_id);
         
+        crate::session::ADVISORY_LOCK_MANAGER.release_all(session_id);
+
         let mut connections = self.connections.write();
         if connections.remove(session_id).is_some() {
             info!("Removed connection for session {} (remaining connections: {})", session_id, connections.len());
@@ -235,6 +261,8 @@ impl ConnectionManager {
     where
         F: FnOnce(&mut Connection) -> Result<R, rusqlite::Error>
     {
+        let _guard = set_current_session(*session_id);
+
         // First try thread-local cache (fast path)
         if let Some(conn_arc) = ThreadLocalConnectionCache::get(session_id) {
             let mut conn = conn_arc.lock();

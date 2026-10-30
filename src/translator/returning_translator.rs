@@ -3,8 +3,12 @@ use regex::Regex;
 use once_cell::sync::Lazy;
 
 // Pre-compiled regex patterns
+static RETURNING_CHECK_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\bRETURNING\b").unwrap()
+});
+
 static RETURNING_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(.+?)\s+RETURNING\s+(.+)$").unwrap()
+    Regex::new(r"(?is)(.+?)\s+RETURNING\s+(.+)$").unwrap()
 });
 
 static INSERT_TABLE_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -33,15 +37,14 @@ pub struct ReturningTranslator;
 impl ReturningTranslator {
     /// Check if a query contains a RETURNING clause
     pub fn has_returning_clause(sql: &str) -> bool {
-        let upper_sql = sql.to_uppercase();
-        upper_sql.contains(" RETURNING ")
+        RETURNING_CHECK_REGEX.is_match(sql)
     }
     
     /// Extract RETURNING clause from a query
     pub fn extract_returning_clause(sql: &str) -> Option<(String, String)> {
         if let Some(captures) = RETURNING_REGEX.captures(sql) {
             let base_query = captures.get(1)?.as_str().trim().to_string();
-            let returning_clause = captures.get(2)?.as_str().trim().to_string();
+            let returning_clause = captures.get(2)?.as_str().trim().trim_end_matches(';').trim().to_string();
             Some((base_query, returning_clause))
         } else {
             None
@@ -131,6 +134,7 @@ mod tests {
     fn test_has_returning_clause() {
         assert!(ReturningTranslator::has_returning_clause("INSERT INTO users (name) VALUES ('John') RETURNING id"));
         assert!(ReturningTranslator::has_returning_clause("UPDATE users SET name = 'Jane' WHERE id = 1 returning *"));
+        assert!(ReturningTranslator::has_returning_clause("INSERT INTO users (name)\nVALUES ('John')\nRETURNING id"));
         assert!(!ReturningTranslator::has_returning_clause("INSERT INTO users (name) VALUES ('John')"));
     }
     
@@ -141,6 +145,12 @@ mod tests {
         ).unwrap();
         assert_eq!(base, "INSERT INTO users (name) VALUES ('John')");
         assert_eq!(returning, "id, name");
+
+        let (base_nl, returning_nl) = ReturningTranslator::extract_returning_clause(
+            "INSERT INTO users (name)\nVALUES ('John')\nRETURNING id, name;"
+        ).unwrap();
+        assert_eq!(base_nl, "INSERT INTO users (name)\nVALUES ('John')");
+        assert_eq!(returning_nl, "id, name");
     }
     
     #[test]

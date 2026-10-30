@@ -7,19 +7,19 @@ use tracing::debug;
 
 /// Regex patterns for array operators
 static ARRAY_CONTAINS_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(\b\w+(?:\.\w+)*)\s*@>\s*('[^']+'|"[^"]+"|'\[[^\]]+\]')"#).unwrap()
+    Regex::new(r#"(\b\w+(?:\.\w+)*)\s*@>\s*('[^']+'|"[^"]+"|'\[[^\]]+\]'|json_array\([^)]*\)|array_to_json\([^)]*\)|\$\d+|\b\w+(?:\.\w+)*)"#).unwrap()
 });
 
 static ARRAY_CONTAINED_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(\b\w+(?:\.\w+)*|'[^']+'|"[^"]+"|'\[[^\]]+\]')\s*<@\s*(\b\w+(?:\.\w+)*|'[^']+'|"[^"]+"|'\[[^\]]+\]')"#).unwrap()
+    Regex::new(r#"('[^']+'|"[^"]+"|'\[[^\]]+\]'|json_array\([^)]*\)|array_to_json\([^)]*\)|\$\d+|\b\w+(?:\.\w+)*)\s*<@\s*('[^']+'|"[^"]+"|'\[[^\]]+\]'|json_array\([^)]*\)|array_to_json\([^)]*\)|\$\d+|\b\w+(?:\.\w+)*)"#).unwrap()
 });
 
 static ARRAY_OVERLAP_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(\b\w+(?:\.\w+)*)\s*&&\s*(\b\w+(?:\.\w+)*|'[^']+'|"[^"]+"|'\[[^\]]+\]')"#).unwrap()
+    Regex::new(r#"(\b\w+(?:\.\w+)*)\s*&&\s*('[^']+'|"[^"]+"|'\[[^\]]+\]'|json_array\([^)]*\)|array_to_json\([^)]*\)|\$\d+|\b\w+(?:\.\w+)*)"#).unwrap()
 });
 
 static ARRAY_LITERAL_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"ARRAY\[([^\]]*)\]").unwrap()
+    Regex::new(r"(?i)ARRAY\[([^\]]*)\]").unwrap()
 });
 
 static ARRAY_SUBSCRIPT_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -31,7 +31,7 @@ static ARRAY_SLICE_REGEX: Lazy<Regex> = Lazy::new(|| {
 });
 
 static ANY_OPERATOR_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"('[^']+'|"[^"]+"|[^\s=]+)\s*=\s*ANY\s*\(('[^']+'|"[^"]+"|[\w\.]+)\)"#).unwrap()
+    Regex::new(r#"(?i)('[^']+'|"[^"]+"|\$\d+(?:::[\w\[\]]+)?|[\w\.]+)\s*(=|@>)\s*ANY\s*\(\s*('[^']+'|"[^"]+"|\$\d+(?:::[\w\[\]]+)?|ARRAY\s*\[[^\]]*\]|[\w\.]+)\s*\)"#).unwrap()
 });
 
 static ALL_OPERATOR_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -92,8 +92,9 @@ impl ArrayTranslator {
         }
         
         // ANY/ALL operators - check common cases
-        if sql.contains(" ANY(") || sql.contains(" any(") || 
-           sql.contains(" ALL(") || sql.contains(" all(") {
+        let sql_upper = sql.to_ascii_uppercase();
+        if sql_upper.contains("ANY(") || sql_upper.contains("ANY (") || 
+           sql_upper.contains("ALL(") || sql_upper.contains("ALL (") {
             return true;
         }
         
@@ -199,10 +200,13 @@ impl ArrayTranslator {
         while let Some(captures) = ARRAY_LITERAL_REGEX.captures(&result) {
             let array_contents = &captures[1];
             
-            // Parse the array contents and convert to JSON format
-            let json_array = Self::convert_array_contents_to_json(array_contents)?;
-            
-            result = result.replace(&captures[0], &json_array);
+            if array_contents.contains('$') {
+                result = result.replace(&captures[0], &format!("json_array({})", array_contents));
+            } else {
+                // Parse the array contents and convert to JSON format
+                let json_array = Self::convert_array_contents_to_json(array_contents)?;
+                result = result.replace(&captures[0], &json_array);
+            }
         }
         
         Ok(result)
@@ -250,36 +254,71 @@ impl ArrayTranslator {
         Ok(format!("'[{}]'", json_elements.join(",")))
     }
     
+    fn is_inside_string(query: &str, pos: usize) -> bool {
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut escaped = false;
+        for (i, ch) in query.char_indices() {
+            if i >= pos {
+                break;
+            }
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '\'' if !in_double_quote => in_single_quote = !in_single_quote,
+                '"' if !in_single_quote => in_double_quote = !in_double_quote,
+                _ => {}
+            }
+        }
+        in_single_quote || in_double_quote
+    }
+
     /// Translate array subscript access: array[1] -> json_extract(array, '$[0]')
     fn translate_array_subscript(sql: &str) -> Result<String, PgSqliteError> {
-        let mut result = sql.to_string();
-        
-        while let Some(captures) = ARRAY_SUBSCRIPT_REGEX.captures(&result) {
-            let array_col = &captures[1];
-            let index: usize = captures[2].parse().unwrap_or(1);
-            // PostgreSQL arrays are 1-based, JSON arrays are 0-based
+        let mut result = String::with_capacity(sql.len());
+        let mut last_end = 0;
+        for caps in ARRAY_SUBSCRIPT_REGEX.captures_iter(sql) {
+            let m = caps.get(0).unwrap();
+            if Self::is_inside_string(sql, m.start()) {
+                continue;
+            }
+            result.push_str(&sql[last_end..m.start()]);
+            let array_col = &caps[1];
+            let index: usize = caps[2].parse().unwrap_or(1);
             let json_index = if index > 0 { index - 1 } else { 0 };
-            
-            let replacement = format!("json_extract({array_col}, '$[{json_index}]')");
-            result = result.replace(&captures[0], &replacement);
+            result.push_str(&format!("json_extract({array_col}, '$[{json_index}]')"));
+            last_end = m.end();
         }
-        
+        if last_end == 0 {
+            return Ok(sql.to_string());
+        }
+        result.push_str(&sql[last_end..]);
         Ok(result)
     }
-    
+
     /// Translate array slice access: array[1:3] -> array_slice(array, 1, 3)
     fn translate_array_slice(sql: &str) -> Result<String, PgSqliteError> {
-        let mut result = sql.to_string();
-        
-        while let Some(captures) = ARRAY_SLICE_REGEX.captures(&result) {
-            let array_col = &captures[1];
-            let start = &captures[2];
-            let end = &captures[3];
-            
-            let replacement = format!("array_slice({array_col}, {start}, {end})");
-            result = result.replace(&captures[0], &replacement);
+        let mut result = String::with_capacity(sql.len());
+        let mut last_end = 0;
+        for caps in ARRAY_SLICE_REGEX.captures_iter(sql) {
+            let m = caps.get(0).unwrap();
+            if Self::is_inside_string(sql, m.start()) {
+                continue;
+            }
+            result.push_str(&sql[last_end..m.start()]);
+            let array_col = &caps[1];
+            let start = &caps[2];
+            let end = &caps[3];
+            result.push_str(&format!("array_slice({array_col}, {start}, {end})"));
+            last_end = m.end();
         }
-        
+        if last_end == 0 {
+            return Ok(sql.to_string());
+        }
+        result.push_str(&sql[last_end..]);
         Ok(result)
     }
     
@@ -303,12 +342,27 @@ impl ArrayTranslator {
         
         // Then handle regular ANY(column) patterns
         while let Some(captures) = ANY_OPERATOR_REGEX.captures(&result) {
-            let value = &captures[1];
-            let array_col = &captures[2];
+            let mut value = captures[1].to_string();
+            let op = &captures[2];
+            let mut array_col = captures[3].to_string();
             
-            let replacement = format!(
-                "EXISTS (SELECT 1 FROM json_each({array_col}) WHERE value = {value})"
-            );
+            // Strip type casts like ::jsonb[] or ::bigint[]
+            if let Some(idx) = array_col.find("::") {
+                array_col.truncate(idx);
+            }
+            if let Some(idx) = value.find("::") {
+                value.truncate(idx);
+            }
+            
+            let replacement = if op == "@>" {
+                format!(
+                    "EXISTS (SELECT 1 FROM json_each(array_to_json({array_col})) AS _elem WHERE array_contains({value}, _elem.value))"
+                )
+            } else {
+                format!(
+                    "EXISTS (SELECT 1 FROM json_each(array_to_json({array_col})) AS _elem WHERE (_elem.value = {value} OR '' || _elem.value = '' || {value}))"
+                )
+            };
             result = result.replace(&captures[0], &replacement);
         }
         
@@ -822,7 +876,7 @@ mod tests {
         let sql = "SELECT * FROM products WHERE 'electronics' = ANY(tags)";
         let result = ArrayTranslator::translate_array_operators(sql).unwrap();
         println!("ANY operator result: {result}");
-        assert!(result.contains("EXISTS (SELECT 1 FROM json_each(tags) WHERE value = 'electronics')"));
+        assert!(result.contains("EXISTS (SELECT 1 FROM json_each(array_to_json(tags)) AS _elem WHERE (_elem.value = 'electronics' OR '' || _elem.value = '' || 'electronics'))"));
     }
     
     #[test]

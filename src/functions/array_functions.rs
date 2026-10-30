@@ -34,6 +34,7 @@ pub fn register_array_functions(conn: &Connection) -> Result<()> {
     // Array constructor functions
     register_string_to_array(conn)?;
     register_array_to_string(conn)?;
+    register_cardinality(conn)?;
     
     Ok(())
 }
@@ -48,8 +49,8 @@ fn register_array_length(conn: &Connection) -> Result<()> {
             let array_json: String = ctx.get(0)?;
             let dimension: i32 = ctx.get(1)?;
             
-            match serde_json::from_str::<JsonValue>(&array_json) {
-                Ok(JsonValue::Array(arr)) => {
+            match parse_array_to_json_val(&array_json) {
+                Some(JsonValue::Array(arr)) => {
                     if dimension == 1 {
                         Ok(Some(arr.len() as i32))
                     } else {
@@ -83,8 +84,8 @@ fn register_array_upper(conn: &Connection) -> Result<()> {
             let array_json: String = ctx.get(0)?;
             let dimension: i32 = ctx.get(1)?;
             
-            match serde_json::from_str::<JsonValue>(&array_json) {
-                Ok(JsonValue::Array(arr)) => {
+            match parse_array_to_json_val(&array_json) {
+                Some(JsonValue::Array(arr)) => {
                     if dimension == 1 {
                         Ok(Some(arr.len() as i32))
                     } else if dimension == 2 {
@@ -116,8 +117,8 @@ fn register_array_lower(conn: &Connection) -> Result<()> {
             let array_json: String = ctx.get(0)?;
             let dimension: i32 = ctx.get(1)?;
             
-            match serde_json::from_str::<JsonValue>(&array_json) {
-                Ok(JsonValue::Array(arr)) => {
+            match parse_array_to_json_val(&array_json) {
+                Some(JsonValue::Array(arr)) => {
                     if arr.is_empty() {
                         Ok(None)
                     } else if dimension == 1 {
@@ -150,8 +151,8 @@ fn register_array_ndims(conn: &Connection) -> Result<()> {
         |ctx| {
             let array_json: String = ctx.get(0)?;
             
-            match serde_json::from_str::<JsonValue>(&array_json) {
-                Ok(json) => Ok(Some(count_dimensions(&json))),
+            match parse_array_to_json_val(&array_json) {
+                Some(json) => Ok(Some(count_dimensions(&json))),
                 _ => Ok(None),
             }
         },
@@ -186,8 +187,8 @@ fn register_array_append(conn: &Connection) -> Result<()> {
                 }
             };
             
-            match serde_json::from_str::<JsonValue>(&array_json) {
-                Ok(JsonValue::Array(mut arr)) => {
+            match parse_array_to_json_val(&array_json) {
+                Some(JsonValue::Array(mut arr)) => {
                     arr.push(elem_value);
                     Ok(serde_json::to_string(&arr).ok())
                 }
@@ -225,8 +226,8 @@ fn register_array_prepend(conn: &Connection) -> Result<()> {
             
             let array_json: String = ctx.get(1)?;
             
-            match serde_json::from_str::<JsonValue>(&array_json) {
-                Ok(JsonValue::Array(mut arr)) => {
+            match parse_array_to_json_val(&array_json) {
+                Some(JsonValue::Array(mut arr)) => {
                     arr.insert(0, elem_value);
                     Ok(serde_json::to_string(&arr).ok())
                 }
@@ -249,10 +250,10 @@ fn register_array_cat(conn: &Connection) -> Result<()> {
             let array2_json: String = ctx.get(1)?;
             
             match (
-                serde_json::from_str::<JsonValue>(&array1_json),
-                serde_json::from_str::<JsonValue>(&array2_json),
+                parse_array_to_json_val(&array1_json),
+                parse_array_to_json_val(&array2_json),
             ) {
-                (Ok(JsonValue::Array(mut arr1)), Ok(JsonValue::Array(arr2))) => {
+                (Some(JsonValue::Array(mut arr1)), Some(JsonValue::Array(arr2))) => {
                     arr1.extend(arr2);
                     Ok(serde_json::to_string(&arr1).ok())
                 }
@@ -290,10 +291,10 @@ fn register_array_remove(conn: &Connection) -> Result<()> {
                 }
             };
             
-            match serde_json::from_str::<JsonValue>(&array_json) {
-                Ok(JsonValue::Array(arr)) => {
+            match parse_array_to_json_val(&array_json) {
+                Some(JsonValue::Array(arr)) => {
                     let filtered: Vec<JsonValue> = arr.into_iter()
-                        .filter(|v| v != &elem_value)
+                        .filter(|v| v != &elem_value && v.to_string() != elem_value.to_string())
                         .collect();
                     
                     Ok(serde_json::to_string(&filtered).ok())
@@ -349,10 +350,10 @@ fn register_array_replace(conn: &Connection) -> Result<()> {
                 }
             };
             
-            match serde_json::from_str::<JsonValue>(&array_json) {
-                Ok(JsonValue::Array(arr)) => {
+            match parse_array_to_json_val(&array_json) {
+                Some(JsonValue::Array(arr)) => {
                     let replaced: Vec<JsonValue> = arr.into_iter()
-                        .map(|v| if v == old_value { new_value.clone() } else { v })
+                        .map(|v| if v == old_value || v.to_string() == old_value.to_string() { new_value.clone() } else { v })
                         .collect();
                     
                     Ok(serde_json::to_string(&replaced).ok())
@@ -365,6 +366,114 @@ fn register_array_replace(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub fn parse_array_to_json_val(s: &str) -> Option<JsonValue> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("NULL") {
+        return None;
+    }
+    if trimmed == "{}" || trimmed == "[]" {
+        return Some(JsonValue::Array(Vec::new()));
+    }
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        if let Ok(val) = serde_json::from_str::<JsonValue>(trimmed) {
+            return Some(val);
+        }
+    }
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        // If it's a single JSON object like {"port": 80, ...}, check if it parses as valid JSON object
+        if let Ok(val) = serde_json::from_str::<JsonValue>(trimmed) {
+            if val.is_object() {
+                return Some(JsonValue::Array(vec![val]));
+            }
+        }
+        let inner = trimmed[1..trimmed.len() - 1].trim();
+        if inner.is_empty() {
+            return Some(JsonValue::Array(Vec::new()));
+        }
+        let mut elements = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        let mut escape_next = false;
+        let mut was_quoted = false;
+
+        for ch in inner.chars() {
+            if escape_next {
+                current.push(ch);
+                escape_next = false;
+                continue;
+            }
+            if ch == '\\' && in_quotes {
+                escape_next = true;
+                continue;
+            }
+            if ch == '"' {
+                in_quotes = !in_quotes;
+                was_quoted = true;
+                continue;
+            }
+            if ch == ',' && !in_quotes {
+                let elem_str = current.trim();
+                elements.push(parse_array_elem(elem_str, was_quoted));
+                current.clear();
+                was_quoted = false;
+                continue;
+            }
+            current.push(ch);
+        }
+        if !current.is_empty() || was_quoted {
+            let elem_str = current.trim();
+            elements.push(parse_array_elem(elem_str, was_quoted));
+        }
+        return Some(JsonValue::Array(elements));
+    }
+    serde_json::from_str::<JsonValue>(trimmed).ok()
+}
+
+fn parse_array_elem(elem: &str, was_quoted: bool) -> JsonValue {
+    if !was_quoted {
+        if elem.eq_ignore_ascii_case("NULL") {
+            return JsonValue::Null;
+        }
+        if let Ok(num) = elem.parse::<i64>() {
+            return JsonValue::Number(num.into());
+        }
+        if let Ok(num) = elem.parse::<f64>() {
+            if let Some(n) = serde_json::Number::from_f64(num) {
+                return JsonValue::Number(n);
+            }
+        }
+        if elem.eq_ignore_ascii_case("true") {
+            return JsonValue::Bool(true);
+        }
+        if elem.eq_ignore_ascii_case("false") {
+            return JsonValue::Bool(false);
+        }
+    }
+    // If it's a string containing a JSON object or array, parse it
+    if (elem.starts_with('{') && elem.ends_with('}')) || (elem.starts_with('[') && elem.ends_with(']')) {
+        if let Ok(val) = serde_json::from_str::<JsonValue>(elem) {
+            return val;
+        }
+    }
+    JsonValue::String(elem.to_string())
+}
+
+pub(crate) fn json_vals_equal(v1: &JsonValue, v2: &JsonValue) -> bool {
+    if v1 == v2 {
+        return true;
+    }
+    match (v1, v2) {
+        (JsonValue::String(s), other) | (other, JsonValue::String(s)) => {
+            match other {
+                JsonValue::Number(n) => n.to_string() == *s,
+                JsonValue::Bool(b) => b.to_string() == *s,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// array_contains(array1, array2) - Check if array1 contains all elements of array2
 fn register_array_contains(conn: &Connection) -> Result<()> {
     conn.create_scalar_function(
@@ -372,17 +481,26 @@ fn register_array_contains(conn: &Connection) -> Result<()> {
         2,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
-            let array1_json: String = ctx.get(0)?;
-            let array2_json: String = ctx.get(1)?;
+            let array1_json: Option<String> = ctx.get(0).ok();
+            let array2_json: Option<String> = ctx.get(1).ok();
+            let (Some(a1), Some(a2)) = (array1_json, array2_json) else {
+                return Ok(false);
+            };
             
             match (
-                serde_json::from_str::<JsonValue>(&array1_json),
-                serde_json::from_str::<JsonValue>(&array2_json),
+                parse_array_to_json_val(&a1),
+                parse_array_to_json_val(&a2),
             ) {
-                (Ok(JsonValue::Array(arr1)), Ok(JsonValue::Array(arr2))) => {
+                (Some(JsonValue::Array(arr1)), Some(JsonValue::Array(arr2))) => {
                     // Check if all elements of arr2 are in arr1
-                    let contains_all = arr2.iter().all(|elem| arr1.contains(elem));
+                    let contains_all = arr2.iter().all(|elem| {
+                        arr1.iter().any(|e1| json_vals_equal(e1, elem))
+                    });
                     Ok(contains_all)
+                }
+                (Some(JsonValue::Array(arr1)), Some(single_val)) => {
+                    let contains = arr1.iter().any(|e1| json_vals_equal(e1, &single_val));
+                    Ok(contains)
                 }
                 _ => Ok(false),
             }
@@ -399,16 +517,21 @@ fn register_array_contained(conn: &Connection) -> Result<()> {
         2,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
-            let array1_json: String = ctx.get(0)?;
-            let array2_json: String = ctx.get(1)?;
+            let array1_json: Option<String> = ctx.get(0).ok();
+            let array2_json: Option<String> = ctx.get(1).ok();
+            let (Some(a1), Some(a2)) = (array1_json, array2_json) else {
+                return Ok(false);
+            };
             
             match (
-                serde_json::from_str::<JsonValue>(&array1_json),
-                serde_json::from_str::<JsonValue>(&array2_json),
+                parse_array_to_json_val(&a1),
+                parse_array_to_json_val(&a2),
             ) {
-                (Ok(JsonValue::Array(arr1)), Ok(JsonValue::Array(arr2))) => {
+                (Some(JsonValue::Array(arr1)), Some(JsonValue::Array(arr2))) => {
                     // Check if all elements of arr1 are in arr2
-                    let contained_all = arr1.iter().all(|elem| arr2.contains(elem));
+                    let contained_all = arr1.iter().all(|elem| {
+                        arr2.iter().any(|e2| json_vals_equal(e2, elem))
+                    });
                     Ok(contained_all)
                 }
                 _ => Ok(false),
@@ -426,16 +549,20 @@ fn register_array_overlap(conn: &Connection) -> Result<()> {
         2,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
-            let array1_json: String = ctx.get(0)?;
-            let array2_json: String = ctx.get(1)?;
+            let array1_json: Option<String> = ctx.get(0).ok();
+            let array2_json: Option<String> = ctx.get(1).ok();
+            let (Some(a1), Some(a2)) = (array1_json, array2_json) else {
+                return Ok(false);
+            };
             
             match (
-                serde_json::from_str::<JsonValue>(&array1_json),
-                serde_json::from_str::<JsonValue>(&array2_json),
+                parse_array_to_json_val(&a1),
+                parse_array_to_json_val(&a2),
             ) {
-                (Ok(JsonValue::Array(arr1)), Ok(JsonValue::Array(arr2))) => {
-                    // Check if any element of arr1 is in arr2
-                    let has_overlap = arr1.iter().any(|elem| arr2.contains(elem));
+                (Some(JsonValue::Array(arr1)), Some(JsonValue::Array(arr2))) => {
+                    let has_overlap = arr1.iter().any(|elem1| {
+                        arr2.iter().any(|elem2| json_vals_equal(elem1, elem2))
+                    });
                     Ok(has_overlap)
                 }
                 _ => Ok(false),
@@ -457,8 +584,8 @@ fn register_array_slice(conn: &Connection) -> Result<()> {
             let start: i32 = ctx.get(1)?;
             let end: i32 = ctx.get(2)?;
             
-            match serde_json::from_str::<JsonValue>(&array_json) {
-                Ok(JsonValue::Array(arr)) => {
+            match parse_array_to_json_val(&array_json) {
+                Some(JsonValue::Array(arr)) => {
                     // Convert 1-based PostgreSQL indices to 0-based
                     let start_idx = (start - 1).max(0) as usize;
                     let end_idx = end.min(arr.len() as i32) as usize;
@@ -504,11 +631,11 @@ fn register_array_position(conn: &Connection) -> Result<()> {
                 }
             };
             
-            match serde_json::from_str::<JsonValue>(&array_json) {
-                Ok(JsonValue::Array(arr)) => {
+            match parse_array_to_json_val(&array_json) {
+                Some(JsonValue::Array(arr)) => {
                     // Find first occurrence (1-based index)
                     for (i, val) in arr.iter().enumerate() {
-                        if val == &elem_value {
+                        if val == &elem_value || val.to_string() == elem_value.to_string() {
                             return Ok(Some((i + 1) as i32));
                         }
                     }
@@ -548,13 +675,13 @@ fn register_array_positions(conn: &Connection) -> Result<()> {
                 }
             };
             
-            match serde_json::from_str::<JsonValue>(&array_json) {
-                Ok(JsonValue::Array(arr)) => {
+            match parse_array_to_json_val(&array_json) {
+                Some(JsonValue::Array(arr)) => {
                     // Find all occurrences (1-based indices)
                     let positions: Vec<i32> = arr.iter()
                         .enumerate()
                         .filter_map(|(i, val)| {
-                            if val == &elem_value {
+                            if val == &elem_value || val.to_string() == elem_value.to_string() {
                                 Some((i + 1) as i32)
                             } else {
                                 None
@@ -753,8 +880,8 @@ fn register_array_to_string(conn: &Connection) -> Result<()> {
             let array_json: String = ctx.get(0)?;
             let delimiter: String = ctx.get(1)?;
             
-            match serde_json::from_str::<JsonValue>(&array_json) {
-                Ok(JsonValue::Array(arr)) => {
+            match parse_array_to_json_val(&array_json) {
+                Some(JsonValue::Array(arr)) => {
                     let elements: Vec<String> = arr.iter()
                         .filter_map(|v| match v {
                             JsonValue::String(s) => Some(s.clone()),
@@ -802,6 +929,37 @@ fn count_dimensions(value: &JsonValue) -> i32 {
         }
         _ => 0,
     }
+}
+
+/// cardinality(array) - Return total number of elements in array
+fn register_cardinality(conn: &Connection) -> Result<()> {
+    conn.create_scalar_function(
+        "cardinality",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let val: rusqlite::types::ValueRef = ctx.get_raw(0);
+            match val {
+                rusqlite::types::ValueRef::Null => Ok(None::<i32>),
+                rusqlite::types::ValueRef::Text(s) => {
+                    let s_str = std::str::from_utf8(s).unwrap_or("");
+                    if let Some(JsonValue::Array(arr)) = parse_array_to_json_val(s_str) {
+                        Ok(Some(arr.len() as i32))
+                    } else {
+                        Ok(Some(0i32))
+                    }
+                }
+                rusqlite::types::ValueRef::Blob(b) => {
+                    if let Ok(JsonValue::Array(arr)) = serde_json::from_slice::<JsonValue>(b) {
+                        Ok(Some(arr.len() as i32))
+                    } else {
+                        Ok(Some(0i32))
+                    }
+                }
+                _ => Ok(Some(0i32)),
+            }
+        },
+    )
 }
 
 

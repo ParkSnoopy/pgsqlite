@@ -43,6 +43,15 @@ impl QueryTypeDetector {
             }
         }
 
+        if bytes.len() >= 2 {
+            let first2 = &bytes[0..2];
+            if (first2 == b"DO" || first2 == b"do" || first2 == b"Do")
+                && (bytes.len() == 2 || bytes[2].is_ascii_whitespace() || bytes[2] == b'$')
+            {
+                return QueryType::Do;
+            }
+        }
+
         if bytes.len() >= 3 {
             let first3 = &bytes[0..3];
             if (first3 == b"END" || first3 == b"end" || first3 == b"End")
@@ -105,6 +114,9 @@ impl QueryTypeDetector {
             QueryType::Rollback
         } else if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("COMMENT") {
             QueryType::Comment
+        } else if trimmed.len() >= 2 && trimmed[..2].eq_ignore_ascii_case("DO")
+            && (trimmed.len() == 2 || trimmed.as_bytes()[2].is_ascii_whitespace() || trimmed.as_bytes()[2] == b'$') {
+            QueryType::Do
         } else {
             QueryType::Other
         }
@@ -170,6 +182,12 @@ impl QueryTypeDetector {
             QueryType::Begin | QueryType::Commit | QueryType::Rollback
         )
     }
+
+    /// Check if query is DO statement (anonymous procedural block)
+    #[inline]
+    pub fn is_do(query: &str) -> bool {
+        matches!(Self::detect_query_type(query), QueryType::Do)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +204,7 @@ pub enum QueryType {
     Commit,
     Rollback,
     Comment,
+    Do,
     Other,
 }
 
@@ -204,6 +223,7 @@ impl QueryType {
             QueryType::Commit => "COMMIT",
             QueryType::Rollback => "ROLLBACK",
             QueryType::Comment => "COMMENT",
+            QueryType::Do => "DO",
             QueryType::Other => "",
         }
     }

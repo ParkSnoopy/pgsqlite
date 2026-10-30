@@ -10,13 +10,16 @@ static UNNEST_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\bunnest\s*\(\s*([^)]+)\s*\)").unwrap()
 });
 
+static UNNEST_JOIN_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:CROSS\s+JOIN|JOIN)\s+(?:LATERAL\s+)?unnest\s*\(\s*([^)]+)\s*\)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\))?)?").unwrap()
+});
 
 static UNNEST_FROM_CLAUSE_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\bFROM\s+unnest\s*\(\s*([^)]+)\s*\)(?:\s+(?:AS\s+)?(\w+))?").unwrap()
+    Regex::new(r"(?i)\bFROM\s+unnest\s*\(\s*([^)]+)\s*\)(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\))?)?").unwrap()
 });
 
 static UNNEST_WITH_ORDINALITY_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\bFROM\s+unnest\s*\(\s*([^)]+)\s*\)\s+WITH\s+ORDINALITY(?:\s+(?:AS\s+)?(\w+))?").unwrap()
+    Regex::new(r"(?i)\bFROM\s+unnest\s*\(\s*([^)]+)\s*\)\s+WITH\s+ORDINALITY(?:\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*,\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\))?)?").unwrap()
 });
 
 /// Translates PostgreSQL unnest() function calls to SQLite json_each() equivalents
@@ -44,10 +47,12 @@ impl UnnestTranslator {
         let mut result = sql.to_string();
         
         // Handle different patterns:
-        // 1. FROM unnest(array) WITH ORDINALITY AS alias
-        // 2. FROM unnest(array) AS alias
-        // 3. unnest(array) in SELECT clause
+        // 1. [CROSS] JOIN [LATERAL] unnest(array) AS alias(col)
+        // 2. FROM unnest(array) WITH ORDINALITY AS alias(col1, col2)
+        // 3. FROM unnest(array) AS alias(col)
+        // 4. unnest(array) in SELECT clause
         
+        result = Self::translate_join_clause(&result)?;
         result = Self::translate_from_clause_with_ordinality(&result)?;
         result = Self::translate_from_clause(&result)?;
         result = Self::translate_select_clause(&result)?;
@@ -65,6 +70,7 @@ impl UnnestTranslator {
         let mut metadata = TranslationMetadata::new();
         
         // Translate unnest calls
+        result = Self::translate_join_clause(&result)?;
         result = Self::translate_from_clause_with_ordinality(&result)?;
         result = Self::translate_from_clause(&result)?;
         result = Self::translate_select_clause(&result)?;
@@ -75,6 +81,46 @@ impl UnnestTranslator {
         Ok((result, metadata))
     }
     
+    /// Translate [CROSS ]JOIN [LATERAL] unnest(...) AS alias(col) to JOIN json_each(...) AS alias
+    fn translate_join_clause(sql: &str) -> Result<String, PgSqliteError> {
+        let mut result = sql.to_string();
+        let mut replacements = Vec::new();
+        let mut col_replacements = Vec::new();
+
+        for captures in UNNEST_JOIN_REGEX.captures_iter(&result) {
+            let array_expr = captures[1].trim();
+            let table_alias = captures.get(2).map(|m| m.as_str()).unwrap_or("unnest_table");
+            let col_alias = captures.get(3).map(|m| m.as_str());
+
+            let json_target = if array_expr.starts_with("array_to_json(") || array_expr.starts_with('\'') || array_expr.starts_with('[') || array_expr.starts_with("ARRAY[") {
+                array_expr.to_string()
+            } else {
+                format!("array_to_json({array_expr})")
+            };
+
+            let replacement = format!("JOIN json_each({json_target}) AS {table_alias}");
+            replacements.push((captures[0].to_string(), replacement));
+
+            if let Some(col) = col_alias {
+                col_replacements.push((table_alias.to_string(), col.to_string()));
+            }
+        }
+
+        for (original, replacement) in replacements {
+            result = result.replace(&original, &replacement);
+            debug!("Translated JOIN unnest: {} -> {}", original, replacement);
+        }
+
+        for (table_alias, col_alias) in col_replacements {
+            let pat = format!(r"(?i)\b{}\.{}\b", regex::escape(&table_alias), regex::escape(&col_alias));
+            if let Ok(re) = Regex::new(&pat) {
+                result = re.replace_all(&result, format!("{}.value", table_alias)).to_string();
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Translate FROM unnest(array) AS alias to FROM json_each(array) AS alias
     fn translate_from_clause(sql: &str) -> Result<String, PgSqliteError> {
         let mut result = sql.to_string();
@@ -84,9 +130,19 @@ impl UnnestTranslator {
         for captures in UNNEST_FROM_CLAUSE_REGEX.captures_iter(&result) {
             let array_expr = captures[1].trim();
             let alias = captures.get(2).map(|m| m.as_str()).unwrap_or("unnest_table");
+            let col_alias = captures.get(3).map(|m| m.as_str());
             
-            // Convert unnest(array) to json_each(array) with proper column selection
-            let replacement = format!("FROM json_each({array_expr}) AS {alias}");
+            let json_target = if array_expr.starts_with("array_to_json(") || array_expr.starts_with('\'') || array_expr.starts_with('[') || array_expr.starts_with("ARRAY[") {
+                array_expr.to_string()
+            } else {
+                format!("array_to_json({array_expr})")
+            };
+
+            let replacement = if let Some(col) = col_alias {
+                format!("FROM (SELECT value AS {col} FROM json_each({json_target})) AS {alias}")
+            } else {
+                format!("FROM json_each({json_target}) AS {alias}")
+            };
             
             replacements.push((captures[0].to_string(), replacement));
         }
@@ -109,11 +165,17 @@ impl UnnestTranslator {
         for captures in UNNEST_WITH_ORDINALITY_REGEX.captures_iter(&result) {
             let array_expr = captures[1].trim();
             let alias = captures.get(2).map(|m| m.as_str()).unwrap_or("unnest_table");
+            let col1 = captures.get(3).map(|m| m.as_str()).unwrap_or("value");
+            let col2 = captures.get(4).map(|m| m.as_str()).unwrap_or("ordinality");
             
-            // Convert unnest(array) WITH ORDINALITY to a CTE that includes row numbers
-            // PostgreSQL's WITH ORDINALITY returns (value, ordinality) columns
+            let json_target = if array_expr.starts_with("array_to_json(") || array_expr.starts_with('\'') || array_expr.starts_with('[') || array_expr.starts_with("ARRAY[") {
+                array_expr.to_string()
+            } else {
+                format!("array_to_json({array_expr})")
+            };
+
             let replacement = format!(
-                "FROM (SELECT value, (key + 1) AS ordinality FROM json_each({array_expr})) AS {alias}"
+                "FROM (SELECT value AS {col1}, (key + 1) AS {col2} FROM json_each({json_target})) AS {alias}"
             );
             
             replacements.push((captures[0].to_string(), replacement));
@@ -268,5 +330,31 @@ mod tests {
         let result = UnnestTranslator::translate_unnest(sql).unwrap();
         assert!(result.contains("json_each"));
         assert!(!result.contains("unnest"));
+    }
+
+    #[test]
+    fn test_unnest_cross_join_lateral() {
+        let sql = "SELECT task.id FROM assets asset CROSS JOIN LATERAL unnest(asset.task_ids) AS requested(task_id) JOIN tasks task ON task.id=requested.task_id";
+        let result = UnnestTranslator::translate_unnest(sql).unwrap();
+        assert!(result.contains("JOIN json_each(array_to_json(asset.task_ids)) AS requested"));
+        assert!(result.contains("task.id=requested.value"));
+        assert!(!result.contains("LATERAL"));
+        assert!(!result.contains("unnest"));
+    }
+
+    #[test]
+    fn test_unnest_with_ordinality_column_aliases() {
+        let sql = "SELECT company_id, position FROM unnest($2::bigint[]) WITH ORDINALITY AS requested(company_id, position)";
+        let result = UnnestTranslator::translate_unnest(sql).unwrap();
+        assert!(result.contains("SELECT value AS company_id, (key + 1) AS position FROM json_each(array_to_json($2::bigint[]))"));
+        assert!(result.contains("AS requested"));
+    }
+
+    #[test]
+    fn test_unnest_from_column_alias() {
+        let sql = "SELECT v FROM unnest(technologies) AS t(v) WHERE v = 'test'";
+        let result = UnnestTranslator::translate_unnest(sql).unwrap();
+        assert!(result.contains("SELECT value AS v FROM json_each(array_to_json(technologies))"));
+        assert!(result.contains("AS t"));
     }
 }
