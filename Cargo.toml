@@ -16,6 +16,27 @@ version = "0.0.23"
 edition = "2024"
 license = "GPL-3.0-only"
 
+[workspace.dependencies]
+bytes              = "1.12"
+chrono             = "0.4"
+clap               = { version = "4.6", features = ["derive", "env"] }
+env_logger         = "0.11"
+futures            = "0.3"
+hex                = "0.4"
+itoa               = "1.0"
+rand               = "0.10"
+rusqlite           = { version = "0.41", features = ["bundled", "uuid", "serde_json", "functions", "collation", "vtab", "column_decltype"] }
+rust_decimal       = { version = "1.43", features = ["serde", "db-postgres"] }
+serde_json         = "1.0"
+sqlparser          = { version = "0.63", features = ["serde", "visitor"] }
+tempfile           = "3.27"
+tokio              = { version = "1.54", features = ["full"] }
+tokio-postgres     = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
+tokio-util         = { version = "0.7", features = ["codec"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid               = { version = "1.29", features = ["v4", "serde"] }
+
 [features]
 default           = []
 use_db_executor   = []
@@ -23,55 +44,55 @@ unified_processor = []
 
 [dependencies]
 # Async runtime
-tokio              = { version = "1.54", features = ["full"] }
-tokio-util         = { version = "0.7", features = ["codec"] }
+tokio              = { workspace = true }
+tokio-util         = { workspace = true }
 
 # PostgreSQL protocol
-bytes              = "1.12"
+bytes              = { workspace = true }
 postgres-protocol  = "0.6"
 
 # SQLite
-rusqlite           = { version = "0.41", features = ["bundled", "uuid", "serde_json", "functions", "collation", "vtab", "column_decltype"] }
+rusqlite           = { workspace = true }
 
 # SQL parsing
-sqlparser          = { version = "0.63", features = ["serde", "visitor"] }
+sqlparser          = { workspace = true }
 
 # Types
-uuid               = { version = "1.29", features = ["v4", "serde"] }
+uuid               = { workspace = true }
 serde              = { version = "1", features = ["derive"] }
-serde_json         = "1"
-chrono             = "0.4"
-rust_decimal       = { version = "1.43", features = ["serde", "db-postgres"] }
+serde_json         = { workspace = true }
+chrono             = { workspace = true }
+rust_decimal       = { workspace = true }
 once_cell          = "1.21"
 
 # PostgreSQL client (for testing)
-tokio-postgres     = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
-env_logger         = "0.11"
+tokio-postgres     = { workspace = true }
+env_logger         = { workspace = true }
 
 # Utilities
 thiserror          = "2"
 anyhow             = "1"
-tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
 async-trait        = "0.1"
-rand               = "0.10"
-futures            = "0.3"
-hex                = "0.4"
+rand               = { workspace = true }
+futures            = { workspace = true }
+hex                = { workspace = true }
 regex              = "1.13"
 byteorder          = "1.5"
 parking_lot        = "0.13"
 memchr             = "2.8"
-itoa               = "1.0"
+itoa               = { workspace = true }
 bitflags           = "2.13"
 lru                = "0.19"
 
 # Memory mapping for zero-copy operations
 memmap2            = "0.9"
-tempfile           = "3.27"
+tempfile           = { workspace = true }
 
 # Configuration
 config             = "0.15"
-clap               = { version = "4", features = ["derive", "env"] }
+clap               = { workspace = true }
 lazy_static        = "1"
 
 # Cryptography for migration checksums
