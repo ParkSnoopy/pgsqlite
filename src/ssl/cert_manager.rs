@@ -2,9 +2,8 @@ use anyhow::{Context, Result};
 use rcgen::{CertificateParams, DistinguishedName};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
-use rustls_pemfile;
+use rustls_pki_types::pem::PemObject;
 use std::fs;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
@@ -182,8 +181,7 @@ impl CertificateManager {
         // Load certificate
         let cert_file = fs::File::open(cert_path)
             .with_context(|| format!("Failed to open certificate file: {cert_path}"))?;
-        let mut cert_reader = BufReader::new(cert_file);
-        let certs = rustls_pemfile::certs(&mut cert_reader)
+        let certs = CertificateDer::pem_reader_iter(cert_file)
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to parse certificate file")?;
 
@@ -194,10 +192,8 @@ impl CertificateManager {
         // Load private key
         let key_file = fs::File::open(key_path)
             .with_context(|| format!("Failed to open key file: {key_path}"))?;
-        let mut key_reader = BufReader::new(key_file);
-        
-        let key = rustls_pemfile::private_key(&mut key_reader)?
-            .context("No private key found in file")?;
+        let key = PrivateKeyDer::from_pem_reader(key_file)
+            .context("Failed to parse private key file")?;
 
         // Check key file permissions on Unix
         #[cfg(unix)]
@@ -214,13 +210,11 @@ impl CertificateManager {
     }
 
     fn parse_certificates_from_memory(&self, cert: &[u8], key: &[u8]) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-        let mut cert_reader = BufReader::new(cert);
-        let certs = rustls_pemfile::certs(&mut cert_reader)
+        let certs = CertificateDer::pem_slice_iter(cert)
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to parse generated certificate")?;
 
-        let mut key_reader = BufReader::new(key);
-        let private_key = rustls_pemfile::private_key(&mut key_reader)?
+        let private_key = PrivateKeyDer::from_pem_slice(key)
             .context("Failed to parse generated private key")?;
 
         Ok((certs, private_key))

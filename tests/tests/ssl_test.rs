@@ -150,7 +150,7 @@ mod tests {
         assert!(key_path.exists(), "Key file should be created");
         
         // Test that existing certificates are reused
-        let cert_manager2 = CertificateManager::new(Arc::new(config));
+        let cert_manager2 = CertificateManager::new(Arc::new(config.clone()));
         let result2 = rt.block_on(cert_manager2.initialize());
         assert!(result2.is_ok());
         
@@ -162,6 +162,18 @@ mod tests {
             }
             _ => panic!("Expected filesystem certificates for existing files"),
         }
+
+        // Explicit paths use the same file parser as discovered certificates.
+        let mut provided = config;
+        provided.ssl_cert = Some(cert_path.to_string_lossy().into_owned());
+        provided.ssl_key = Some(key_path.to_string_lossy().into_owned());
+        let manager = CertificateManager::new(Arc::new(provided));
+        assert!(rt.block_on(manager.initialize()).is_ok());
+
+        std::fs::write(&key_path, b"not a private key").unwrap();
+        assert!(rt.block_on(manager.initialize()).is_err());
+        std::fs::write(&cert_path, b"not a certificate").unwrap();
+        assert!(rt.block_on(manager.initialize()).is_err());
     }
 
     #[test]
