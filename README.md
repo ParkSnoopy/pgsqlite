@@ -397,4 +397,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines.
 
 ## License
 
-This project is licensed under the Apache License, Version 2.0 - see the [LICENSE](LICENSE) file for details.
+The project is licensed under [GPL-3.0-only](LICENSE) after commit `00ee9ed5c3e88f26203281d378a274da7a4da6ee`. That commit and earlier versions are available under [Apache-2.0](LICENSE.ORIG); existing Apache-2.0 grants for that material remain in effect.

@@ -213,4 +213,4 @@ Based on comprehensive benchmarking (100 operations each):
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the Apache License 2.0.
+By contributing, you agree that your contributions will be licensed under GPL-3.0-only. See [LICENSE](LICENSE) and the [license history](README.md#license).
