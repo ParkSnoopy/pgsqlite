@@ -12,6 +12,10 @@ static CREATE_TABLE_REGEX: Lazy<Result<Regex, regex::Error>> = Lazy::new(|| {
     Regex::new(r#"(?is)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"([^"]+)"|(\w+))\s*\((.*)\)"#)
 });
 
+static CHECK_REGEX_OP_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"([a-zA-Z_][a-zA-Z0-9_]*|"[^"]+")\s*(~|\!~|~\*|\!~\*)\s*('[^']*')"#).unwrap()
+});
+
 #[derive(Debug)]
 pub struct CreateTableResult {
     pub sql: String,
@@ -86,8 +90,13 @@ impl CreateTableTranslator {
             // No CHECK constraints to add anymore
             let final_columns = sqlite_columns;
 
-            // Reconstruct CREATE TABLE
-            let sqlite_sql = format!("CREATE TABLE {} ({})", table_name_for_output, final_columns);
+            // Reconstruct CREATE TABLE preserving IF NOT EXISTS if present
+            let if_not_exists = if pg_sql.to_uppercase().contains("IF NOT EXISTS") {
+                "IF NOT EXISTS "
+            } else {
+                ""
+            };
+            let sqlite_sql = format!("CREATE TABLE {}{} ({})", if_not_exists, table_name_for_output, final_columns);
             
             Ok(CreateTableResult {
                 sql: sqlite_sql,
@@ -152,12 +161,36 @@ impl CreateTableTranslator {
                 serial_columns.insert(column_name);
             }
         }
+
+        // Check if the table already has another primary key defined
+        let mut has_other_primary_key = false;
+        for column_def in &column_definitions {
+            let upper = column_def.to_uppercase();
+            if upper.trim().starts_with("PRIMARY KEY") {
+                if !Self::is_redundant_primary_key(column_def, &serial_columns) {
+                    has_other_primary_key = true;
+                }
+            } else if upper.contains("PRIMARY KEY") {
+                if let Some(col_name) = column_def.split_whitespace().next() {
+                    if !serial_columns.iter().any(|s| s.eq_ignore_ascii_case(col_name)) {
+                        has_other_primary_key = true;
+                    }
+                }
+            }
+        }
         
         // Second pass: translate columns, filtering out redundant PRIMARY KEY constraints
+        let mut pk_already_assigned = has_other_primary_key;
         for column_def in column_definitions {
             if Self::is_redundant_primary_key(&column_def, &serial_columns) {
                 // Skip this PRIMARY KEY constraint as it's already handled by SERIAL
                 continue;
+            }
+
+            let is_serial = Self::extract_serial_column_name(&column_def).is_some();
+            let treat_serial_as_pk = is_serial && !pk_already_assigned;
+            if treat_serial_as_pk {
+                pk_already_assigned = true;
             }
             
             let translated = Self::translate_column_definition(
@@ -165,12 +198,32 @@ impl CreateTableTranslator {
                 table_name,
                 type_mapping,
                 context,
-                conn
+                conn,
+                treat_serial_as_pk,
             )?;
+            let translated = Self::translate_check_regex(&translated);
             sqlite_columns.push(translated);
         }
         
         Ok(sqlite_columns.join(", "))
+    }
+
+    fn translate_check_regex(col_def: &str) -> String {
+        if !col_def.contains('~') {
+            return col_def.to_string();
+        }
+        CHECK_REGEX_OP_PATTERN.replace_all(col_def, |caps: &regex::Captures| {
+            let g1 = caps.get(1).unwrap().as_str();
+            let op = caps.get(2).unwrap().as_str();
+            let g3 = caps.get(3).unwrap().as_str();
+            match op {
+                "~" => format!("regexp({}, {})", g3, g1),
+                "!~" => format!("(NOT regexp({}, {}))", g3, g1),
+                "~*" => format!("regexpi({}, {})", g3, g1),
+                "!~*" => format!("(NOT regexpi({}, {}))", g3, g1),
+                _ => caps.get(0).unwrap().as_str().to_string(),
+            }
+        }).to_string()
     }
     
     /// Extract column name if this is a SERIAL column definition
@@ -206,7 +259,8 @@ impl CreateTableTranslator {
         table_name: &str,
         type_mapping: &mut HashMap<String, TypeMapping>,
         context: &mut CreateTableContext,
-        conn: Option<&Connection>
+        conn: Option<&Connection>,
+        treat_serial_as_pk: bool,
     ) -> Result<String, PgSqliteError> {
         // Handle constraints (PRIMARY KEY, FOREIGN KEY, etc.)
         if column_def.to_uppercase().starts_with("PRIMARY KEY") 
@@ -339,7 +393,11 @@ impl CreateTableTranslator {
                 _ => {
                     // Not an ENUM, use regular type mapping
                     let type_mapper = TypeMapper::new();
-                    let sqlite_type = type_mapper.pg_to_sqlite_for_create_table(&pg_type);
+                    let sqlite_type = if (pg_type == "SERIAL" || pg_type == "BIGSERIAL") && !treat_serial_as_pk {
+                        "INTEGER".to_string()
+                    } else {
+                        type_mapper.pg_to_sqlite_for_create_table(&pg_type)
+                    };
                     let normalized_pg_type = Self::normalize_pg_type_name(&pg_type);
                     (sqlite_type, normalized_pg_type)
                 }
@@ -347,7 +405,11 @@ impl CreateTableTranslator {
         } else {
             // No connection available, use regular type mapping
             let type_mapper = TypeMapper::new();
-            let sqlite_type = type_mapper.pg_to_sqlite_for_create_table(&pg_type);
+            let sqlite_type = if (pg_type == "SERIAL" || pg_type == "BIGSERIAL") && !treat_serial_as_pk {
+                "INTEGER".to_string()
+            } else {
+                type_mapper.pg_to_sqlite_for_create_table(&pg_type)
+            };
             let normalized_pg_type = Self::normalize_pg_type_name(&pg_type);
             (sqlite_type, normalized_pg_type)
         };
@@ -381,7 +443,7 @@ impl CreateTableTranslator {
             }
 
             // Special handling for SERIAL - skip PRIMARY KEY as it's included in the type translation
-            if (pg_type.to_uppercase() == "SERIAL" || pg_type.to_uppercase() == "BIGSERIAL")
+            if treat_serial_as_pk && (pg_type.to_uppercase() == "SERIAL" || pg_type.to_uppercase() == "BIGSERIAL")
                 && part.to_uppercase() == "PRIMARY" {
                     // Skip "PRIMARY" and check if next is "KEY"
                     if let Some(next_part) = parts.get(type_end_idx + i + 1)
@@ -737,9 +799,9 @@ mod tests {
 
         println!("Translated SQL: {}", result.sql);
 
-        // Check that NOW() was translated to datetime('now')
-        assert!(result.sql.contains("DEFAULT datetime('now')"),
-                "Expected 'DEFAULT datetime('now')' but got: {}", result.sql);
+        // Check that NOW() was translated to (datetime('now'))
+        assert!(result.sql.contains("DEFAULT (datetime('now'))"),
+                "Expected 'DEFAULT (datetime('now'))' but got: {}", result.sql);
         assert!(!result.sql.contains("DEFAULT now()"),
                 "Found 'DEFAULT now()' which should have been translated: {}", result.sql);
     }

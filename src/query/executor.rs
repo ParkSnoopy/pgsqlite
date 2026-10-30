@@ -30,17 +30,378 @@ static SET_CONFIG_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)set_config\(\s*'([^']+)'\s*,\s*'([^']*)'\s*,\s*(true|false)\s*\)").unwrap()
 });
 
-fn preprocess_query(query: &str) -> String {
-    let query: Cow<'_, str> = if PG_SHOW_ALL_SETTINGS_PATTERN.is_match(query) {
-        Cow::Owned(PG_SHOW_ALL_SETTINGS_PATTERN.replace_all(query, "pg_settings").to_string())
+static UPDATE_ALIAS_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)\bUPDATE\s+(?:ONLY\s+)?("[^"]+"|[a-zA-Z_][a-zA-Z0-9_]*)\s+("[^"]+"|[a-zA-Z_][a-zA-Z0-9_]*)\s+SET\b"#).unwrap()
+});
+
+static DELETE_ALIAS_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)\bDELETE\s+FROM\s+(?:ONLY\s+)?("[^"]+"|[a-zA-Z_][a-zA-Z0-9_]*)\s+("[^"]+"|[a-zA-Z_][a-zA-Z0-9_]*)\s+(WHERE|RETURNING|USING)\b"#).unwrap()
+});
+
+static XMAX_ZERO_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\(?\bxmax\s*=\s*0\)?").unwrap()
+});
+
+static XMAX_NONZERO_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\(?\bxmax\s*(?:!=|<>)\s*0\)?").unwrap()
+});
+
+static DO_UPDATE_SET_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)\bON\s+CONFLICT\b.*?\bDO\s+UPDATE\s+SET\s+("[^"]+"|[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*)"#).unwrap()
+});
+
+static ON_CONFLICT_CONSTRAINT_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)\bON\s+CONFLICT\s+ON\s+CONSTRAINT\s+(?:"[^"]+"|[a-zA-Z_][a-zA-Z0-9_]*)"#).unwrap()
+});
+
+static INET_CONTAINS_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(\b[a-zA-Z_][a-zA-Z0-9_.]*(?:\([^)]*\))?)\s*>>=\s*('[^']*'|\$[0-9]+(?:::[a-zA-Z0-9_]+)?|[a-zA-Z_][a-zA-Z0-9_.]*(?:\([^)]*\))?)"#).unwrap()
+});
+
+static SELECT_ARRAY_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\(?\s*SELECT\s+ARRAY\s*\(").unwrap()
+});
+
+static DISTINCT_ON_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\bSELECT\s+DISTINCT\s+ON\s*\(").unwrap()
+});
+
+fn rewrite_select_array(sql: &str) -> String {
+    if !sql.to_ascii_uppercase().contains("SELECT ARRAY") {
+        return sql.to_string();
+    }
+    let mut result = String::new();
+    let mut idx = 0;
+    while let Some(m) = SELECT_ARRAY_PATTERN.find(&sql[idx..]) {
+        let match_start = idx + m.start();
+        result.push_str(&sql[idx..match_start]);
+        
+        let has_outer_paren = sql[match_start..].starts_with('(');
+        let array_paren_offset = if has_outer_paren {
+            sql[match_start..].find("ARRAY").and_then(|pos| sql[match_start + pos..].find('(').map(|p| match_start + pos + p))
+        } else {
+            sql[match_start..].find('(').map(|p| match_start + p)
+        };
+        
+        if let Some(paren_start) = array_paren_offset {
+            let mut depth = 0;
+            let mut end_pos = None;
+            for (i, b) in sql[paren_start..].bytes().enumerate() {
+                if b == b'(' {
+                    depth += 1;
+                } else if b == b')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_pos = Some(paren_start + i + 1);
+                        break;
+                    }
+                }
+            }
+            if let Some(inner_end) = end_pos {
+                let mut total_end = inner_end;
+                if has_outer_paren {
+                    let rem = &sql[inner_end..];
+                    let trimmed_len = rem.len() - rem.trim_start().len();
+                    if rem[trimmed_len..].starts_with(')') {
+                        total_end = inner_end + trimmed_len + 1;
+                    }
+                }
+                let expr = &sql[match_start..total_end];
+                static ARRAY_CAT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)array_cat\s*\((.+?),\s*(.+?)\)").unwrap());
+                static ARRAY_OR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)unnest\s*\((.+?)\s*\|\|\s*(.+?)\)").unwrap());
+                
+                if let Some(caps) = ARRAY_CAT_RE.captures(expr) {
+                    let a = caps.get(1).unwrap().as_str().trim();
+                    let b = caps.get(2).unwrap().as_str().trim();
+                    result.push_str(&format!("pg_array_distinct_cat({}, {})", a, b));
+                } else if let Some(caps) = ARRAY_OR_RE.captures(expr) {
+                    let a = caps.get(1).unwrap().as_str().trim();
+                    let b = caps.get(2).unwrap().as_str().trim();
+                    result.push_str(&format!("pg_array_distinct_cat({}, {})", a, b));
+                } else {
+                    result.push_str(expr);
+                }
+                idx = total_end;
+                continue;
+            }
+        }
+        result.push_str(&sql[match_start..idx + m.end()]);
+        idx += m.end();
+    }
+    result.push_str(&sql[idx..]);
+    result
+}
+
+fn rewrite_distinct_on(sql: &str) -> String {
+    if !sql.to_ascii_uppercase().contains("DISTINCT ON") {
+        return sql.to_string();
+    }
+    let mut current = sql.to_string();
+    while let Some(m) = DISTINCT_ON_PATTERN.find(&current) {
+        let sel_start = m.start();
+        let paren_start = m.end() - 1;
+        let mut depth = 0;
+        let mut paren_end = None;
+        for (i, b) in current[paren_start..].bytes().enumerate() {
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                depth -= 1;
+                if depth == 0 {
+                    paren_end = Some(paren_start + i);
+                    break;
+                }
+            }
+        }
+        let Some(p_end) = paren_end else { break; };
+        let keys = current[paren_start + 1..p_end].trim();
+        
+        static FROM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bFROM\b").unwrap());
+        let Some(from_m) = FROM_RE.find(&current[p_end..]) else { break; };
+        let from_start = p_end + from_m.start();
+        let cols = current[p_end + 1..from_start].trim();
+        let from_end = from_start + 4;
+        
+        let mut outer_depth = 0;
+        let mut query_end = current.len();
+        for (i, b) in current[from_end..].bytes().enumerate() {
+            if b == b'(' {
+                outer_depth += 1;
+            } else if b == b')' {
+                if outer_depth == 0 {
+                    query_end = from_end + i;
+                    break;
+                }
+                outer_depth -= 1;
+            } else if b == b';' && outer_depth == 0 {
+                query_end = from_end + i;
+                break;
+            }
+        }
+        
+        let rest = current[from_end..query_end].trim();
+        let mut from_where = rest;
+        let mut order_by = None;
+        let mut ob_depth = 0;
+        let rest_bytes = rest.as_bytes();
+        for i in 0..rest.len() {
+            let b = rest_bytes[i];
+            if b == b'(' {
+                ob_depth += 1;
+            } else if b == b')' {
+                if ob_depth > 0 { ob_depth -= 1; }
+            } else if ob_depth == 0 && i + 8 <= rest.len() && rest[i..i+8].eq_ignore_ascii_case("ORDER BY") {
+                from_where = rest[..i].trim();
+                order_by = Some(rest[i+8..].trim());
+                break;
+            }
+        }
+        
+        let mut out_cols = Vec::new();
+        for col in cols.split(',') {
+            let col = col.trim();
+            static AS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)").unwrap());
+            if let Some(c) = AS_RE.captures(col) {
+                out_cols.push(c.get(1).unwrap().as_str().to_string());
+            } else if let Some(dot_pos) = col.rfind('.') {
+                out_cols.push(col[dot_pos + 1..].trim().to_string());
+            } else {
+                out_cols.push(col.to_string());
+            }
+        }
+        let outer_cols_str = out_cols.join(", ");
+        
+        let over_clause = if let Some(ob) = order_by {
+            format!("PARTITION BY {keys} ORDER BY {ob}")
+        } else {
+            format!("PARTITION BY {keys}")
+        };
+        
+        let replacement = format!(
+            "SELECT {outer_cols_str} FROM (SELECT {cols}, ROW_NUMBER() OVER ({over_clause}) AS __pg_rn FROM {from_where}) WHERE __pg_rn = 1"
+        );
+        
+        current = format!("{}{}{}", &current[..sel_start], replacement, &current[query_end..]);
+    }
+    current
+}
+
+fn wrap_do_update_conflict(query: &str) -> String {
+    if let Some(m) = DO_UPDATE_SET_PATTERN.find(query) {
+        let start_pos = m.end();
+        let bytes = query.as_bytes();
+        let mut depth = 0;
+        let mut in_quote: Option<u8> = None;
+        let mut end_pos = query.len();
+        
+        let mut i = start_pos;
+        while i < query.len() {
+            let b = bytes[i];
+            if let Some(q) = in_quote {
+                if b == q {
+                    in_quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            if b == b'\'' || b == b'"' {
+                in_quote = Some(b);
+                i += 1;
+                continue;
+            }
+            if b == b'(' {
+                depth += 1;
+            } else if b == b')' {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            } else if depth == 0 {
+                if b == b',' {
+                    end_pos = i;
+                    break;
+                }
+                let rest = &query[i..];
+                if rest.starts_with(" WHERE ") || rest.starts_with("\nWHERE ") || rest.starts_with("\r\nWHERE ")
+                    || rest.starts_with(" RETURNING ") || rest.starts_with("\nRETURNING ") || rest.starts_with("\r\nRETURNING ") {
+                    end_pos = i;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        
+        let expr = query[start_pos..end_pos].trim();
+        format!("{}{}pg_mark_conflict({}){}", &query[..start_pos], if query[start_pos..].starts_with(' ') { " " } else { "" }, expr, &query[end_pos..])
     } else {
-        Cow::Borrowed(query)
-    };
+        query.to_string()
+    }
+}
+
+pub(crate) fn preprocess_query(query: &str) -> String {
+    let mut rewritten = query.to_string();
+    if ON_CONFLICT_CONSTRAINT_PATTERN.is_match(&rewritten) {
+        rewritten = ON_CONFLICT_CONSTRAINT_PATTERN.replace_all(&rewritten, "ON CONFLICT").to_string();
+    }
+    if rewritten.contains(">>=") {
+        rewritten = INET_CONTAINS_PATTERN.replace_all(&rewritten, |caps: &regex::Captures| {
+            format!("pg_inet_contains_or_equals({}, {})", &caps[1], &caps[2])
+        }).to_string();
+    }
+    if rewritten.to_ascii_uppercase().contains("SELECT ARRAY") {
+        rewritten = rewrite_select_array(&rewritten);
+    }
+    if rewritten.contains("ILIKE") || rewritten.contains("ilike") {
+        static NOT_ILIKE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?i)\bNOT\s+ILIKE\b").unwrap());
+        static ILIKE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?i)\bILIKE\b").unwrap());
+        rewritten = NOT_ILIKE_RE.replace_all(&rewritten, "NOT LIKE").to_string();
+        rewritten = ILIKE_RE.replace_all(&rewritten, "LIKE").to_string();
+    }
+    if rewritten.contains("unnest") || rewritten.contains("UNNEST") {
+        rewritten = crate::translator::UnnestTranslator::translate_unnest(&rewritten).unwrap_or(rewritten);
+    }
+    if rewritten.to_ascii_uppercase().contains("FOR UPDATE") || rewritten.to_ascii_uppercase().contains("FOR SHARE") || rewritten.to_ascii_uppercase().contains("FOR NO KEY UPDATE") || rewritten.to_ascii_uppercase().contains("FOR KEY SHARE") {
+        static FOR_UPDATE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r#"(?i)\bFOR\s+(?:UPDATE|NO\s+KEY\s+UPDATE|SHARE|KEY\s+SHARE)(?:\s+OF\s+[a-zA-Z0-9_,\s]+)?(?:\s+NOWAIT|\s+SKIP\s+LOCKED)?"#).unwrap()
+        });
+        rewritten = FOR_UPDATE_RE.replace_all(&rewritten, "").to_string();
+    }
+    if rewritten.to_ascii_uppercase().contains("CROSS JOIN LATERAL") {
+        static CROSS_JOIN_LATERAL_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r#"(?i)\bCROSS\s+JOIN\s+LATERAL\b"#).unwrap()
+        });
+        rewritten = CROSS_JOIN_LATERAL_RE.replace_all(&rewritten, "JOIN").to_string();
+    }
+    if rewritten.to_ascii_uppercase().contains("DELETE FROM") && rewritten.to_ascii_uppercase().contains("USING") {
+        static DELETE_USING_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r#"(?is)\bDELETE\s+FROM\s+([a-zA-Z0-9_]+(?:\s+(?:AS\s+)?[a-zA-Z0-9_]+)?)\s+USING\s+(.+?)\s+WHERE\s+(.+?)(?:\s+(RETURNING\s+[^;]+))?$"#).unwrap()
+        });
+        if let Some(caps) = DELETE_USING_RE.captures(&rewritten) {
+            let target = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let using = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let where_clause = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            let returning = caps.get(4).map(|m| format!(" {}", m.as_str())).unwrap_or_default();
+            let full_match = caps.get(0).unwrap().as_str();
+            let replacement = format!("DELETE FROM {target} WHERE EXISTS (SELECT 1 FROM {using} WHERE {where_clause}){returning}");
+            rewritten = rewritten.replace(full_match, &replacement);
+        }
+    }
+    if rewritten.to_ascii_lowercase().contains("array_elements") {
+        static JSONB_ARRAY_ELEMENTS_ALIAS_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r#"(?i)\bjsonb?_array_elements(?:_text)?\s*\(([^()]+(?:\([^()]*\)[^()]*)*)\)\s*(?:AS\s+)?(\w+)\s*\(\s*(\w+)\s*\)"#).unwrap()
+        });
+        while let Some(caps) = JSONB_ARRAY_ELEMENTS_ALIAS_RE.captures(&rewritten) {
+            let full_match = caps.get(0).unwrap().as_str().to_string();
+            let expr = caps.get(1).unwrap().as_str().to_string();
+            let tbl = caps.get(2).unwrap().as_str().to_string();
+            let col = caps.get(3).unwrap().as_str().to_string();
+            drop(caps);
+            let replacement = format!("json_each({expr}) AS {tbl}");
+            rewritten = rewritten.replace(&full_match, &replacement);
+            if let Ok(col_ref_re) = regex::Regex::new(&format!(r#"(?i)\b{}\.{}\b"#, tbl, col)) {
+                rewritten = col_ref_re.replace_all(&rewritten, &format!("{tbl}.value")).to_string();
+            }
+        }
+
+        static JSONB_ARRAY_ELEMENTS_SINGLE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r#"(?i)\bjsonb?_array_elements(?:_text)?\s*\(([^()]+(?:\([^()]*\)[^()]*)*)\)\s*(?:AS\s+)?(\w+)"#).unwrap()
+        });
+        while let Some(caps) = JSONB_ARRAY_ELEMENTS_SINGLE_RE.captures(&rewritten) {
+            let full_match = caps.get(0).unwrap().as_str().to_string();
+            let expr = caps.get(1).unwrap().as_str().to_string();
+            let alias = caps.get(2).unwrap().as_str().to_string();
+            drop(caps);
+            let placeholder = format!("__JSON_EACH_P_{alias}__");
+            rewritten = rewritten.replace(&full_match, &placeholder);
+            if let Ok(alias_ref_re) = regex::Regex::new(&format!(r#"(?i)\b{}\b"#, alias)) {
+                rewritten = alias_ref_re.replace_all(&rewritten, &format!("_j_{alias}.value")).to_string();
+            }
+            rewritten = rewritten.replace(&placeholder, &format!("json_each({expr}) AS _j_{alias}"));
+        }
+    }
+    if rewritten.contains('~') {
+        if let Ok(translated) = crate::translator::RegexTranslator::translate_query(&rewritten) {
+            rewritten = translated;
+        }
+    }
+    if rewritten.to_ascii_uppercase().contains("DISTINCT ON") {
+        rewritten = rewrite_distinct_on(&rewritten);
+    }
+    if rewritten.to_ascii_lowercase().contains("xmax") {
+        rewritten = wrap_do_update_conflict(&rewritten);
+        rewritten = XMAX_ZERO_PATTERN.replace_all(&rewritten, "pg_is_insert()").to_string();
+        rewritten = XMAX_NONZERO_PATTERN.replace_all(&rewritten, "(1 - pg_is_insert())").to_string();
+    }
+    if PG_SHOW_ALL_SETTINGS_PATTERN.is_match(&rewritten) {
+        rewritten = PG_SHOW_ALL_SETTINGS_PATTERN.replace_all(&rewritten, "pg_settings").to_string();
+    }
+    if UPDATE_ALIAS_PATTERN.is_match(&rewritten) {
+        rewritten = UPDATE_ALIAS_PATTERN.replace_all(&rewritten, |caps: &regex::Captures| {
+            let g1 = caps.get(1).unwrap().as_str();
+            let g2 = caps.get(2).unwrap().as_str();
+            if g2.eq_ignore_ascii_case("SET") || g2.eq_ignore_ascii_case("AS") || g2.eq_ignore_ascii_case("ONLY") {
+                caps.get(0).unwrap().as_str().to_string()
+            } else {
+                format!("UPDATE {} AS {} SET", g1, g2)
+            }
+        }).to_string();
+    }
+    if DELETE_ALIAS_PATTERN.is_match(&rewritten) {
+        rewritten = DELETE_ALIAS_PATTERN.replace_all(&rewritten, |caps: &regex::Captures| {
+            let g1 = caps.get(1).unwrap().as_str();
+            let g2 = caps.get(2).unwrap().as_str();
+            let g3 = caps.get(3).unwrap().as_str();
+            if g2.eq_ignore_ascii_case("WHERE") || g2.eq_ignore_ascii_case("AS") || g2.eq_ignore_ascii_case("ONLY") || g2.eq_ignore_ascii_case("RETURNING") || g2.eq_ignore_ascii_case("USING") {
+                caps.get(0).unwrap().as_str().to_string()
+            } else {
+                format!("DELETE FROM {} AS {} {}", g1, g2, g3)
+            }
+        }).to_string();
+    }
 
     if crate::config::hide_internal_tables() {
-        crate::translator::SqliteMasterFilter::translate(&query).into_owned()
+        crate::translator::SqliteMasterFilter::translate(&rewritten).into_owned()
     } else {
-        query.into_owned()
+        rewritten
     }
 }
 
@@ -202,7 +563,8 @@ impl QueryExecutor {
         
         // Check if query is empty after comment stripping
         if query_to_execute.is_empty() {
-            return Err(PgSqliteError::Protocol(error_message!("Empty query").into_owned()));
+            framed.send(BackendMessage::EmptyQueryResponse).await.map_err(PgSqliteError::Io)?;
+            return Ok(());
         }
         
         // Handle PostgreSQL DEALLOCATE commands (used for prepared statement cleanup)
@@ -231,30 +593,22 @@ impl QueryExecutor {
         
         // Check if query contains multiple statements
         let trimmed = query_to_execute.trim();
-        if trimmed.contains(';') {
-            // Split by semicolon and execute each statement
-            let statements: Vec<&str> = trimmed.split(';')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            
-            // Handle empty query case (just semicolon) - SQLAlchemy uses ";" for ping
-            if statements.is_empty() {
-                debug!("Empty query (just semicolon) - treating as successful no-op");
-                // Send CommandComplete for successful empty query
-                let msg = BackendMessage::CommandComplete { tag: global_string_optimizer().get_command_tag("SELECT", 0).into_owned() };
-                framed.send(msg).await.map_err(PgSqliteError::Io)?;
-                return Ok(());
+        let statements = crate::query::split_sql_statements(trimmed);
+        
+        // Handle empty query case
+        if statements.is_empty() {
+            debug!("Empty query - sending EmptyQueryResponse");
+            framed.send(BackendMessage::EmptyQueryResponse).await.map_err(PgSqliteError::Io)?;
+            return Ok(());
+        }
+        
+        if statements.len() > 1 {
+            debug!("Query contains {} statements", statements.len());
+            for (i, stmt) in statements.iter().enumerate() {
+                debug!("Executing statement {}: {}", i + 1, stmt);
+                Self::execute_single_statement(framed, db, session, stmt, query_router).await?;
             }
-            
-            if statements.len() > 1 {
-                debug!("Query contains {} statements", statements.len());
-                for (i, stmt) in statements.iter().enumerate() {
-                    debug!("Executing statement {}: {}", i + 1, stmt);
-                    Self::execute_single_statement(framed, db, session, stmt, query_router).await?;
-                }
-                return Ok(());
-            }
+            return Ok(());
         }
         
         // Single statement execution
@@ -321,6 +675,15 @@ impl QueryExecutor {
                 tag: "SELECT 1".to_string()
             }).await.map_err(PgSqliteError::Io)?;
 
+            return Ok(());
+        }
+
+        // Handle DO procedural blocks (no-op in SQLite)
+        if crate::query::QueryTypeDetector::is_do(query) {
+            info!("DO block received - procedural blocks not supported in SQLite, succeeding with no-op");
+            framed.send(BackendMessage::CommandComplete {
+                tag: "DO".to_string()
+            }).await.map_err(PgSqliteError::Io)?;
             return Ok(());
         }
 
@@ -946,6 +1309,14 @@ impl QueryExecutor {
             QueryType::Begin | QueryType::Commit | QueryType::Rollback => {
                 Self::execute_transaction(framed, db, session, query_to_execute, query_router).await
             }
+            QueryType::Do => {
+                info!("DO block received - procedural blocks not supported in SQLite, succeeding with no-op");
+                framed.send(BackendMessage::CommandComplete {
+                    tag: "DO".to_string()
+                }).await
+                    .map_err(PgSqliteError::Io)?;
+                Ok(())
+            }
             _ => {
                 // Check if it's a SET command
                 if crate::query::SetHandler::is_set_command(query_to_execute) {
@@ -971,6 +1342,15 @@ impl QueryExecutor {
                     info!("FLUSH command received - SQLite doesn't have caching layers like PostgreSQL, succeeding with no-op");
                     framed.send(BackendMessage::CommandComplete {
                         tag: "FLUSH".to_string()
+                    }).await
+                        .map_err(PgSqliteError::Io)?;
+                    Ok(())
+                } else if query_to_execute.trim().to_uppercase().starts_with("LOCK TABLE")
+                    || query_to_execute.trim().to_uppercase().starts_with("LOCK ") {
+                    // Handle LOCK TABLE commands (SQLite handles transaction locks at database level)
+                    info!("LOCK TABLE command received - succeeding with no-op");
+                    framed.send(BackendMessage::CommandComplete {
+                        tag: "LOCK TABLE".to_string()
                     }).await
                         .map_err(PgSqliteError::Io)?;
                     Ok(())
@@ -1712,6 +2092,7 @@ impl QueryExecutor {
         
         // SQLite 3.35.0+ supports native RETURNING clause
         // Execute the query with RETURNING clause directly
+        crate::functions::system_functions::reset_conflict_flag();
         let returning_response = if let Some(router) = query_router {
             router.execute_query(query, session).await.map_err(|e| PgSqliteError::Protocol(e.to_string()))?
         } else {
@@ -1735,8 +2116,11 @@ impl QueryExecutor {
             let mut type_oid = PgType::Text.to_oid(); // Default to text
             let mut pg_type = None;
             
-            // Try to get type information from schema
-            if let Some(ref table) = table_name
+            let col_lower = col_name.to_lowercase();
+            if col_lower == "pg_is_insert" || col_lower == "pg_is_insert()" || col_lower.contains("xmax") {
+                type_oid = PgType::Bool.to_oid();
+                pg_type = Some("BOOLEAN".to_string());
+            } else if let Some(ref table) = table_name
                 && let Ok(Some(schema_type)) = db.get_schema_type_with_session(&session.id, table, col_name).await {
                     pg_type = Some(schema_type.clone());
                     type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&schema_type);
@@ -1769,6 +2153,17 @@ impl QueryExecutor {
                     if let Some(Some(pg_type)) = column_types.get(col_idx) {
                         // Apply type-specific formatting for datetime types
                         let formatted = match pg_type.to_uppercase().as_str() {
+                            "BOOL" | "BOOLEAN" => {
+                                if let Ok(s) = std::str::from_utf8(value_bytes) {
+                                    match s.trim() {
+                                        "1" => Some(b"t".to_vec()),
+                                        "0" => Some(b"f".to_vec()),
+                                        _ => Some(value_bytes.clone()),
+                                    }
+                                } else {
+                                    Some(value_bytes.clone())
+                                }
+                            }
                             "DATE" => {
                                 // Convert INTEGER days to YYYY-MM-DD format
                                 if let Ok(value_str) = std::str::from_utf8(value_bytes) {
@@ -1905,6 +2300,27 @@ impl QueryExecutor {
 
                 return Ok(());
             }
+            if after_create.starts_with("FUNCTION") || after_create.starts_with("OR REPLACE FUNCTION") {
+                info!("CREATE FUNCTION command received - succeeding with no-op");
+                framed.send(BackendMessage::CommandComplete {
+                    tag: "CREATE FUNCTION".to_string()
+                }).await.map_err(PgSqliteError::Io)?;
+                return Ok(());
+            }
+            if after_create.starts_with("PROCEDURE") || after_create.starts_with("OR REPLACE PROCEDURE") {
+                info!("CREATE PROCEDURE command received - succeeding with no-op");
+                framed.send(BackendMessage::CommandComplete {
+                    tag: "CREATE PROCEDURE".to_string()
+                }).await.map_err(PgSqliteError::Io)?;
+                return Ok(());
+            }
+            if after_create.starts_with("TRIGGER") {
+                info!("CREATE TRIGGER command received - succeeding with no-op");
+                framed.send(BackendMessage::CommandComplete {
+                    tag: "CREATE TRIGGER".to_string()
+                }).await.map_err(PgSqliteError::Io)?;
+                return Ok(());
+            }
         }
 
         // Check if this is a DROP USER/ROLE statement
@@ -1919,6 +2335,41 @@ impl QueryExecutor {
                 }).await
                     .map_err(PgSqliteError::Io)?;
 
+                return Ok(());
+            }
+            if after_drop.starts_with("FUNCTION") {
+                info!("DROP FUNCTION command received - succeeding with no-op");
+                framed.send(BackendMessage::CommandComplete {
+                    tag: "DROP FUNCTION".to_string()
+                }).await.map_err(PgSqliteError::Io)?;
+                return Ok(());
+            }
+            if after_drop.starts_with("PROCEDURE") {
+                info!("DROP PROCEDURE command received - succeeding with no-op");
+                framed.send(BackendMessage::CommandComplete {
+                    tag: "DROP PROCEDURE".to_string()
+                }).await.map_err(PgSqliteError::Io)?;
+                return Ok(());
+            }
+            if after_drop.starts_with("TRIGGER") {
+                info!("DROP TRIGGER command received - succeeding with no-op");
+                framed.send(BackendMessage::CommandComplete {
+                    tag: "DROP TRIGGER".to_string()
+                }).await.map_err(PgSqliteError::Io)?;
+                return Ok(());
+            }
+        }
+
+        // Check if this is an ALTER TABLE constraint/default alteration
+        if matches!(QueryTypeDetector::detect_query_type(query), QueryType::Alter) {
+            let query_upper = query.to_uppercase();
+            if query_upper.contains("DROP CONSTRAINT") 
+                || query_upper.contains("ADD CONSTRAINT") 
+                || query_upper.contains("ALTER COLUMN") {
+                info!("ALTER TABLE constraint/column alter received - succeeding with no-op");
+                framed.send(BackendMessage::CommandComplete {
+                    tag: "ALTER TABLE".to_string()
+                }).await.map_err(PgSqliteError::Io)?;
                 return Ok(());
             }
         }
@@ -1964,6 +2415,10 @@ impl QueryExecutor {
                 
                 Ok((result.sql, result.type_mappings, result.enum_columns, result.array_columns))
             }).await?
+        } else if query.to_uppercase().contains("CREATE INDEX") || query.to_uppercase().contains("CREATE UNIQUE INDEX") {
+            use crate::translator::CreateIndexTranslator;
+            let translated = CreateIndexTranslator::translate(query);
+            (translated, std::collections::HashMap::new(), Vec::new(), Vec::new())
         } else {
             // For other DDL, check for JSON/JSONB types
             let translated = if query.to_lowercase().contains("json") || query.to_lowercase().contains("jsonb") {
@@ -1989,9 +2444,26 @@ impl QueryExecutor {
             None
         };
         
+        // For ALTER TABLE with IF NOT EXISTS, SQLite does not support IF NOT EXISTS in ADD COLUMN
+        let query_upper = query.to_uppercase();
+        let query_to_run = if query_upper.starts_with("ALTER TABLE") && query_upper.contains("IF NOT EXISTS") {
+            let re = regex::Regex::new(r"(?i)\bIF\s+NOT\s+EXISTS\b").unwrap();
+            re.replace(&translated_query, "").to_string()
+        } else {
+            translated_query
+        };
+
         // Execute the translated query
         let cached_conn = Self::get_or_cache_connection(session, db).await;
-        db.execute_with_session_cached(&translated_query, &session.id, cached_conn.as_ref()).await?;
+        let exec_result = db.execute_with_session_cached(&query_to_run, &session.id, cached_conn.as_ref()).await;
+        if let Err(e) = exec_result {
+            let err_str = e.to_string();
+            if query_upper.starts_with("ALTER TABLE") && (err_str.contains("duplicate column name") || err_str.contains("already exists")) {
+                info!("Column already exists, ignoring error for idempotency");
+            } else {
+                return Err(e);
+            }
+        }
         
         // If this was a DROP TABLE, clean up enum usage records and invalidate cache
         if let Some(table_name) = table_name_to_clean {
@@ -2204,7 +2676,7 @@ impl QueryExecutor {
                 let after_create = query.trim_start()[6..].trim_start();
                 if after_create.to_uppercase().starts_with("TABLE") {
                     "CREATE TABLE".to_string()
-                } else if after_create.to_uppercase().starts_with("INDEX") {
+                } else if after_create.to_uppercase().starts_with("INDEX") || after_create.to_uppercase().starts_with("UNIQUE INDEX") {
                     "CREATE INDEX".to_string()
                 } else if after_create.to_uppercase().starts_with("DATABASE") {
                     "CREATE DATABASE".to_string()

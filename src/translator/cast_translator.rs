@@ -416,6 +416,7 @@ impl CastTranslator {
     fn find_expression_start(before: &str) -> usize {
         let bytes = before.as_bytes();
         let mut paren_depth = 0;
+        let mut bracket_depth = 0;
         let mut quote_char = None;
         
         // Scan backwards to find expression start
@@ -445,10 +446,17 @@ impl CastTranslator {
                     // Return position after the '('
                     return i + 1;
                 }
+            } else if ch == b']' {
+                bracket_depth += 1;
+            } else if ch == b'[' {
+                bracket_depth -= 1;
+                if bracket_depth < 0 {
+                    return i + 1;
+                }
             }
             
-            // If we're not in parentheses, look for expression boundaries
-            if paren_depth == 0
+            // If we're not in parentheses or brackets, look for expression boundaries
+            if paren_depth == 0 && bracket_depth == 0
                 && (ch == b' ' || ch == b',' || ch == b'(' || ch == b'=' || ch == b'<' || ch == b'>') {
                     return i + 1;
                 }
@@ -502,7 +510,7 @@ impl CastTranslator {
             "TEXT", "VARCHAR", "CHAR", "BOOLEAN", "BOOL",
             "REAL", "FLOAT", "FLOAT4", "FLOAT8", "DOUBLE",
             "NUMERIC", "DECIMAL", "MONEY", "UUID", "JSON", "JSONB",
-            "BYTEA", "BIT", "VARBIT", "INTERVAL"
+            "BYTEA", "BIT", "VARBIT", "INTERVAL", "INET", "CIDR"
         ];
         
         for type_name in single_word_types {
@@ -554,7 +562,7 @@ impl CastTranslator {
             
             // If we're not inside parentheses, type name ends at these characters
             if paren_depth == 0 {
-                if ch == b' ' || ch == b',' || ch == b';' || ch == b'=' || 
+                if ch.is_ascii_whitespace() || ch == b',' || ch == b';' || ch == b'=' || 
                    ch == b'<' || ch == b'>' || ch == b'+' || ch == b'-' || ch == b'*' || 
                    ch == b'/' || ch == b'|' || ch == b'&' {
                     return i;

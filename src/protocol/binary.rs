@@ -416,6 +416,145 @@ impl BinaryEncoder {
 
         Ok(result)
     }
+
+    /// Decode a PostgreSQL binary array into a JSON array string
+    pub fn decode_array(bytes: &[u8]) -> Result<String, PgSqliteError> {
+        if bytes.len() < 12 {
+            return Ok("[]".to_string());
+        }
+        let ndim = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if ndim == 0 {
+            return Ok("[]".to_string());
+        }
+        let _flags = i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let elem_type_oid = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+
+        let mut offset = 12;
+        let mut total_elements = 1;
+        for _ in 0..ndim {
+            if offset + 8 > bytes.len() {
+                return Ok("[]".to_string());
+            }
+            let dim_size = i32::from_be_bytes([bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3]]);
+            let _lower_bound = i32::from_be_bytes([bytes[offset+4], bytes[offset+5], bytes[offset+6], bytes[offset+7]]);
+            offset += 8;
+            if dim_size <= 0 {
+                return Ok("[]".to_string());
+            }
+            total_elements *= dim_size as usize;
+        }
+
+        let mut elements = Vec::with_capacity(total_elements);
+        for _ in 0..total_elements {
+            if offset + 4 > bytes.len() {
+                break;
+            }
+            let elem_len = i32::from_be_bytes([bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3]]);
+            offset += 4;
+            if elem_len == -1 {
+                elements.push(serde_json::Value::Null);
+                continue;
+            }
+            if elem_len < 0 || offset + (elem_len as usize) > bytes.len() {
+                break;
+            }
+            let elem_bytes = &bytes[offset..offset + (elem_len as usize)];
+            offset += elem_len as usize;
+
+            let val = match elem_type_oid {
+                t if t == PgType::Int8.to_oid() => {
+                    if elem_bytes.len() == 8 {
+                        let num = i64::from_be_bytes([
+                            elem_bytes[0], elem_bytes[1], elem_bytes[2], elem_bytes[3],
+                            elem_bytes[4], elem_bytes[5], elem_bytes[6], elem_bytes[7],
+                        ]);
+                        serde_json::Value::Number(num.into())
+                    } else {
+                        serde_json::Value::Null
+                    }
+                }
+                t if t == PgType::Int4.to_oid() => {
+                    if elem_bytes.len() == 4 {
+                        let num = i32::from_be_bytes([elem_bytes[0], elem_bytes[1], elem_bytes[2], elem_bytes[3]]);
+                        serde_json::Value::Number(num.into())
+                    } else {
+                        serde_json::Value::Null
+                    }
+                }
+                t if t == PgType::Int2.to_oid() => {
+                    if elem_bytes.len() == 2 {
+                        let num = i16::from_be_bytes([elem_bytes[0], elem_bytes[1]]);
+                        serde_json::Value::Number(num.into())
+                    } else {
+                        serde_json::Value::Null
+                    }
+                }
+                t if t == PgType::Float4.to_oid() => {
+                    if elem_bytes.len() == 4 {
+                        let num = f32::from_be_bytes([elem_bytes[0], elem_bytes[1], elem_bytes[2], elem_bytes[3]]);
+                        serde_json::Number::from_f64(num as f64).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+                    } else {
+                        serde_json::Value::Null
+                    }
+                }
+                t if t == PgType::Float8.to_oid() => {
+                    if elem_bytes.len() == 8 {
+                        let num = f64::from_be_bytes([
+                            elem_bytes[0], elem_bytes[1], elem_bytes[2], elem_bytes[3],
+                            elem_bytes[4], elem_bytes[5], elem_bytes[6], elem_bytes[7],
+                        ]);
+                        serde_json::Number::from_f64(num).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+                    } else {
+                        serde_json::Value::Null
+                    }
+                }
+                t if t == PgType::Bool.to_oid() => {
+                    if !elem_bytes.is_empty() {
+                        serde_json::Value::Bool(elem_bytes[0] != 0)
+                    } else {
+                        serde_json::Value::Null
+                    }
+                }
+                t if t == PgType::Jsonb.to_oid() => {
+                    let json_bytes = if elem_bytes.starts_with(&[1]) {
+                        &elem_bytes[1..]
+                    } else {
+                        elem_bytes
+                    };
+                    if let Ok(s) = std::str::from_utf8(json_bytes) {
+                        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(s) {
+                            json_val
+                        } else {
+                            serde_json::Value::String(s.to_string())
+                        }
+                    } else {
+                        serde_json::Value::String(hex::encode(json_bytes))
+                    }
+                }
+                t if t == PgType::Json.to_oid() => {
+                    if let Ok(s) = std::str::from_utf8(elem_bytes) {
+                        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(s) {
+                            json_val
+                        } else {
+                            serde_json::Value::String(s.to_string())
+                        }
+                    } else {
+                        serde_json::Value::String(hex::encode(elem_bytes))
+                    }
+                }
+                _ => {
+                    if let Ok(s) = std::str::from_utf8(elem_bytes) {
+                        serde_json::Value::String(s.to_string())
+                    } else {
+                        serde_json::Value::String(hex::encode(elem_bytes))
+                    }
+                }
+            };
+            elements.push(val);
+        }
+
+        Ok(serde_json::to_string(&serde_json::Value::Array(elements)).unwrap_or_else(|_| "[]".to_string()))
+    }
     
     /// Encode a range type value
     /// PostgreSQL range binary format:

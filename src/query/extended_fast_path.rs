@@ -56,9 +56,9 @@ impl ExtendedFastPath {
                 // Fast check for binary result formats - optimize for common case
                 // Most queries use text format (empty or [0])
                 // Check first element as most queries have uniform format
-                if !result_formats.is_empty() && result_formats[0] == 1 {
+                if result_formats.contains(&1) {
                     // Fall back to normal path for binary results
-                    // TODO: Implement proper binary encoding for result formats
+                    // Fast path doesn't implement binary result encoding
                     return Ok(false);
                 }
                 match Self::execute_select_with_params(framed, db, session, portal_name, query, rusqlite_params, result_formats).await {
@@ -71,6 +71,10 @@ impl ExtendedFastPath {
                 }
             }
             QueryType::Insert | QueryType::Update | QueryType::Delete => {
+                if query.to_ascii_uppercase().contains("RETURNING") {
+                    // Fall back to normal path for RETURNING queries to ensure proper type inference and encoding
+                    return Ok(false);
+                }
                 match Self::execute_dml_with_params(framed, db, session, query, rusqlite_params, query_type).await {
                     Ok(()) => {
                         Ok(true)
@@ -275,8 +279,23 @@ impl ExtendedFastPath {
                     // Special types that are mapped to TEXT
                     Ok(rusqlite::types::Value::Text(text.to_string()))
                 }
+                t if PgType::from_oid(t).map(|pt| pt.is_array()).unwrap_or(false) => {
+                    if let Some(json_val) = crate::functions::array_functions::parse_array_to_json_val(text) {
+                        if let Ok(json_str) = serde_json::to_string(&json_val) {
+                            return Ok(rusqlite::types::Value::Text(json_str));
+                        }
+                    }
+                    Ok(rusqlite::types::Value::Text(text.to_string()))
+                }
                 _ => {
-                    // Default to TEXT
+                    let trimmed = text.trim();
+                    if trimmed == "{}" || (trimmed.starts_with('{') && trimmed.ends_with('}') && serde_json::from_str::<serde_json::Value>(trimmed).is_err()) {
+                        if let Some(json_val) = crate::functions::array_functions::parse_array_to_json_val(trimmed) {
+                            if let Ok(json_str) = serde_json::to_string(&json_val) {
+                                return Ok(rusqlite::types::Value::Text(json_str));
+                            }
+                        }
+                    }
                     Ok(rusqlite::types::Value::Text(text.to_string()))
                 }
             }
@@ -496,6 +515,12 @@ impl ExtendedFastPath {
                     // Other special types - for now, error out so we can implement them properly
                     Err(PgSqliteError::Protocol(format!("Binary format not implemented for type {param_type}")))
                 }
+                t if PgType::from_oid(t).map(|pt| pt.is_array()).unwrap_or(false) => {
+                    if let Ok(json_arr) = crate::protocol::binary::BinaryEncoder::decode_array(bytes) {
+                        return Ok(rusqlite::types::Value::Text(json_arr));
+                    }
+                    Ok(rusqlite::types::Value::Blob(bytes.to_vec()))
+                }
                 0 => {
                     // Type not specified (OID 0) - try to infer from binary format
                     if bytes.len() == 8 {
@@ -602,6 +627,7 @@ impl ExtendedFastPath {
             (is_empty || looks_suspicious) && !response.columns.is_empty()
         };
         
+        let mut sent_fields: Option<Vec<crate::protocol::FieldDescription>> = None;
         if send_row_desc {
             // Special logging for the problematic query
             if query.contains("orders") && query.contains("customer_id") {
@@ -709,22 +735,39 @@ impl ExtendedFastPath {
                 }
             }
             
+            sent_fields = Some(fields.clone());
             framed.send(BackendMessage::RowDescription(fields)).await
                 .map_err(PgSqliteError::Io)?;
         }
         
-        // TODO: Handle result_formats for binary encoding
-        // For now, we only support text format (handled by falling back earlier)
-        let _ = result_formats; // Suppress unused warning
+        let field_types: Vec<i32> = if let Some(fds) = sent_fields {
+            fds.iter().map(|f| f.type_oid).collect()
+        } else {
+            let portals = session.portals.read().await;
+            if let Some(portal) = portals.get(portal_name) {
+                let statements = session.prepared_statements.read().await;
+                if let Some(stmt) = statements.get(&portal.statement_name) {
+                    stmt.field_descriptions.iter().map(|f| f.type_oid).collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        };
         
+        let rows_count = response.rows.len();
+        info!("execute_select_with_params: query={}, rows_count={}", query, rows_count);
+
         // Send data rows
         for row in response.rows {
-            framed.send(BackendMessage::DataRow(row)).await
+            let encoded_row = super::ExtendedQueryHandler::encode_row(&row, result_formats, &field_types)?;
+            framed.send(BackendMessage::DataRow(encoded_row)).await
                 .map_err(PgSqliteError::Io)?;
         }
         
         // Send CommandComplete
-        let tag = format!("SELECT {}", response.rows_affected);
+        let tag = format!("SELECT {rows_count}");
         framed.send(BackendMessage::CommandComplete { tag }).await
             .map_err(PgSqliteError::Io)?;
         

@@ -2139,6 +2139,8 @@ impl DbHandler {
             Ok(())
         })?;
         
+        crate::session::ADVISORY_LOCK_MANAGER.release_xact_locks(session_id);
+
         // Force all other connections to refresh their WAL view (WAL mode only)
         // This ensures committed data is visible to all other sessions
         self.connection_manager.refresh_all_other_connections(session_id)?;
@@ -2151,7 +2153,7 @@ impl DbHandler {
     }
     
     pub async fn rollback(&self, session_id: &Uuid) -> Result<(), PgSqliteError> {
-        self.connection_manager.execute_with_session(session_id, |conn| {
+        let res = self.connection_manager.execute_with_session(session_id, |conn| {
             match conn.execute("ROLLBACK", []) {
                 Ok(_) => Ok(()),
                 Err(rusqlite::Error::SqliteFailure(_, Some(msg))) 
@@ -2163,7 +2165,9 @@ impl DbHandler {
                 Err(e) => Err(e),
             }?;
             Ok(())
-        })
+        });
+        crate::session::ADVISORY_LOCK_MANAGER.release_xact_locks(session_id);
+        res
     }
     
     pub async fn rollback_with_session(&self, session_id: &Uuid) -> Result<(), PgSqliteError> {
@@ -2295,11 +2299,26 @@ impl DbHandler {
         
         // Detect query type before the closure
         let query_type = QueryTypeDetector::detect_query_type(query);
+
+        // Convert $1, $2, ... placeholders to ?1, ?2, ... placeholders so SQLite numbered parameters
+        // match PostgreSQL positional indices instead of SQLite's textual occurrence order.
+        let processed_query = if query.contains('$') {
+            crate::query::ParameterParser::convert_dollar_to_numbered_params(query)
+        } else {
+            query.to_string()
+        };
+        // Strip any residual PostgreSQL parameter casts like ?1::bigint[] or ?2::text
+        let processed_query = if processed_query.contains("::") {
+            let cast_regex = regex::Regex::new(r"::[a-zA-Z][a-zA-Z0-9_]*(?:\[\])*(?:\s+(?:WITHOUT|WITH)\s+TIME\s+ZONE|\s+PRECISION|\s+VARYING)?").unwrap();
+            cast_regex.replace_all(&processed_query, "").to_string()
+        } else {
+            processed_query
+        };
         
         // Use the connection manager to get the session connection
         let result = self.connection_manager.execute_with_session(session_id, |conn| {
             // Execute the query directly with rusqlite parameters
-            let mut stmt = conn.prepare(query)?;
+            let mut stmt = conn.prepare(&processed_query)?;
             
             let response: Result<DbResponse, rusqlite::Error> = match query_type {
                 QueryType::Select => {
@@ -2392,6 +2411,8 @@ impl DbHandler {
                         rows.push(row_data);
                     }
                     
+                    info!("try_execute_fast_path_with_params SELECT: processed_query='{}', params={:?}, rows_count={}", processed_query, params, rows.len());
+
                     Ok(DbResponse {
                         columns: column_names,
                         rows,

@@ -67,6 +67,117 @@ pub fn strip_sql_comments(query: &str) -> String {
     result
 }
 
+/// Split SQL script into individual statements by semicolon,
+/// respecting comments, single quotes, double quotes, and dollar-quoted ($$...$$) blocks.
+pub fn split_sql_statements(query: &str) -> Vec<&str> {
+    let mut statements = Vec::new();
+    let mut start = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut dollar_tag: Option<String> = None;
+    let mut chars = query.char_indices().peekable();
+
+    while let Some((i, c)) = chars.next() {
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if in_block_comment {
+            if c == '*' && chars.peek().map(|&(_, next_c)| next_c) == Some('/') {
+                chars.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+
+        if in_single_quote {
+            if c == '\'' {
+                if chars.peek().map(|&(_, next_c)| next_c) == Some('\'') {
+                    chars.next(); // skip escaped quote ''
+                } else {
+                    in_single_quote = false;
+                }
+            }
+            continue;
+        }
+
+        if in_double_quote {
+            if c == '"' {
+                if chars.peek().map(|&(_, next_c)| next_c) == Some('"') {
+                    chars.next(); // skip escaped quote ""
+                } else {
+                    in_double_quote = false;
+                }
+            }
+            continue;
+        }
+
+        if let Some(ref tag) = dollar_tag {
+            if query[i..].starts_with(tag) {
+                let advance = tag.chars().count() - 1;
+                for _ in 0..advance {
+                    chars.next();
+                }
+                dollar_tag = None;
+            }
+            continue;
+        }
+
+        // Outside quotes / comments / dollar blocks:
+        if c == '-' && chars.peek().map(|&(_, next_c)| next_c) == Some('-') {
+            chars.next();
+            in_line_comment = true;
+            continue;
+        }
+        if c == '/' && chars.peek().map(|&(_, next_c)| next_c) == Some('*') {
+            chars.next();
+            in_block_comment = true;
+            continue;
+        }
+        if c == '\'' {
+            in_single_quote = true;
+            continue;
+        }
+        if c == '"' {
+            in_double_quote = true;
+            continue;
+        }
+        if c == '$' {
+            let rest = &query[i + 1..];
+            if let Some(end_dollar) = rest.find('$') {
+                let inner = &rest[..end_dollar];
+                if inner.is_empty() || inner.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+                    let tag = format!("${inner}$");
+                    let advance = tag.chars().count() - 1;
+                    for _ in 0..advance {
+                        chars.next();
+                    }
+                    dollar_tag = Some(tag);
+                    continue;
+                }
+            }
+        }
+        if c == ';' {
+            let stmt = query[start..i].trim();
+            if !stmt.is_empty() {
+                statements.push(stmt);
+            }
+            start = i + c.len_utf8();
+        }
+    }
+
+    let remaining = query[start..].trim();
+    if !remaining.is_empty() {
+        statements.push(remaining);
+    }
+
+    statements
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

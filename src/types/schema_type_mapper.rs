@@ -138,6 +138,8 @@ impl SchemaTypeMapper {
                 "timetz" => 1270,                 // TIMETZ[]
                 "interval" => 1187,               // INTERVAL[]
                 "uuid" => 2951,                   // UUID[]
+                "json" => 199,                    // JSON[]
+                "jsonb" => 3807,                  // JSONB[]
                 _ => PgType::Text.to_oid(),       // Unknown array type, default to TEXT
             };
         }
@@ -222,6 +224,21 @@ impl SchemaTypeMapper {
             "TEXT[]" | "_TEXT" => PgType::TextArray.to_oid(),
             "INT[]" | "INT4[]" | "INTEGER[]" | "_INT4" => PgType::Int4Array.to_oid(),
             "BIGINT[]" | "INT8[]" | "_INT8" => PgType::Int8Array.to_oid(),
+            "SMALLINT[]" | "INT2[]" | "_INT2" => PgType::Int2Array.to_oid(),
+            "BOOLEAN[]" | "BOOL[]" | "_BOOL" => PgType::BoolArray.to_oid(),
+            "REAL[]" | "FLOAT4[]" | "_FLOAT4" => PgType::Float4Array.to_oid(),
+            "FLOAT8[]" | "DOUBLE PRECISION[]" | "_FLOAT8" => PgType::Float8Array.to_oid(),
+            "VARCHAR[]" | "_VARCHAR" => PgType::VarcharArray.to_oid(),
+            "CHAR[]" | "_CHAR" => PgType::CharArray.to_oid(),
+            "JSON[]" | "_JSON" => PgType::JsonArray.to_oid(),
+            "JSONB[]" | "_JSONB" => PgType::JsonbArray.to_oid(),
+            "UUID[]" | "_UUID" => PgType::UuidArray.to_oid(),
+            "DATE[]" | "_DATE" => PgType::DateArray.to_oid(),
+            "TIME[]" | "_TIME" => PgType::TimeArray.to_oid(),
+            "TIMESTAMP[]" | "_TIMESTAMP" => PgType::TimestampArray.to_oid(),
+            "TIMESTAMPTZ[]" | "_TIMESTAMPTZ" => PgType::TimestamptzArray.to_oid(),
+            "NUMERIC[]" | "DECIMAL[]" | "_NUMERIC" => PgType::NumericArray.to_oid(),
+            "BYTEA[]" | "_BYTEA" => PgType::ByteaArray.to_oid(),
             
             // Range types
             "INT4RANGE" => PgType::Int4range.to_oid(),

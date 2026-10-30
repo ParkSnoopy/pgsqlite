@@ -12,7 +12,7 @@ pub fn register_datetime_functions(conn: &Connection) -> Result<()> {
         FunctionFlags::SQLITE_UTF8,
         |_ctx| {
             let now = Utc::now();
-            Ok(now.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+            Ok(now.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string())
         },
     )?;
     
@@ -22,7 +22,7 @@ pub fn register_datetime_functions(conn: &Connection) -> Result<()> {
         FunctionFlags::SQLITE_UTF8,
         |_ctx| {
             let now = Utc::now();
-            Ok(now.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+            Ok(now.format("%Y-%m-%d %H:%M:%S%.6f+00").to_string())
         },
     )?;
     

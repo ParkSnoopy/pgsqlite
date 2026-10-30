@@ -87,8 +87,8 @@ impl DateTimeTranslator {
         // In CREATE TABLE DEFAULT clauses, use SQLite's built-in datetime('now') 
         // In other contexts, use our custom now() function
         if is_create_table_with_default {
-            // For CREATE TABLE with DEFAULT, use SQLite's built-in functions
-            result = NOW_PATTERN.replace_all(&result, "datetime('now')").to_string();
+            // For CREATE TABLE with DEFAULT, use SQLite's built-in functions wrapped in parentheses
+            result = NOW_PATTERN.replace_all(&result, "(datetime('now'))").to_string();
             // Don't process datetime functions further for CREATE TABLE
             return (result, metadata);
         } else {
@@ -130,7 +130,7 @@ impl DateTimeTranslator {
             let args = &caps[1];
             // Don't process datetime('now') - leave it as-is for CREATE TABLE DEFAULT
             if args.trim() == "'now'" && is_create_table {
-                format!("datetime({args})")
+                format!("(datetime({args}))")
             } else {
                 format!("CAST((julianday(datetime({args})) - 2440587.5) * 86400 * 1000000 AS INTEGER)")
             }

@@ -522,11 +522,6 @@ where
                             format!("Parse failed: {e}"),
                         );
                         framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
-                        framed
-                            .send(BackendMessage::ReadyForQuery {
-                                status: *session.transaction_status.read().await,
-                            })
-                            .await?;
                     }
                 }
             }
@@ -557,11 +552,6 @@ where
                             format!("Bind failed: {e}"),
                         );
                         framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
-                        framed
-                            .send(BackendMessage::ReadyForQuery {
-                                status: *session.transaction_status.read().await,
-                            })
-                            .await?;
                     }
                 }
             }
@@ -585,11 +575,6 @@ where
                             format!("Execute failed: {e}"),
                         );
                         framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
-                        framed
-                            .send(BackendMessage::ReadyForQuery {
-                                status: *session.transaction_status.read().await,
-                            })
-                            .await?;
                     }
                 }
             }
@@ -605,11 +590,6 @@ where
                             format!("Describe failed: {e}"),
                         );
                         framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
-                        framed
-                            .send(BackendMessage::ReadyForQuery {
-                                status: *session.transaction_status.read().await,
-                            })
-                            .await?;
                     }
                 }
             }
@@ -624,11 +604,6 @@ where
                             format!("Close failed: {e}"),
                         );
                         framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
-                        framed
-                            .send(BackendMessage::ReadyForQuery {
-                                status: *session.transaction_status.read().await,
-                            })
-                            .await?;
                     }
                 }
             }

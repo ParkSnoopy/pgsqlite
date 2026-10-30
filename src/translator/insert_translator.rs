@@ -524,6 +524,9 @@ impl InsertTranslator {
         // Handle ARRAY[...] constructor
         if value.starts_with("ARRAY[") && value.ends_with(']') {
             let inner = &value[6..value.len()-1];
+            if inner.contains('$') {
+                return Ok(format!("json_array({inner})"));
+            }
             let elements = Self::parse_array_elements(inner)?;
             let json_array = serde_json::to_string(&elements)
                 .map_err(|e| format!("Failed to convert array to JSON: {e}"))?;
