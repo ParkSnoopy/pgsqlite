@@ -168,7 +168,7 @@ impl StatementCacheOptimizer {
         params: P,
     ) -> Result<(Vec<String>, crate::session::db_handler::DbRows), rusqlite::Error> {
         let mut stmt = conn.prepare(query)?;
-        let column_names: Vec<String> = stmt.column_names().iter().map(|&s| s.to_string()).collect();
+        let column_names: Vec<String> = stmt.column_names().map(str::to_string).collect();
         
         let mut results = Vec::new();
         let rows = stmt.query_map(params, |row| {

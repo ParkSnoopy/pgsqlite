@@ -103,6 +103,7 @@ impl<'a> ExpressionTypeResolver<'a> {
                         let expr_type = self.resolve_expr_type(expr, &cte_context);
                         column_types.push((alias.value.clone(), expr_type));
                     }
+                    SelectItem::ExprWithAliases { .. } => {}
                     SelectItem::Wildcard(_) => {
                         // For wildcards, we need to get all columns from the referenced tables
                         if let Some(table) = &cte_context.default_table
@@ -113,8 +114,9 @@ impl<'a> ExpressionTypeResolver<'a> {
                     SelectItem::QualifiedWildcard(name, _) => {
                         let table_name = match name {
                             SelectItemQualifiedWildcardKind::ObjectName(obj_name) => {
-                                obj_name.0.last().map(|p| match p {
-                                    ObjectNamePart::Identifier(i) => i.value.clone(),
+                                obj_name.0.last().and_then(|p| match p {
+                                    ObjectNamePart::Identifier(i) => Some(i.value.clone()),
+                                    ObjectNamePart::Function(_) => None,
                                 }).unwrap_or_default()
                             }
                             SelectItemQualifiedWildcardKind::Expr(_) => String::new(),

@@ -156,12 +156,15 @@ export PGSQLITE_BATCH_BYTES=65536
 
 #### Memory-Mapped Values Configuration
 ```bash
-# Memory mapping threshold in bytes (default: 8192)
-export PGSQLITE_MMAP_THRESHOLD=16384
-
-# Enable memory mapping (default: 1)
+# Enable value memory mapping (disabled by default)
 export PGSQLITE_ENABLE_MMAP=1
 ```
+
+File-backed value mapping requires Linux, a mounted `/proc`, and fs-verity support on the temporary filesystem selected by `PGSQLITE_TEMP_DIR`.
+If fs-verity is unavailable, mapping fails with a warning rather than falling back silently.
+Unset `PGSQLITE_ENABLE_MMAP` and omit `--enable-mmap` to use in-memory values instead.
+The `--in-memory` flag selects an in-memory SQLite database and does not disable value mapping.
+The `ValueHandler` is currently a library API and is not connected to the server query executor, so `--enable-mmap` does not activate it in the server.
 
 ## Usage Examples
 

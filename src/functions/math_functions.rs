@@ -400,7 +400,7 @@ pub fn register_math_functions(conn: &Connection) -> Result<()> {
         0,
         FunctionFlags::SQLITE_UTF8,
         |_ctx| {
-            use rand::Rng;
+            use rand::RngExt;
             let mut rng = rand::rng();
             Ok(rng.random::<f64>())
         },

@@ -1733,6 +1733,7 @@ impl CatalogInterceptor {
                         indices.push(idx);
                     }
                 }
+                SelectItem::ExprWithAliases { .. } => {}
                 SelectItem::Wildcard(_) => {
                     cols.extend_from_slice(all_columns);
                     indices.extend(0..all_columns.len());

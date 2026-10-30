@@ -118,8 +118,8 @@ impl SqliteMasterFilter {
                 // SQLite persists the literal CREATE VIEW text and expands it
                 // on every read, so creation time is the only chance to filter.
                 // Covers MATERIALIZED and TEMP views: same variant, same field.
-                Statement::CreateView { query, .. } => {
-                    let _ = query.visit(&mut visitor);
+                Statement::CreateView(view) => {
+                    let _ = view.query.visit(&mut visitor);
                 }
                 // `CREATE TABLE ... AS SELECT`. `query` is `None` for ordinary
                 // CREATE TABLE, which is then left untouched.
@@ -199,8 +199,10 @@ impl VisitorMut for RelationReplacer {
         // Keep the client's own alias if it had one, so `m.name` still resolves;
         // otherwise alias to the spelling the client used, so `sqlite_schema.name` does.
         let effective_alias = alias.clone().unwrap_or(TableAlias {
+            explicit: true,
             name: Ident::new(relation),
             columns: vec![],
+            at: None,
         });
 
         let Some(subquery) = parse_filtered_relation() else {
@@ -211,6 +213,7 @@ impl VisitorMut for RelationReplacer {
             lateral: false,
             subquery,
             alias: Some(effective_alias),
+            sample: None,
         };
         self.replaced += 1;
         ControlFlow::Continue(())
@@ -261,7 +264,7 @@ mod tests {
         let out = rewritten("SELECT m.name FROM sqlite_schema m JOIN foo f ON f.n = m.name");
         assert_eq!(
             out,
-            format!("SELECT m.name FROM {FILTERED} AS m JOIN foo AS f ON f.n = m.name")
+            format!("SELECT m.name FROM {FILTERED} m JOIN foo f ON f.n = m.name")
         );
     }
 

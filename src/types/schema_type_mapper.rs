@@ -34,8 +34,9 @@ fn select_projection_has_unaliased_function(query: &str, function_name: &str) ->
 }
 
 fn object_name_last_part_lower(name: &ObjectName) -> Option<String> {
-    name.0.last().map(|part| match part {
-        ObjectNamePart::Identifier(ident) => ident.value.to_lowercase(),
+    name.0.last().and_then(|part| match part {
+        ObjectNamePart::Identifier(ident) => Some(ident.value.to_lowercase()),
+        ObjectNamePart::Function(_) => None,
     })
 }
 

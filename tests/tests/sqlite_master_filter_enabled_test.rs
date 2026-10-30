@@ -125,7 +125,7 @@ async fn write_attempts_on_sqlite_master_keep_sqlites_own_error() {
             .simple_query(sql)
             .await
             .expect_err("writing to sqlite_master must fail");
-        let text = err.to_string();
+        let text = err.as_db_error().expect("expected a PostgreSQL error response").message();
         assert!(
             !text.contains("__pgsqlite_"),
             "internal prefix leaked into a client-facing error for `{sql}`: {text}"

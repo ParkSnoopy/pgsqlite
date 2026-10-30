@@ -163,9 +163,9 @@ impl<'a> DecimalQueryRewriter<'a> {
                     Ok(())
                 }
             }
-            Statement::Update { table, selection, assignments, .. } => {
+            Statement::Update(update) => {
                 // Check if the table has decimal columns
-                if let sqlparser::ast::TableFactor::Table { name, .. } = &table.relation {
+                if let sqlparser::ast::TableFactor::Table { name, .. } = &update.table.relation {
                     let table_name = name.to_string();
                     let has_decimal_columns = self.any_table_has_decimal_columns(std::slice::from_ref(&table_name));
                     
@@ -176,7 +176,7 @@ impl<'a> DecimalQueryRewriter<'a> {
                     };
                     
                     // Always rewrite WHERE clause to check for implicit casts
-                    if let Some(expr) = selection {
+                    if let Some(expr) = &mut update.selection {
                         self.rewrite_expression_for_implicit_casts(expr, &context)?;
                     }
                     
@@ -184,7 +184,7 @@ impl<'a> DecimalQueryRewriter<'a> {
                     if has_decimal_columns {
                         // For UPDATE assignments, we don't want to wrap simple numeric literals
                         // because rust_decimal can't handle very large numbers (>28 digits)
-                        for assignment in assignments {
+                        for assignment in &mut update.assignments {
                             self.rewrite_update_assignment(&mut assignment.value, &context)?;
                         }
                     }
@@ -458,21 +458,9 @@ impl<'a> DecimalQueryRewriter<'a> {
                     self.rewrite_expression_with_optimization(inner_expr, context, has_decimal_columns)?;
                 }
                 // Always check subquery for decimals
-                let temp_query = Query {
-                    with: None,
-                    body: subquery.clone(),
-                    order_by: None,
-                    limit_clause: None,
-                    fetch: None,
-                    for_clause: None,
-                    settings: None,
-                    format_clause: None,
-                    pipe_operators: vec![],
-                    locks: vec![],
-                };
-                if self.query_has_decimal_columns(&temp_query) {
-                    let subquery_context = self.resolver.build_context(&temp_query);
-                    self.rewrite_set_expr(subquery, &subquery_context)?;
+                if self.query_has_decimal_columns(subquery) {
+                    let subquery_context = self.resolver.build_context(subquery);
+                    self.rewrite_set_expr(&mut subquery.body, &subquery_context)?;
                 }
             }
             // Other expressions only rewrite if current context has decimal columns
@@ -596,21 +584,8 @@ impl<'a> DecimalQueryRewriter<'a> {
             }
             Expr::InSubquery { expr, subquery, .. } => {
                 self.rewrite_expression(expr, context)?;
-                // For IN subqueries, we need to create a new Query wrapper
-                let temp_query = Query {
-                    with: None,
-                    body: subquery.clone(),
-                    order_by: None,
-                    limit_clause: None,
-                    fetch: None,
-                    for_clause: None,
-                    settings: None,
-                    format_clause: None,
-                    pipe_operators: vec![],
-                    locks: vec![],
-                };
-                let subquery_context = self.resolver.build_context(&temp_query);
-                self.rewrite_set_expr(subquery, &subquery_context)?;
+                let subquery_context = self.resolver.build_context(subquery);
+                self.rewrite_set_expr(&mut subquery.body, &subquery_context)?;
             }
             Expr::Cast { expr, data_type, .. } => {
                 // Don't rewrite the inner expression if we're casting to TEXT
@@ -1115,20 +1090,8 @@ impl<'a> DecimalQueryRewriter<'a> {
             }
             Expr::InSubquery { expr, subquery, .. } => {
                 self.rewrite_expression_for_implicit_casts(expr, context)?;
-                let temp_query = Query {
-                    with: None,
-                    body: subquery.clone(),
-                    order_by: None,
-                    limit_clause: None,
-                    fetch: None,
-                    for_clause: None,
-                    settings: None,
-                    format_clause: None,
-                    pipe_operators: vec![],
-                    locks: vec![],
-                };
-                let subquery_context = self.resolver.build_context(&temp_query);
-                self.rewrite_set_expr(subquery, &subquery_context)?;
+                let subquery_context = self.resolver.build_context(subquery);
+                self.rewrite_set_expr(&mut subquery.body, &subquery_context)?;
             }
             _ => {
                 // For other expressions, check if they involve decimals
@@ -1316,20 +1279,8 @@ impl<'a> DecimalQueryRewriter<'a> {
             }
             Expr::InSubquery { expr, subquery, .. } => {
                 self.rewrite_expression_without_decimal_arithmetic(expr, context)?;
-                let temp_query = Query {
-                    with: None,
-                    body: subquery.clone(),
-                    order_by: None,
-                    limit_clause: None,
-                    fetch: None,
-                    for_clause: None,
-                    settings: None,
-                    format_clause: None,
-                    pipe_operators: vec![],
-                    locks: vec![],
-                };
-                let subquery_context = self.resolver.build_context(&temp_query);
-                self.rewrite_set_expr(subquery, &subquery_context)?;
+                let subquery_context = self.resolver.build_context(subquery);
+                self.rewrite_set_expr(&mut subquery.body, &subquery_context)?;
             }
             _ => {}
         }

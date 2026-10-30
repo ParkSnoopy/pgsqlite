@@ -87,7 +87,7 @@ bitflags           = "2.13"
 lru                = "0.19"
 
 # Memory mapping for zero-copy operations
-memmap2            = "0.9"
+memmap2            = "0.9.12"
 tempfile           = { workspace = true }
 
 # Configuration
@@ -106,6 +106,9 @@ tokio-rustls       = { version = "0.26", default-features = false, features = ["
 rustls             = { version = "0.23", default-features = false, features = ["logging", "tls12", "ring"] }
 rustls-pki-types   = { version = "1.15", features = ["std"] }
 rcgen              = "0.14"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+composefs-ioctls   = "0.9"
 
 # ============================================
 # RUST-MAGIC-LINTER (maximum preset)

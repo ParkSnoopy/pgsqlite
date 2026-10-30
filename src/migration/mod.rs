@@ -61,7 +61,7 @@ impl Migration {
             }
         }
         
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 }
 

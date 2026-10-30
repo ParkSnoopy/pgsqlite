@@ -153,9 +153,10 @@ impl SchemaPrefixTranslator {
             let table = &name.0[1];
             
             // Check if it's a pg_catalog schema
-            let schema_name = match schema {
-                ObjectNamePart::Identifier(ident) => ident.value.to_lowercase(),
+            let ObjectNamePart::Identifier(schema) = schema else {
+                return;
             };
+            let schema_name = schema.value.to_lowercase();
             
             if schema_name == "pg_catalog" {
                 // Replace with just the table name
@@ -163,13 +164,12 @@ impl SchemaPrefixTranslator {
             } else if schema_name == "information_schema" {
                 // The two relations served by SQLite views are rewritten to
                 // their underscore names; the rest keep their Rust handlers.
-                let table_name = match table {
-                    ObjectNamePart::Identifier(ident) => ident.value.to_lowercase(),
+                let ObjectNamePart::Identifier(table) = table else {
+                    return;
                 };
+                let table_name = table.value.to_lowercase();
                 if table_name == "tables" || table_name == "columns" {
-                    let mut ident = match table {
-                        ObjectNamePart::Identifier(ident) => ident.clone(),
-                    };
+                    let mut ident = table.clone();
                     ident.value = format!("information_schema_{table_name}");
                     name.0 = vec![ObjectNamePart::Identifier(ident)];
                 }

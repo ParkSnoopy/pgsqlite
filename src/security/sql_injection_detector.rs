@@ -140,6 +140,16 @@ impl SqlInjectionDetector {
                 analysis.has_modifying_statements = true;
                 self.analyze_dml_statement(statement, analysis, depth + 1, original_query)?;
             }
+            Statement::Execute { name, immediate, parameters, .. } => {
+                if name.is_none() || *immediate || name.as_ref().is_some_and(|name| {
+                    self.dangerous_functions.contains(&name.to_string().to_lowercase())
+                }) {
+                    analysis.has_dangerous_function = true;
+                }
+                for parameter in parameters {
+                    self.analyze_expression(parameter, analysis, depth + 1, original_query)?;
+                }
+            }
             Statement::Drop { .. } | Statement::CreateTable { .. } | Statement::AlterTable { .. } => {
                 analysis.has_ddl_statements = true;
                 // DDL statements in injection contexts are highly suspicious
@@ -243,7 +253,7 @@ impl SqlInjectionDetector {
             SelectItem::UnnamedExpr(expr) => {
                 self.analyze_expression(expr, analysis, depth, original_query)?;
             }
-            SelectItem::ExprWithAlias { expr, .. } => {
+            SelectItem::ExprWithAlias { expr, .. } | SelectItem::ExprWithAliases { expr, .. } => {
                 self.analyze_expression(expr, analysis, depth, original_query)?;
             }
             SelectItem::QualifiedWildcard(_, _) => {
@@ -371,8 +381,8 @@ impl SqlInjectionDetector {
     ) -> Result<(), PgSqliteError> {
         // For INSERT, UPDATE, DELETE statements, analyze the WHERE clauses and subqueries
         match statement {
-            Statement::Update { selection, .. } => {
-                if let Some(where_clause) = selection {
+            Statement::Update(update) => {
+                if let Some(where_clause) = &update.selection {
                     self.analyze_expression(where_clause, analysis, depth, original_query)?;
                 }
             }
@@ -604,6 +614,9 @@ mod tests {
 
         let result = detector.analyze_query("SELECT exec('rm -rf /')");
         assert!(result.is_err());
+        assert!(detector.analyze_query("EXEC('DROP TABLE users')").is_err());
+        assert!(detector.analyze_query("EXEC xp_cmdshell 'command'").is_err());
+        assert!(detector.analyze_query("EXECUTE saved_plan(1)").is_ok());
     }
 
     #[test]

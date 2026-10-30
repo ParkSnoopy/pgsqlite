@@ -203,9 +203,10 @@ async fn benchmark_batch_operations() {
     // Single UPDATE
     let start = Instant::now();
     for i in 0..OPERATIONS {
+        let id = i64::try_from(i).unwrap();
         conn.execute(
             "UPDATE batch_ops_test SET value = ?1 WHERE id = ?2",
-            rusqlite::params![i * 30, i],
+            rusqlite::params![id * 30, id],
         ).unwrap();
     }
     let sqlite_update_time = start.elapsed();

@@ -106,6 +106,7 @@ impl PgRolesHandler {
                         selected.push((Self::alias_output_name(alias), col_name));
                     }
                 }
+                SelectItem::ExprWithAliases { .. } => {}
                 SelectItem::QualifiedWildcard(_, _) => {
                     // For qualified wildcard like pg_roles.*, return all columns
                     selected.extend(

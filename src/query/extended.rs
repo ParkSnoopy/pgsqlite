@@ -6218,8 +6218,8 @@ impl ExtendedQueryHandler {
             sqlparser::ast::Statement::Query(query) => {
                 super::extended_helpers::extract_tables_from_query(query, &mut tables);
             }
-            sqlparser::ast::Statement::Update { table, .. } => {
-                if let TableFactor::Table { name, .. } = &table.relation {
+            sqlparser::ast::Statement::Update(update) => {
+                if let TableFactor::Table { name, .. } = &update.table.relation {
                     tables.push(name.to_string());
                 }
             }

@@ -1,7 +1,9 @@
-use std::io::{self, Write};
+use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Write;
 use memmap2::Mmap;
-use tempfile::NamedTempFile;
 use tokio::io::AsyncWrite;
+#[cfg(target_os = "linux")]
 use tracing::debug;
 
 /// Configuration for memory-mapped value handling
@@ -56,7 +58,6 @@ pub enum MappedValue {
         mmap: Mmap,
         offset: usize,
         length: usize,
-        _temp_file: Option<NamedTempFile>, // Keep temp file alive
     },
     /// Direct reference to existing data (zero-copy)
     Reference(&'static [u8]),
@@ -82,24 +83,40 @@ impl MappedValue {
     }
     
     /// Create a memory-mapped temporary file
+    #[cfg(target_os = "linux")]
     fn create_temp_mapped(data: &[u8], config: &MemoryMappedConfig) -> io::Result<Self> {
+        use std::os::fd::AsRawFd;
+
         let mut temp_file = if let Some(ref dir) = config.temp_dir {
-            NamedTempFile::new_in(dir)?
+            tempfile::tempfile_in(dir)?
         } else {
-            NamedTempFile::new()?
+            tempfile::tempfile()?
         };
         
         // Write data to temp file
         temp_file.write_all(data)?;
         temp_file.flush()?;
         
-        // Memory map the file
-        let file = temp_file.reopen()?;
-        // Safety: This is safe because:
-        // 1. The file is freshly created and written with valid data
-        // 2. memmap2::Mmap::map() handles the OS-level memory mapping safely
-        // 3. The file descriptor remains valid for the lifetime of the mapping
-        let mmap = unsafe { Mmap::map(&file)? };
+        // fs-verity requires a read-only descriptor and no writable descriptors.
+        let file = std::fs::File::open(format!("/proc/self/fd/{}", temp_file.as_raw_fd()))?;
+        drop(temp_file);
+        composefs_ioctls::fsverity::fs_ioc_enable_verity(&file, 1, 4096).map_err(|err| {
+            use composefs_ioctls::fsverity::EnableVerityError;
+            let kind = match err {
+                EnableVerityError::FilesystemNotSupported => io::ErrorKind::Unsupported,
+                _ => io::ErrorKind::Other,
+            };
+            let message = format!(
+                "cannot enable fs-verity for mapped values: {err}; use in-memory values by disabling value mapping (unset PGSQLITE_ENABLE_MMAP and omit --enable-mmap, or set ValueHandlerConfig.enable_mmap to false)"
+            );
+            tracing::warn!("{message}");
+            io::Error::new(kind, message)
+        })?;
+        // map_if_safe checks that the kernel enforces immutability before mapping.
+        let mmap = Mmap::map_if_safe(&file).map_err(|err| {
+            tracing::warn!("cannot safely map value: {err}; disable value memory mapping to use in-memory values");
+            io::Error::from(err)
+        })?;
         
         debug!("Created memory-mapped value: {} bytes", data.len());
         
@@ -107,8 +124,14 @@ impl MappedValue {
             mmap,
             offset: 0,
             length: data.len(),
-            _temp_file: Some(temp_file),
         })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn create_temp_mapped(_data: &[u8], _config: &MemoryMappedConfig) -> io::Result<Self> {
+        let message = "file-backed value memory mapping requires Linux and fs-verity; disable value memory mapping to use in-memory values";
+        tracing::warn!("{message}");
+        Err(io::Error::new(io::ErrorKind::Unsupported, message))
     }
     
     /// Get a slice view of the data
@@ -396,7 +419,7 @@ mod tests {
     }
     
     #[tokio::test]
-    async fn test_large_value_temp_file() {
+    async fn test_large_value_mapping_or_unsupported_filesystem() {
         let config = MemoryMappedConfig {
             min_size_for_mmap: 10, // Very small threshold for testing
             max_memory_size: 5,    // Force temp file usage
@@ -404,14 +427,49 @@ mod tests {
         };
         
         let data = b"this is larger than the memory limit";
-        let value = MappedValue::from_slice(data, &config).unwrap();
-        
-        match value {
-            MappedValue::Mapped { .. } => {
+        match MappedValue::from_slice(data, &config) {
+            Ok(value @ MappedValue::Mapped { .. }) => {
                 assert_eq!(value.as_slice(), data);
                 assert_eq!(value.len(), data.len());
+                let mut output = Vec::new();
+                value.write_to(&mut output).await.unwrap();
+                assert_eq!(output, data);
             }
-            _ => panic!("Expected mapped storage for large value"),
+            Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+                assert!(err.to_string().contains("in-memory values"));
+            }
+            Ok(_) => panic!("Expected mapped storage for large value"),
+            Err(err) => panic!("Unexpected mapping error: {err}"),
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an fs-verity-capable PGSQLITE_TEMP_DIR"]
+    async fn test_fs_verity_mapped_value() {
+        let config = MemoryMappedConfig {
+            min_size_for_mmap: 1,
+            max_memory_size: 1,
+            temp_dir: Some(std::env::var("PGSQLITE_TEMP_DIR").unwrap()),
+        };
+        let data = b"mapped value";
+        let value = MappedValue::from_slice(data, &config).unwrap();
+        assert!(matches!(value, MappedValue::Mapped { .. }));
+        assert_eq!(value.as_slice(), data);
+        let mut output = Vec::new();
+        value.write_to(&mut output).await.unwrap();
+        assert_eq!(output, data);
+    }
+
+    #[test]
+    fn test_in_memory_values_do_not_use_temp_directory() {
+        let config = MemoryMappedConfig {
+            min_size_for_mmap: 1,
+            max_memory_size: usize::MAX,
+            temp_dir: Some("directory-that-does-not-exist".to_string()),
+        };
+        let data = b"in-memory value";
+        let value = MappedValue::from_slice(data, &config).unwrap();
+        assert!(matches!(value, MappedValue::Memory(_)));
+        assert_eq!(value.as_slice(), data);
     }
 }
