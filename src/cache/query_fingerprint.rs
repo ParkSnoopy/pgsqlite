@@ -52,11 +52,11 @@ impl QueryFingerprint {
                     }
                 }
                 
-                // Handle numbers (but only standalone numbers, not parts of identifiers)
+                // Handle numbers (but only standalone numbers, not parts of identifiers or parameter placeholders)
                 '0'..='9' if !in_string => {
-                    // Check if this is part of an identifier by looking at what came before
+                    // Check if this is part of an identifier or parameter placeholder by looking at what came before
                     let last_char = result.chars().last();
-                    let is_identifier = matches!(last_char, Some('A'..='Z') | Some('_'));
+                    let is_identifier = matches!(last_char, Some('A'..='Z') | Some('0'..='9') | Some('_') | Some('$'));
                     
                     if is_identifier {
                         // Part of identifier, keep as-is

@@ -98,7 +98,7 @@ impl SchemaPrefixTranslator {
             "pg_table_is_visible", "pg_get_userbyid", "pg_get_constraintdef",
             "format_type", "pg_get_expr", "pg_get_indexdef", "version",
             "current_database", "current_schema", "current_user", "session_user",
-            "pg_backend_pid", "pg_is_in_recovery", "current_schemas"
+            "pg_backend_pid", "pg_blocking_pids", "pg_is_in_recovery", "current_schemas"
         ];
 
         for func in &catalog_functions {

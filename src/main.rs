@@ -15,6 +15,7 @@ use tracing::{debug, error, info};
 use tokio_rustls::TlsAcceptor;
 
 use pgsqlite::config::Config;
+use pgsqlite::PgSqliteError;
 use pgsqlite::protocol::{
     AuthenticationMessage, BackendMessage, ErrorResponse, FrontendMessage, PostgresCodec,
     TransactionStatus, check_global_rate_limit, record_global_failure,
@@ -383,11 +384,22 @@ where
         error!("Failed to create session connection: {}", e);
         return Err(anyhow::anyhow!("Failed to create session connection: {}", e));
     }
-    
-    // Note: cleanup is now handled by SessionState Drop implementation
-    // when the session Arc is dropped
-    
-    // We'll handle cleanup at the end of the function
+
+    struct SessionCleanupGuard {
+        session_id: uuid::Uuid,
+        db_handler: Arc<DbHandler>,
+    }
+
+    impl Drop for SessionCleanupGuard {
+        fn drop(&mut self) {
+            self.db_handler.remove_session_connection(&self.session_id);
+        }
+    }
+
+    let _cleanup_guard = SessionCleanupGuard {
+        session_id,
+        db_handler: db_handler.clone(),
+    };
 
     // Send authentication OK
     framed
@@ -466,11 +478,14 @@ where
                             session.set_transaction_status(TransactionStatus::InFailedTransaction).await;
                         }
                         
-                        let err = ErrorResponse::new(
-                            "ERROR".to_string(),
-                            "42000".to_string(),
-                            format!("Query execution failed: {e}"),
-                        );
+                        let err = match &e {
+                            PgSqliteError::Validation(pg_err) => pg_err.to_error_response(),
+                            _ => ErrorResponse::new(
+                                "ERROR".to_string(),
+                                "42000".to_string(),
+                                format!("Query execution failed: {e}"),
+                            ),
+                        };
                         framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
                     }
                 }
@@ -546,11 +561,17 @@ where
                     Ok(()) => {}
                     Err(e) => {
                         error!("Bind error: {}", e);
-                        let err = ErrorResponse::new(
-                            "ERROR".to_string(),
-                            "42000".to_string(),
-                            format!("Bind failed: {e}"),
-                        );
+                        if session.in_transaction().await {
+                            session.set_transaction_status(TransactionStatus::InFailedTransaction).await;
+                        }
+                        let err = match &e {
+                            PgSqliteError::Validation(pg_err) => pg_err.to_error_response(),
+                            _ => ErrorResponse::new(
+                                "ERROR".to_string(),
+                                "42000".to_string(),
+                                format!("Bind failed: {e}"),
+                            ),
+                        };
                         framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
                     }
                 }
@@ -569,11 +590,17 @@ where
                     Ok(()) => {}
                     Err(e) => {
                         error!("Execute error: {}", e);
-                        let err = ErrorResponse::new(
-                            "ERROR".to_string(),
-                            "42000".to_string(),
-                            format!("Execute failed: {e}"),
-                        );
+                        if session.in_transaction().await {
+                            session.set_transaction_status(TransactionStatus::InFailedTransaction).await;
+                        }
+                        let err = match &e {
+                            PgSqliteError::Validation(pg_err) => pg_err.to_error_response(),
+                            _ => ErrorResponse::new(
+                                "ERROR".to_string(),
+                                "42000".to_string(),
+                                format!("Execute failed: {e}"),
+                            ),
+                        };
                         framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
                     }
                 }

@@ -37,6 +37,14 @@ pub fn register_string_functions(conn: &Connection) -> Result<()> {
         FunctionFlags::SQLITE_UTF8,
         StringAggregator,
     )?;
+
+    // Register string_agg_distinct function
+    conn.create_aggregate_function(
+        "string_agg_distinct",
+        2,
+        FunctionFlags::SQLITE_UTF8,
+        StringAggDistinct,
+    )?;
     
     // Register translate function
     conn.create_scalar_function(
@@ -239,12 +247,24 @@ impl rusqlite::functions::Aggregate<(Vec<String>, Option<String>), Option<String
     }
     
     fn step(&self, ctx: &mut rusqlite::functions::Context<'_>, agg: &mut (Vec<String>, Option<String>)) -> rusqlite::Result<()> {
-        let value = ctx.get::<String>(0)?;
-        agg.0.push(value);
+        let val_ref = ctx.get_raw(0);
+        let val_str = match val_ref {
+            rusqlite::types::ValueRef::Null => return Ok(()),
+            rusqlite::types::ValueRef::Text(s) => std::str::from_utf8(s).unwrap_or("").to_string(),
+            rusqlite::types::ValueRef::Integer(i) => i.to_string(),
+            rusqlite::types::ValueRef::Real(f) => f.to_string(),
+            rusqlite::types::ValueRef::Blob(b) => String::from_utf8_lossy(b).to_string(),
+        };
+        agg.0.push(val_str);
         
         if agg.1.is_none() {
-            let delimiter = ctx.get::<String>(1)?;
-            agg.1 = Some(delimiter);
+            let delim_ref = ctx.get_raw(1);
+            let delim_str = match delim_ref {
+                rusqlite::types::ValueRef::Text(s) => std::str::from_utf8(s).unwrap_or("").to_string(),
+                rusqlite::types::ValueRef::Null => "".to_string(),
+                _ => ctx.get::<String>(1).unwrap_or_default(),
+            };
+            agg.1 = Some(delim_str);
         }
         
         Ok(())
@@ -253,6 +273,57 @@ impl rusqlite::functions::Aggregate<(Vec<String>, Option<String>), Option<String
     fn finalize(&self, _ctx: &mut rusqlite::functions::Context<'_>, agg: Option<(Vec<String>, Option<String>)>) -> rusqlite::Result<Option<String>> {
         match agg {
             Some((values, delimiter)) => {
+                if values.is_empty() {
+                    Ok(None)
+                } else {
+                    let delimiter = delimiter.as_deref().unwrap_or(",");
+                    Ok(Some(values.join(delimiter)))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// String aggregator for string_agg_distinct function
+#[derive(Debug)]
+struct StringAggDistinct;
+
+impl rusqlite::functions::Aggregate<(Vec<String>, std::collections::HashSet<String>, Option<String>), Option<String>> for StringAggDistinct {
+    fn init(&self, _ctx: &mut rusqlite::functions::Context<'_>) -> rusqlite::Result<(Vec<String>, std::collections::HashSet<String>, Option<String>)> {
+        Ok((Vec::new(), std::collections::HashSet::new(), None))
+    }
+
+    fn step(&self, ctx: &mut rusqlite::functions::Context<'_>, agg: &mut (Vec<String>, std::collections::HashSet<String>, Option<String>)) -> rusqlite::Result<()> {
+        let val_ref = ctx.get_raw(0);
+        let val_str = match val_ref {
+            rusqlite::types::ValueRef::Null => return Ok(()),
+            rusqlite::types::ValueRef::Text(s) => std::str::from_utf8(s).unwrap_or("").to_string(),
+            rusqlite::types::ValueRef::Integer(i) => i.to_string(),
+            rusqlite::types::ValueRef::Real(f) => f.to_string(),
+            rusqlite::types::ValueRef::Blob(b) => String::from_utf8_lossy(b).to_string(),
+        };
+
+        if agg.1.insert(val_str.clone()) {
+            agg.0.push(val_str);
+        }
+
+        if agg.2.is_none() {
+            let delim_ref = ctx.get_raw(1);
+            let delim_str = match delim_ref {
+                rusqlite::types::ValueRef::Text(s) => std::str::from_utf8(s).unwrap_or("").to_string(),
+                rusqlite::types::ValueRef::Null => "".to_string(),
+                _ => ctx.get::<String>(1).unwrap_or_default(),
+            };
+            agg.2 = Some(delim_str);
+        }
+
+        Ok(())
+    }
+
+    fn finalize(&self, _ctx: &mut rusqlite::functions::Context<'_>, agg: Option<(Vec<String>, std::collections::HashSet<String>, Option<String>)>) -> rusqlite::Result<Option<String>> {
+        match agg {
+            Some((values, _, delimiter)) => {
                 if values.is_empty() {
                     Ok(None)
                 } else {
@@ -404,5 +475,21 @@ mod tests {
             |row| row.get(0)
         ).unwrap();
         assert_eq!(result, "helloxxx");
+    }
+
+    #[test]
+    fn test_string_agg_distinct() {
+        let conn = Connection::open_in_memory().unwrap();
+        register_string_functions(&conn).unwrap();
+
+        conn.execute("CREATE TABLE t (val TEXT)", []).unwrap();
+        conn.execute("INSERT INTO t VALUES ('b'), ('a'), ('b'), (NULL), ('c')", []).unwrap();
+
+        let result: String = conn.query_row(
+            "SELECT string_agg_distinct(val, ',') FROM t",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(result, "b,a,c");
     }
 }

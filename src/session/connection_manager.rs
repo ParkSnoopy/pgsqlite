@@ -83,7 +83,9 @@ impl ConnectionManager {
              PRAGMA synchronous = {};
              PRAGMA cache_size = {};
              PRAGMA temp_store = MEMORY;
-             PRAGMA mmap_size = {};",
+             PRAGMA mmap_size = {};
+             PRAGMA busy_timeout = 30000;
+             PRAGMA foreign_keys = ON;",
             self.config.pragma_journal_mode,
             self.config.pragma_synchronous,
             self.config.pragma_cache_size,

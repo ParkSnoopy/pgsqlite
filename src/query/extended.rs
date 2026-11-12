@@ -170,11 +170,14 @@ impl ExtendedQueryHandler {
             for (index, param_name) in python_params.iter().enumerate() {
                 let param_pattern = format!("%({param_name})s::");
                 if let Some(cast_start) = cleaned_query.find(&param_pattern) {
-                    let type_start = cast_start + param_pattern.len();
-                    // Find the end of the type (space, comma, or parenthesis)
+                    let raw_type_start = cast_start + param_pattern.len();
+                    let trimmed_after = cleaned_query[raw_type_start..].trim_start();
+                    let offset = cleaned_query[raw_type_start..].len() - trimmed_after.len();
+                    let type_start = raw_type_start + offset;
+                    
                     let mut type_end = type_start;
                     while type_end < cleaned_query.len() {
-                        let ch = cleaned_query.chars().nth(type_end).unwrap();
+                        let ch = cleaned_query.as_bytes()[type_end] as char;
                         if ch.is_whitespace() || ch == ',' || ch == ')' || ch == ';' {
                             break;
                         }
@@ -183,24 +186,9 @@ impl ExtendedQueryHandler {
                     
                     if type_end > type_start {
                         let type_name = &cleaned_query[type_start..type_end];
-                        let type_oid = match type_name.to_uppercase().as_str() {
-                            "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => PgType::Timestamp.to_oid(),
-                            "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => PgType::Timestamptz.to_oid(),
-                            "DATE" => PgType::Date.to_oid(),
-                            "TIME" | "TIME WITHOUT TIME ZONE" => PgType::Time.to_oid(),
-                            "TIMETZ" | "TIME WITH TIME ZONE" => PgType::Timetz.to_oid(),
-                            "INTERVAL" => PgType::Interval.to_oid(),
-                            "VARCHAR" | "TEXT" => PgType::Text.to_oid(),
-                            "INTEGER" | "INT4" => PgType::Int4.to_oid(),
-                            "BIGINT" | "INT8" => PgType::Int8.to_oid(),
-                            "SMALLINT" | "INT2" => PgType::Int2.to_oid(),
-                            "NUMERIC" | "DECIMAL" => PgType::Numeric.to_oid(),
-                            "BOOLEAN" => PgType::Bool.to_oid(),
-                            _ => 0, // Unknown type
-                        };
+                        let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(type_name);
                         if type_oid != 0 {
                             extracted_param_types[index] = type_oid;
-                            // Extracted parameter type
                         }
                     }
                 }
@@ -225,22 +213,57 @@ impl ExtendedQueryHandler {
             for i in 1..=extracted_param_types.len() {
                 let cast_pattern = format!("${i}::");
                 if let Some(cast_start) = cleaned_query.find(&cast_pattern) {
-                    let type_start = cast_start + cast_pattern.len();
-                    let mut type_end = type_start;
-                    while type_end < cleaned_query.len() {
-                        let ch = cleaned_query.chars().nth(type_end).unwrap();
-                        if ch.is_whitespace() || ch == ',' || ch == ')' || ch == ';' {
-                            break;
+                    let raw_type_start = cast_start + cast_pattern.len();
+                    let trimmed_after = cleaned_query[raw_type_start..].trim_start();
+                    let offset = cleaned_query[raw_type_start..].len() - trimmed_after.len();
+                    let type_start = raw_type_start + offset;
+                    let after_cast = &cleaned_query[type_start..];
+                    let upper_after = after_cast.to_uppercase();
+                    let multiword_types = [
+                        ("TIMESTAMP WITHOUT TIME ZONE", 27),
+                        ("TIMESTAMP WITH TIME ZONE", 24),
+                        ("TIME WITHOUT TIME ZONE", 22),
+                        ("TIME WITH TIME ZONE", 19),
+                        ("DOUBLE PRECISION", 16),
+                        ("CHARACTER VARYING", 17),
+                        ("BIT VARYING", 11),
+                    ];
+                    let mut matched_len = None;
+                    for (pattern, len) in multiword_types {
+                        if upper_after.starts_with(pattern) {
+                            if after_cast.len() == len {
+                                matched_len = Some(len);
+                                break;
+                            } else if let Some(next_char) = after_cast.as_bytes().get(len) {
+                                if !next_char.is_ascii_alphanumeric() && *next_char != b'_' {
+                                    matched_len = Some(len);
+                                    break;
+                                }
+                            }
                         }
-                        type_end += 1;
                     }
-                    
-                    if type_end > type_start {
-                        let type_name = &cleaned_query[type_start..type_end];
-                        let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(type_name);
+                    let type_name = if let Some(len) = matched_len {
+                        &after_cast[..len]
+                    } else {
+                        let mut type_end = type_start;
+                        while type_end < cleaned_query.len() {
+                            let c = cleaned_query.as_bytes()[type_end] as char;
+                            if !c.is_alphanumeric() && c != '_' {
+                                break;
+                            }
+                            type_end += 1;
+                        }
+                        &cleaned_query[type_start..type_end]
+                    };
+                    if !type_name.is_empty() {
+                        let mut final_type = type_name.to_string();
+                        let rest = cleaned_query[type_start + type_name.len()..].trim_start();
+                        if rest.starts_with("[]") {
+                            final_type.push_str("[]");
+                        }
+                        let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&final_type);
                         if type_oid != 0 {
                             extracted_param_types[i - 1] = type_oid;
-                            // Extracted parameter type
                         }
                     }
                 }
@@ -312,8 +335,8 @@ impl ExtendedQueryHandler {
         // For INSERT and SELECT queries, we need to determine parameter types from the target table schema
         let mut actual_param_types = param_types.clone();
         
-        // Use extracted parameter types if we found any
-        if extracted_param_types.iter().any(|&t| t != 0) {
+        // Use extracted parameter types if ALL are non-zero
+        if extracted_param_types.iter().all(|&t| t != 0) && !extracted_param_types.is_empty() {
             // Using extracted parameter types
             actual_param_types = extracted_param_types.clone();
             
@@ -330,11 +353,21 @@ impl ExtendedQueryHandler {
             // First check parameter cache
             if let Some(cached_info) = GLOBAL_PARAMETER_CACHE.get(&query) {
                 actual_param_types = cached_info.param_types;
+                for (i, &ext) in extracted_param_types.iter().enumerate() {
+                    if ext != 0 && i < actual_param_types.len() && actual_param_types[i] == 0 {
+                        actual_param_types[i] = ext;
+                    }
+                }
                 debug!("Using cached parameter types for query: {:?}", actual_param_types);
             } else {
                 // Check if we have this query cached in query cache
                 if let Some(cached) = GLOBAL_QUERY_CACHE.get(&query) {
                     actual_param_types = cached.param_types.clone();
+                    for (i, &ext) in extracted_param_types.iter().enumerate() {
+                        if ext != 0 && i < actual_param_types.len() && actual_param_types[i] == 0 {
+                            actual_param_types[i] = ext;
+                        }
+                    }
                     debug!("Using cached parameter types from query cache: {:?}", actual_param_types);
                     
                     // Also cache in parameter cache for faster access
@@ -386,11 +419,17 @@ impl ExtendedQueryHandler {
                         (types.clone(), Some(types), None, Vec::new())
                     };
                     
-                    actual_param_types = analyzed_types.clone();
+                    let mut merged_types = analyzed_types.clone();
+                    for (i, &ext) in extracted_param_types.iter().enumerate() {
+                        if ext != 0 && i < merged_types.len() {
+                            merged_types[i] = ext;
+                        }
+                    }
+                    actual_param_types = merged_types.clone();
                     
                     // Cache the parameter info
                     GLOBAL_PARAMETER_CACHE.insert(query.clone(), CachedParameterInfo {
-                        param_types: analyzed_types,
+                        param_types: actual_param_types.clone(),
                         original_types: original_types_opt.unwrap_or_else(|| actual_param_types.clone()),
                         table_name,
                         column_names,
@@ -419,7 +458,16 @@ impl ExtendedQueryHandler {
             }
         }
         
+        // Translate data-modifying CTE queries into SQLite DML with RETURNING
+        if let Some(dml_translated) = crate::translator::DmlCteTranslator::translate(&cleaned_query) {
+            info!("PARSE: Translated DML CTE query to: {}", dml_translated);
+            cleaned_query = dml_translated;
+        }
+
         // Pre-translate the query first so we can analyze the translated version
+        #[allow(unused_mut)]
+        let mut translation_metadata = crate::translator::TranslationMetadata::new();
+
         #[cfg(feature = "unified_processor")]
         #[allow(unused_mut)]
         let mut translated_for_analysis = {
@@ -430,13 +478,29 @@ impl ExtendedQueryHandler {
         };
         
         #[cfg(not(feature = "unified_processor"))]
-        let mut translated_for_analysis = if crate::translator::CastTranslator::needs_translation(&cleaned_query) {
-            db.with_session_connection(&session.id, |conn| {
-                Ok(crate::translator::CastTranslator::translate_query(&cleaned_query, Some(conn)))
-            }).await?
-        } else {
-            cleaned_query.clone()
-        };
+        let mut translated_for_analysis = cleaned_query.clone();
+
+        // Translate row_to_json() / json_populate_record() functions first before casts are stripped
+        #[cfg(not(feature = "unified_processor"))]
+        {
+            use crate::translator::RowToJsonTranslator;
+            if RowToJsonTranslator::contains_row_to_json_call(&translated_for_analysis) {
+                let (translated, metadata) = db.with_session_connection(&session.id, |conn| {
+                    Ok(RowToJsonTranslator::translate_row_to_json_with_conn(&translated_for_analysis, Some(conn)))
+                }).await?;
+                if translated != translated_for_analysis {
+                    translated_for_analysis = translated;
+                }
+                translation_metadata.merge(metadata);
+            }
+        }
+
+        #[cfg(not(feature = "unified_processor"))]
+        if crate::translator::CastTranslator::needs_translation(&translated_for_analysis) {
+            translated_for_analysis = db.with_session_connection(&session.id, |conn| {
+                Ok(crate::translator::CastTranslator::translate_query(&translated_for_analysis, Some(conn)))
+            }).await?;
+        }
         
         // Translate NUMERIC to TEXT casts with proper formatting
         #[cfg(not(feature = "unified_processor"))] // Skip when using unified processor
@@ -447,8 +511,6 @@ impl ExtendedQueryHandler {
         }
         
         // Translate datetime functions if needed and capture metadata
-        #[allow(unused_mut)]
-        let mut translation_metadata = crate::translator::TranslationMetadata::new();
         #[cfg(not(feature = "unified_processor"))] // Skip when using unified processor
         if crate::translator::DateTimeTranslator::needs_translation(&translated_for_analysis) {
             let (translated, metadata) = crate::translator::DateTimeTranslator::translate_with_metadata(&translated_for_analysis);
@@ -503,19 +565,27 @@ impl ExtendedQueryHandler {
             }
         }
         }
-        
-        // Translate row_to_json() functions for PostgreSQL compatibility
-        #[cfg(not(feature = "unified_processor"))] // Skip when using unified processor
+
+        // Translate array_agg / string_agg functions with ORDER BY/DISTINCT support
+        #[cfg(not(feature = "unified_processor"))]
         {
-            use crate::translator::RowToJsonTranslator;
-        let (translated, metadata) = RowToJsonTranslator::translate_row_to_json(&translated_for_analysis);
-        if translated != translated_for_analysis {
-            // row_to_json translation applied
-            // Translation complete
-            translated_for_analysis = translated;
+            use crate::translator::ArrayAggTranslator;
+            if ArrayAggTranslator::contains_enhanced_array_agg(&translated_for_analysis)
+                || ArrayAggTranslator::contains_enhanced_string_agg(&translated_for_analysis)
+            {
+                if let Ok((translated, metadata)) = ArrayAggTranslator::translate_with_metadata(&translated_for_analysis) {
+                    if translated != translated_for_analysis {
+                        translated_for_analysis = translated;
+                    }
+                    translation_metadata.merge(metadata);
+                }
+            }
         }
-        // row_to_json metadata processed
-        translation_metadata.merge(metadata);
+
+        // Fix SQLite INSERT ... SELECT ... FROM ... ON CONFLICT syntax ambiguity
+        #[cfg(not(feature = "unified_processor"))]
+        if translated_for_analysis.to_uppercase().contains("ON CONFLICT") {
+            translated_for_analysis = crate::translator::RowToJsonTranslator::fix_insert_select_on_conflict(&translated_for_analysis);
         }
         
         // Note: System function processing (like to_regtype) is handled during Execute phase
@@ -567,6 +637,16 @@ impl ExtendedQueryHandler {
                 let cast_regex = regex::Regex::new(r"::[a-zA-Z]\w*(?:\[\])*").unwrap();
                 test_query = cast_regex.replace_all(&test_query, "").to_string();
                 
+                // Replace invalid LIMIT NULL / OFFSET NULL with valid literals for SQLite test query
+                static LIMIT_NULL_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                    regex::Regex::new(r"(?i)\bLIMIT\s+NULL\b").unwrap()
+                });
+                static OFFSET_NULL_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                    regex::Regex::new(r"(?i)\bOFFSET\s+NULL\b").unwrap()
+                });
+                test_query = LIMIT_NULL_RE.replace_all(&test_query, "LIMIT 1").to_string();
+                test_query = OFFSET_NULL_RE.replace_all(&test_query, "OFFSET 0").to_string();
+
                 // Add LIMIT 1 to avoid processing too much data, but only if there's no existing LIMIT
                 if !test_query.to_uppercase().contains(" LIMIT ") {
                     test_query = format!("{test_query} LIMIT 1");
@@ -579,101 +659,100 @@ impl ExtendedQueryHandler {
                         info!("Test query returned {} columns: {:?}", response.columns.len(), response.columns);
                         // Extract table name from query to look up schema
                         let table_name = extract_table_name_from_select(&query);
-                        
-                        // Pre-fetch schema types for all columns if we have a table name
+                        let alias_map = crate::query::join_type_inference::extract_table_alias_mapping(&query);
+
+                        // Pre-fetch schema types for all columns
                         let mut schema_types = std::collections::HashMap::new();
-                        if let Some(ref table) = table_name {
+                        let mut schema_types_by_idx = std::collections::HashMap::new();
+                        let pragma_types = if let Some(ref table) = table_name {
                             info!("PARSE: Fetching schema types for table '{}'", table);
-                            let pragma_types = db.get_column_types_from_pragma(&session.id, table).await.unwrap_or_default();
-                            // For aliased columns, try to find the source column
-                            for col_name in &response.columns {
-                                // First try direct lookup
-                                if let Ok(Some(pg_type)) = db.get_schema_type_with_session(&session.id, table, col_name).await {
-                                    info!("PARSE: Found schema type for column '{}' in table '{}': {}", col_name, table, pg_type);
+                            db.get_column_types_from_pragma(&session.id, table).await.unwrap_or_default()
+                        } else {
+                            std::collections::HashMap::new()
+                        };
+
+                        for (col_idx, col_name) in response.columns.iter().enumerate() {
+                            let col_lower = col_name.to_ascii_lowercase();
+                            if col_lower.contains("json_object") || col_lower.contains("row_to_json") || col_lower.contains("to_json") {
+                                schema_types_by_idx.insert(col_idx, "json".to_string());
+                                schema_types.insert(col_name.clone(), "json".to_string());
+                                continue;
+                            }
+
+                            // 1. Try to resolve source table and column (handling aliases, joins, compound ids)
+                            if let Some((source_table, source_col)) = Self::extract_source_table_column_with_index(&cleaned_query, col_name, col_idx) {
+                                if let Ok(Some(pg_type)) = db.get_schema_type_with_session(&session.id, &source_table, &source_col).await {
+                                    info!("PARSE: Found schema type for column {} '{}' from '{}.{}': {}", col_idx, col_name, source_table, source_col, pg_type);
+                                    schema_types_by_idx.insert(col_idx, pg_type.clone());
                                     schema_types.insert(col_name.clone(), pg_type);
-                                } else {
-                                    // Parse the query to find the source column for this alias
-                                    // Look for pattern like "table.column AS alias" in the SELECT clause
-                                    let pattern = format!(r"(?i)(\w+)\.(\w+)\s+AS\s+{}", regex::escape(col_name));
-                                    // Checking alias pattern
-                                    if let Ok(re) = regex::Regex::new(&pattern)
-                                        && let Some(captures) = re.captures(&query)
-                                            && let Some(src_table) = captures.get(1)
-                                                && let Some(src_col) = captures.get(2) {
-                                                    let src_table_name = src_table.as_str();
-                                                    let src_col_name = src_col.as_str();
-                                                    // Only use if it's the same table we identified
-                                                    if src_table_name == table
-                                                        && let Ok(Some(pg_type)) = db.get_schema_type_with_session(&session.id, table, src_col_name).await {
-                                                            info!("Found type for aliased column '{}' from query pattern '{}.{}' in table '{}': {}", col_name, src_table_name, src_col_name, table, pg_type);
-                                                            schema_types.insert(col_name.clone(), pg_type);
-                                                            continue;
-                                                        }
-                                                }
-                                        // First check translation metadata
-                                    if let Some(hint) = translation_metadata.get_hint(col_name) {
-                                        // For datetime expressions, check if we have a source column and prefer its type
-                                        if let Some(ref source_col) = hint.source_column {
-                                            if let Ok(Some(source_type)) = db.get_schema_type_with_session(&session.id, table, source_col).await {
-                                                info!("Found source column type for datetime expression '{}' -> '{}': {}", col_name, source_col, source_type);
-                                                schema_types.insert(col_name.clone(), source_type);
-                                            } else if let Some(suggested_type) = &hint.suggested_type {
-                                                info!("Using suggested type for datetime expression '{}': {:?}", col_name, suggested_type);
-                                                // Convert PgType to the string format used in schema
-                                                let type_string = match suggested_type {
-                                                    crate::types::PgType::Float8 => "DOUBLE PRECISION",
-                                                    crate::types::PgType::Float4 => "REAL",
-                                                    crate::types::PgType::Int4 => "INTEGER",
-                                                    crate::types::PgType::Int8 => "BIGINT",
-                                                    crate::types::PgType::Text => "TEXT",
-                                                    crate::types::PgType::Date => "DATE",
-                                                    crate::types::PgType::Time => "TIME",
-                                                    crate::types::PgType::Timestamp => "TIMESTAMP",
-                                                    crate::types::PgType::Timestamptz => "TIMESTAMPTZ",
-                                                    crate::types::PgType::TextArray => "TEXT[]",
-                                                    _ => "TEXT", // Default to TEXT for unknown types
-                                                };
-                                                schema_types.insert(col_name.clone(), type_string.to_string());
-                                            }
-                                        } else if let Some(suggested_type) = &hint.suggested_type {
-                                            info!("Found type hint from translation for '{}': {:?}", col_name, suggested_type);
-                                            // Convert PgType to the string format used in schema
-                                            let type_string = match suggested_type {
-                                                crate::types::PgType::Float8 => "DOUBLE PRECISION",
-                                                crate::types::PgType::Float4 => "REAL",
-                                                crate::types::PgType::Int4 => "INTEGER",
-                                                crate::types::PgType::Int8 => "BIGINT",
-                                                crate::types::PgType::Text => "TEXT",
-                                                crate::types::PgType::Date => "DATE",
-                                                crate::types::PgType::Time => "TIME",
-                                                crate::types::PgType::Timestamp => "TIMESTAMP",
-                                                crate::types::PgType::Timestamptz => "TIMESTAMPTZ",
-                                                _ => "TEXT", // Default to TEXT for unknown types
-                                            };
-                                            schema_types.insert(col_name.clone(), type_string.to_string());
-                                        }
-                                    } else {
-                                        // Try to find source table and column if this is an alias
-                                        info!("Attempting to extract source for alias: '{}' from query: {}", col_name, cleaned_query);
-                                        if let Some((source_table, source_col)) = Self::extract_source_table_column_for_alias(&cleaned_query, col_name) {
-                                            info!("Successfully resolved alias '{}' -> table '{}', column '{}'", col_name, source_table, source_col);
-                                            if let Ok(Some(pg_type)) = db.get_schema_type_with_session(&session.id, &source_table, &source_col).await {
-                                                info!("Found schema type for alias '{}' -> source column '{}.{}': {}", col_name, source_table, source_col, pg_type);
-                                                schema_types.insert(col_name.clone(), pg_type);
-                                            } else {
-                                                info!("No schema type found for '{}.{}'", source_table, source_col);
-                                            }
-                                        } else {
-                                            info!("Could not extract source table/column for alias '{}' from query", col_name);
-                                        }
+                                    continue;
+                                }
+                            }
+
+                            // 2. Direct lookup in primary table
+                            if let Some(ref table) = table_name {
+                                if let Ok(Some(pg_type)) = db.get_schema_type_with_session(&session.id, table, col_name).await {
+                                    info!("PARSE: Found schema type for column {} '{}' in table '{}': {}", col_idx, col_name, table, pg_type);
+                                    schema_types_by_idx.insert(col_idx, pg_type.clone());
+                                    schema_types.insert(col_name.clone(), pg_type);
+                                    continue;
+                                }
+                            }
+
+                            // 3. Search all other tables in the query
+                            let mut found_in_other = false;
+                            for other_table in alias_map.values() {
+                                if Some(other_table) != table_name.as_ref() {
+                                    if let Ok(Some(pg_type)) = db.get_schema_type_with_session(&session.id, other_table, col_name).await {
+                                        info!("PARSE: Found schema type for column {} '{}' in query table '{}': {}", col_idx, col_name, other_table, pg_type);
+                                        schema_types_by_idx.insert(col_idx, pg_type.clone());
+                                        schema_types.insert(col_name.clone(), pg_type);
+                                        found_in_other = true;
+                                        break;
                                     }
                                 }
-                                // PRAGMA table_info fallback
-                                if !schema_types.contains_key(col_name) {
-                                    if let Some(pg_type) = pragma_types.get(col_name) {
-                                        info!("PARSE: Found PRAGMA type for '{}.{}' -> {}", table, col_name, pg_type);
-                                        schema_types.insert(col_name.clone(), pg_type.clone());
+                            }
+                            if found_in_other {
+                                continue;
+                            }
+
+                            // 4. Check translation metadata hints
+                            if let Some(hint) = translation_metadata.get_hint(col_name) {
+                                if let Some(ref source_col) = hint.source_column {
+                                    let table_to_use = table_name.as_deref().unwrap_or("");
+                                    if let Ok(Some(source_type)) = db.get_schema_type_with_session(&session.id, table_to_use, source_col).await {
+                                        schema_types_by_idx.insert(col_idx, source_type.clone());
+                                        schema_types.insert(col_name.clone(), source_type);
+                                        continue;
                                     }
+                                } else if let Some(suggested_type) = &hint.suggested_type {
+                                    let type_string = match suggested_type {
+                                        crate::types::PgType::Float8 => "DOUBLE PRECISION",
+                                        crate::types::PgType::Float4 => "REAL",
+                                        crate::types::PgType::Int4 => "INTEGER",
+                                        crate::types::PgType::Int8 => "BIGINT",
+                                        crate::types::PgType::Text => "TEXT",
+                                        crate::types::PgType::Date => "DATE",
+                                        crate::types::PgType::Time => "TIME",
+                                        crate::types::PgType::Timestamp => "TIMESTAMP",
+                                        crate::types::PgType::Timestamptz => "TIMESTAMPTZ",
+                                        crate::types::PgType::TextArray => "TEXT[]",
+                                        _ => "TEXT",
+                                    };
+                                    schema_types_by_idx.insert(col_idx, type_string.to_string());
+                                    schema_types.insert(col_name.clone(), type_string.to_string());
+                                    continue;
+                                }
+                            }
+
+                            // 5. PRAGMA table_info fallback
+                            if !schema_types_by_idx.contains_key(&col_idx) {
+                                if let Some(pg_type) = pragma_types.get(col_name) {
+                                    if let Some(ref table) = table_name {
+                                        info!("PARSE: Found PRAGMA type for '{}.{}' -> {}", table, col_name, pg_type);
+                                    }
+                                    schema_types_by_idx.insert(col_idx, pg_type.clone());
+                                    schema_types.insert(col_name.clone(), pg_type.clone());
                                 }
                             }
                         }
@@ -804,10 +883,10 @@ impl ExtendedQueryHandler {
                             }
                             
                             // Third priority: Check schema table for stored type mappings
-                            if let Some(pg_type) = schema_types.get(col_name) {
+                            if let Some(pg_type) = schema_types_by_idx.get(&i).or_else(|| schema_types.get(col_name)) {
                                 // Use basic type OID mapping (enum checking would require async which isn't allowed in closure)
                                 let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(pg_type);
-                                info!("PARSE: Column '{}': using schema type '{}' -> OID {}", col_name, pg_type, type_oid);
+                                info!("PARSE: Column {} '{}': using schema type '{}' -> OID {}", i, col_name, pg_type, type_oid);
                                 inferred_types.push(type_oid);
                                 continue;
                             }
@@ -887,7 +966,7 @@ impl ExtendedQueryHandler {
                                 info!("Column '{}': no data rows, attempting schema-based type inference", col_name);
                                 
                                 // Try to extract source table.column from the query
-                                if let Some((source_table, source_col)) = Self::extract_source_table_column_for_alias(&cleaned_query, col_name) {
+                                if let Some((source_table, source_col)) = Self::extract_source_table_column_with_index(&cleaned_query, col_name, i).or_else(|| Self::extract_source_table_column_for_alias(&cleaned_query, col_name)) {
                                     info!("Resolved alias '{}' -> table '{}', column '{}'", col_name, source_table, source_col);
                                     
                                     // Use session-aware schema lookup to see uncommitted data
@@ -1014,7 +1093,8 @@ impl ExtendedQueryHandler {
                         info!("Parsed {} field descriptions from query with inferred types", fields.len());
                         fields
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        info!("PARSE: test_query failed: {:?}, query: {}", e, test_query);
                         // Failed to get field descriptions - will determine during execute
                         Vec::new()
                     }
@@ -1106,78 +1186,12 @@ impl ExtendedQueryHandler {
     /// Try to extract the source table and column for an alias in a simple SELECT
     /// e.g., "SELECT test_users.id AS users_id" -> returns ("test_users", "id")
     /// e.g., "SELECT id AS event_id FROM test_events" -> returns ("test_events", "id")
-    fn extract_source_table_column_for_alias(query: &str, alias: &str) -> Option<(String, String)> {
-        // This is a simple heuristic for the common case
-        // Look for "SELECT <expr> as <alias>" pattern
-        info!("extract_source_table_column_for_alias: Looking for alias '{}' in query", alias);
-        let query_upper = query.to_uppercase();
-        let alias_upper = alias.to_uppercase();
-        
-        // Find "AS <alias>" in the query
-        let as_pattern = format!(" AS {alias_upper}");
-        info!("Looking for pattern: '{}'", as_pattern);
-        if let Some(as_pos) = query_upper.find(&as_pattern) {
-            info!("Found AS pattern at position {}", as_pos);
-            // Work backwards to find the start of the expression
-            let before_as = &query[..as_pos];
-            
-            // Find the column expression before AS
-            // Handle both "table.column" and "column" patterns
-            
-            // Get the last token/word before AS (handling commas and spaces)
-            let trimmed = before_as.trim_end();
-            info!("Text before AS (trimmed): '{}'", trimmed);
-            
-            // Find where this expression starts (after SELECT or comma)
-            let mut expr_start = 0;
-            let select_upper = "SELECT ";
-            
-            // Look for the last comma or SELECT keyword
-            if let Some(comma_pos) = trimmed.rfind(',') {
-                expr_start = comma_pos + 1;
-                info!("Found comma at position {}, expr_start = {}", comma_pos, expr_start);
-            } else if let Some(select_pos) = query_upper.find(select_upper) {
-                expr_start = select_pos + select_upper.len();
-                info!("Found SELECT at position {}, expr_start = {}", select_pos, expr_start);
-            }
-            
-            // Make sure expr_start is within bounds
-            if expr_start >= trimmed.len() {
-                info!("expr_start {} >= trimmed.len() {}, using 0", expr_start, trimmed.len());
-                expr_start = 0;
-            }
-            
-            let expr = trimmed[expr_start..].trim();
-            info!("Extracted expression: '{}'", expr);
-            
-            // Check if it contains a dot (table.column)
-            if let Some(dot_pos) = expr.rfind('.') {
-                let table_part = expr[..dot_pos].trim();
-                let column_part = expr[dot_pos + 1..].trim();
-                info!("Found table.column pattern: '{}' . '{}'", table_part, column_part);
-                
-                // Validate both parts are simple identifiers
-                if table_part.chars().all(|c| c.is_alphanumeric() || c == '_') &&
-                   column_part.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    info!("Successfully parsed alias '{}' -> table '{}', column '{}'", alias, table_part, column_part);
-                    return Some((table_part.to_string(), column_part.to_string()));
-                }
-            }
-            // For simple column references without table prefix
-            else if expr.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                // Try to extract table from FROM clause
-                if let Some(table_name) = extract_table_name_from_select(query) {
-                    info!("Successfully parsed alias '{}' -> table '{}' (from FROM clause), column '{}'", alias, table_name, expr);
-                    return Some((table_name, expr.to_string()));
-                }
-            }
-            
-            info!("Failed to parse expression '{}' - not a valid table.column or simple column", expr);
-        } else {
-            info!("AS pattern not found for alias '{}'", alias);
-        }
-        
-        None
+    pub(crate) fn extract_source_table_column_for_alias(query: &str, alias: &str) -> Option<(String, String)> {
+        crate::query::join_type_inference::extract_source_table_column(query, alias, None)
+    }
+
+    pub(crate) fn extract_source_table_column_with_index(query: &str, alias: &str, idx: usize) -> Option<(String, String)> {
+        crate::query::join_type_inference::extract_source_table_column(query, alias, Some(idx))
     }
     
     pub async fn handle_bind<T>(
@@ -1239,9 +1253,9 @@ impl ExtendedQueryHandler {
             
         // Processing parameter types and formats
         
-        // Check if we need to infer types (only when param types are empty or unknown)
+        // Check if we need to infer types (when param types are empty or ANY param is 0)
         let needs_inference = stmt.param_types.is_empty() || 
-            stmt.param_types.iter().all(|&t| t == 0);
+            stmt.param_types.iter().any(|&t| t == 0);
         
         let mut inferred_types = None;
         
@@ -1250,6 +1264,11 @@ impl ExtendedQueryHandler {
             let mut types = Vec::new();
             
             for (i, val) in values.iter().enumerate() {
+                let existing = stmt.param_types.get(i).copied().unwrap_or(0);
+                if existing != 0 {
+                    types.push(existing);
+                    continue;
+                }
                 let format = formats.get(i).copied().unwrap_or(0);
                 let inferred_type = if let Some(v) = val {
                     // For binary format, check the length to infer integer types
@@ -1283,6 +1302,32 @@ impl ExtendedQueryHandler {
             }
             
             inferred_types = Some(types);
+        }
+        
+        // Validate UTF-8 null bytes: PostgreSQL rejects 0x00 in text/char/json values with 22021
+        for (i, val) in values.iter().enumerate() {
+            if let Some(bytes) = val {
+                let format = if formats.is_empty() {
+                    0
+                } else if formats.len() == 1 {
+                    formats[0]
+                } else {
+                    formats.get(i).copied().unwrap_or(0)
+                };
+                let param_type = inferred_types.as_ref()
+                    .and_then(|t| t.get(i).copied())
+                    .or_else(|| stmt.param_types.get(i).copied())
+                    .unwrap_or(0);
+                if (format == 0 || param_type == 25 || param_type == 1043 || param_type == 18 || param_type == 19 || param_type == 114 || param_type == 3802)
+                    && param_type != 17
+                    && bytes.contains(&0)
+                {
+                    return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                        code: "22021".to_string(),
+                        message: "invalid byte sequence for encoding \"UTF8\": 0x00".to_string(),
+                    }));
+                }
+            }
         }
         
         for (i, val) in values.iter().enumerate() {
@@ -1354,8 +1399,6 @@ impl ExtendedQueryHandler {
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        println!("EXTENDED: handle_execute called for portal: '{}'", portal);
-
         // Get the portal
         let (query, translated_query, bound_values, param_formats, result_formats, statement_name, inferred_param_types) = {
             let portals = session.portals.read().await;
@@ -1423,6 +1466,23 @@ impl ExtendedQueryHandler {
             stmt.param_types.clone()
         };
         
+        // Validate UTF-8 null bytes: PostgreSQL rejects 0x00 in text/char/json values with 22021
+        for (i, val) in bound_values.iter().enumerate() {
+            if let Some(bytes) = val {
+                let format = param_formats.get(i).copied().unwrap_or(0);
+                let param_type = param_types.get(i).copied().unwrap_or(0);
+                if (format == 0 || param_type == 25 || param_type == 1043 || param_type == 18 || param_type == 19 || param_type == 114 || param_type == 3802)
+                    && param_type != 17
+                    && bytes.contains(&0)
+                {
+                    return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                        code: "22021".to_string(),
+                        message: "invalid byte sequence for encoding \"UTF8\": 0x00".to_string(),
+                    }));
+                }
+            }
+        }
+        
         // Fast path for simple parameterized SELECT queries
         // Allow :: cast operator if it's only for parameters (e.g., $1::INTEGER)
         let has_non_param_cast = if query.contains("::") {
@@ -1478,34 +1538,36 @@ impl ExtendedQueryHandler {
                         // Parse the query to get column names and their aliases
                         let mut inferred_types = Vec::new();
                         let table_name = extract_table_name_from_select(&query);
+                        let alias_map = crate::query::join_type_inference::extract_table_alias_mapping(&query);
                         info!("Ultra-fast path: Inferring types for query: {}", query);
                         info!("Ultra-fast path: Extracted table name: {:?}", table_name);
                         
-                        // Extract column names from SELECT clause
-                        // Handle both " FROM " and "\nFROM " (queries might have newlines)
-                        let query_upper = query.to_uppercase();
-                        let select_end = query_upper.find(" FROM ")
-                            .or_else(|| query_upper.find("\nFROM "));
+                        let select_end = find_top_level_from(&query);
                         
                         if let Some(select_end) = select_end {
-                            let select_part = &query[6..select_end]; // Skip "SELECT"
-                            let columns: Vec<&str> = select_part.split(',').map(|s| s.trim()).collect();
+                            let query_upper = query.to_uppercase();
+                            let select_start = query_upper.find("SELECT").map(|pos| pos + 6).unwrap_or(0);
+                            let mut select_part = &query[select_start..select_end];
+                            let trimmed_select = select_part.trim_start();
+                            if trimmed_select.to_uppercase().starts_with("DISTINCT ") {
+                                select_part = &trimmed_select[9..];
+                            }
+                            let columns = split_select_columns(select_part);
                             
                             info!("Ultra-fast path: Parsing {} columns from SELECT clause", columns.len());
-                            for col_expr in columns {
-                                info!("Ultra-fast path: Processing column expression: '{}'", col_expr);
+                            for (col_idx, col_expr) in columns.iter().enumerate() {
+                                info!("Ultra-fast path: Processing column expression {}: '{}'", col_idx, col_expr);
                                 let mut found_type = false;
                                 
                                 // Extract the alias name (after AS) if present
                                 let col_name = if let Some(as_pos) = col_expr.to_uppercase().rfind(" AS ") {
-                                    col_expr[as_pos + 4..].trim()
+                                    col_expr[as_pos + 4..].trim().trim_matches('"')
                                 } else {
-                                    // No alias, use the expression itself
-                                    col_expr
+                                    col_expr.trim().trim_matches('"')
                                 };
                                 
-                                // Try to extract source table.column from the expression
-                                if let Some((source_table, source_col)) = Self::extract_source_table_column_for_alias(&query, col_name) {
+                                // 1. Try to extract source table.column with index
+                                if let Some((source_table, source_col)) = Self::extract_source_table_column_with_index(&query, col_name, col_idx) {
                                     if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, &source_table, &source_col).await {
                                         let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str);
                                         info!("Ultra-fast path: Pre-execution type inference for '{}' from '{}.{}' -> {} (OID {})", 
@@ -1513,28 +1575,51 @@ impl ExtendedQueryHandler {
                                         inferred_types.push(type_oid);
                                         found_type = true;
                                     }
-                                } else if col_expr.contains('.') {
-                                    // Handle table.column format directly
+                                }
+                                
+                                // 2. Handle table.column format directly in expression
+                                if !found_type && col_expr.contains('.') {
                                     let parts: Vec<&str> = col_expr.split('.').collect();
                                     if parts.len() == 2 {
-                                        let table_part = parts[0].trim();
+                                        let table_alias = parts[0].trim();
                                         let column_part = parts[1].trim();
-                                        if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, table_part, column_part).await {
+                                        let real_table = alias_map.get(table_alias).map(|s| s.as_str()).unwrap_or(table_alias);
+                                        if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, real_table, column_part).await {
                                             let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str);
                                             info!("Ultra-fast path: Pre-execution type inference for '{}' from '{}.{}' -> {} (OID {})", 
-                                                  col_name, table_part, column_part, pg_type_str, type_oid);
+                                                  col_name, real_table, column_part, pg_type_str, type_oid);
                                             inferred_types.push(type_oid);
                                             found_type = true;
                                         }
                                     }
-                                } else if let Some(ref table) = table_name {
-                                    // Try direct column name lookup in the main table
-                                    if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, table, col_expr).await {
-                                        let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str);
-                                        info!("Ultra-fast path: Pre-execution type inference for '{}' from table '{}' -> {} (OID {})", 
-                                              col_name, table, pg_type_str, type_oid);
-                                        inferred_types.push(type_oid);
-                                        found_type = true;
+                                }
+                                
+                                // 3. Try direct column name lookup in the main table
+                                if !found_type {
+                                    if let Some(ref table) = table_name {
+                                        if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, table, col_name).await {
+                                            let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str);
+                                            info!("Ultra-fast path: Pre-execution type inference for '{}' from table '{}' -> {} (OID {})", 
+                                                  col_name, table, pg_type_str, type_oid);
+                                            inferred_types.push(type_oid);
+                                            found_type = true;
+                                        }
+                                    }
+                                }
+                                
+                                // 4. Search other tables in alias_map
+                                if !found_type {
+                                    for other_table in alias_map.values() {
+                                        if Some(other_table) != table_name.as_ref() {
+                                            if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, other_table, col_name).await {
+                                                let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str);
+                                                info!("Ultra-fast path: Pre-execution type inference for '{}' from other table '{}' -> {} (OID {})",
+                                                      col_name, other_table, pg_type_str, type_oid);
+                                                inferred_types.push(type_oid);
+                                                found_type = true;
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                                 
@@ -1622,7 +1707,7 @@ impl ExtendedQueryHandler {
                                     }
                                     t if t == PgType::Bool.to_oid() => {
                                         if bytes.len() == 1 {
-                                            let val = if bytes[0] == 0 { "f" } else { "t" };
+                                            let val = if bytes[0] == 0 { "0" } else { "1" };
                                             Some(val.as_bytes().to_vec())
                                         } else {
                                             Some(bytes.clone())
@@ -1646,8 +1731,10 @@ impl ExtendedQueryHandler {
                                     }
                                     0 => {
                                         // Unknown type - try to infer from length
-                                        // psycopg3 sends numeric values as 8-byte floats when type is unknown
-                                        if bytes.len() == 8 {
+                                        if bytes.len() == 1 && (bytes[0] == 0 || bytes[0] == 1) {
+                                            let val = if bytes[0] == 0 { "0" } else { "1" };
+                                            Some(val.as_bytes().to_vec())
+                                        } else if bytes.len() == 8 {
                                             // Try interpreting as float64 (common for numeric values from psycopg3)
                                             let val = f64::from_be_bytes([
                                                 bytes[0], bytes[1], bytes[2], bytes[3],
@@ -1993,6 +2080,12 @@ impl ExtendedQueryHandler {
             info!("Detected catalog query in extended protocol: {}", final_query);
         }
         
+        let mut final_query = final_query;
+        if let Some(dml_translated) = crate::translator::DmlCteTranslator::translate(&final_query) {
+            info!("EXTENDED: Translated DML CTE query to: {}", dml_translated);
+            final_query = dml_translated;
+        }
+
         let is_select = query_starts_with_ignore_case(&final_query, "SELECT")
             || (query_starts_with_ignore_case(&final_query, "WITH") && {
                 let upper = final_query.to_ascii_uppercase();
@@ -2919,6 +3012,11 @@ impl ExtendedQueryHandler {
                             }
                         }
                     }
+                    if param_type == 0 {
+                        if let Ok(i) = trimmed.parse::<i64>() {
+                            return Ok(rusqlite::types::Value::Integer(i));
+                        }
+                    }
                     Ok(rusqlite::types::Value::Text(text.to_string()))
                 }
             }
@@ -3043,6 +3141,10 @@ impl ExtendedQueryHandler {
                     if format == 1 {
                         // Binary format - decode based on expected type
                         match param_type {
+                            t if t == PgType::Bool.to_oid() => {
+                                let val = if bytes.first().copied().unwrap_or(0) != 0 { 1 } else { 0 };
+                                val.to_string()
+                            }
                             t if t == PgType::Int2.to_oid() => {
                                 // int2 (smallint)
                                 if bytes.len() == 2 {
@@ -3249,8 +3351,21 @@ impl ExtendedQueryHandler {
                         // Text format - interpret as UTF-8 string
                         match String::from_utf8(bytes.clone()) {
                             Ok(s) => {
+                                if s.contains('\0') && param_type != 17 {
+                                    return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                                        code: "22021".to_string(),
+                                        message: "invalid byte sequence for encoding \"UTF8\": 0x00".to_string(),
+                                    }));
+                                }
                                 // Check parameter type to determine handling
                                 match param_type {
+                                    t if t == PgType::Bool.to_oid() => {
+                                        let val = match s.trim() {
+                                            "1" | "t" | "true" | "TRUE" | "T" => 1,
+                                            _ => 0,
+                                        };
+                                        val.to_string()
+                                    }
                                     t if t == PgType::Int4.to_oid() || t == PgType::Int8.to_oid() || t == PgType::Int2.to_oid() || 
                                          t == PgType::Float4.to_oid() || t == PgType::Float8.to_oid() => {
                                         // Integer and float types - use as-is if valid number
@@ -3283,6 +3398,13 @@ impl ExtendedQueryHandler {
                                         if query.contains("FROM (VALUES") && query.contains("SELECT CAST(p0") {
                                             // SQLAlchemy VALUES pattern - keep as formatted string
                                             format!("'{}'", s.replace('\'', "''"))
+                                        } else if t == PgType::Timestamptz.to_oid() {
+                                            match crate::types::ValueConverter::convert_timestamptz_to_unix(&s) {
+                                                Ok(unix_timestamp) => unix_timestamp,
+                                                Err(e) => {
+                                                    return Err(PgSqliteError::InvalidParameter(format!("Invalid TIMESTAMP value: {e}")));
+                                                }
+                                            }
                                         } else {
                                             // Normal query - convert to Unix timestamp
                                             match crate::types::ValueConverter::convert_timestamp_to_unix(&s) {
@@ -3324,6 +3446,9 @@ impl ExtendedQueryHandler {
                                         } else {
                                             format!("'{}'", s.replace('\'', "''"))
                                         }
+                                    }
+                                    t if t == PgType::Text.to_oid() || t == PgType::Varchar.to_oid() || t == PgType::Char.to_oid() || t == 19 => {
+                                        format!("'{}'", s.replace('\'', "''"))
                                     }
                                     _ => {
                                         let trimmed = s.trim();
@@ -3638,6 +3763,15 @@ impl ExtendedQueryHandler {
                 return Some(micros);
             }
         }
+
+        // Try date-only format
+        if let Ok(d) = NaiveDate::parse_from_str(timestamp_str, "%Y-%m-%d") {
+            let dt = d.and_hms_opt(0, 0, 0)?;
+            let pg_epoch = NaiveDate::from_ymd_opt(2000, 1, 1)?.and_hms_opt(0, 0, 0)?;
+            let duration = dt - pg_epoch;
+            return duration.num_microseconds();
+        }
+
         None
     }
     
@@ -3951,20 +4085,19 @@ impl ExtendedQueryHandler {
                         // Binary format requested
                         match type_oid {
                             t if t == PgType::Bool.to_oid() => {
-                                // bool - convert text to binary
-                                if let Ok(s) = String::from_utf8(bytes.clone()) {
+                                if bytes.as_slice() == [0] || bytes.as_slice() == b"0" || bytes.as_slice() == b"f" || bytes.as_slice() == b"F" || bytes.as_slice() == b"false" || bytes.as_slice() == b"FALSE" {
+                                    Some(vec![0u8])
+                                } else if bytes.as_slice() == [1] || bytes.as_slice() == b"1" || bytes.as_slice() == b"t" || bytes.as_slice() == b"T" || bytes.as_slice() == b"true" || bytes.as_slice() == b"TRUE" {
+                                    Some(vec![1u8])
+                                } else if let Ok(s) = std::str::from_utf8(bytes) {
                                     let val = match s.trim() {
                                         "1" | "t" | "true" | "TRUE" | "T" => 1u8,
                                         "0" | "f" | "false" | "FALSE" | "F" => 0u8,
-                                        _ => {
-                                            // Invalid boolean, keep as text
-                                            encoded_row.push(Some(bytes.clone()));
-                                            continue;
-                                        }
+                                        _ => 0u8,
                                     };
                                     Some(vec![val])
                                 } else {
-                                    Some(bytes.clone())
+                                    Some(vec![0u8])
                                 }
                             }
                             t if t == PgType::Int2.to_oid() => {
@@ -4406,18 +4539,19 @@ impl ExtendedQueryHandler {
                         // Text format
                         match type_oid {
                             t if t == PgType::Bool.to_oid() => {
-                                // bool - convert SQLite's 0/1 to PostgreSQL's f/t format
-                                if let Ok(s) = String::from_utf8(bytes.clone()) {
-                                    let pg_bool_str = match s.trim() {
-                                        "0" => "f",
-                                        "1" => "t",
-                                        // Already in PostgreSQL format or other values
-                                        "f" | "t" | "false" | "true" => &s,
-                                        _ => &s, // Keep unknown values as-is
+                                if bytes.as_slice() == [0] || bytes.as_slice() == b"0" || bytes.as_slice() == b"f" || bytes.as_slice() == b"F" || bytes.as_slice() == b"false" || bytes.as_slice() == b"FALSE" {
+                                    Some(vec![b'f'])
+                                } else if bytes.as_slice() == [1] || bytes.as_slice() == b"1" || bytes.as_slice() == b"t" || bytes.as_slice() == b"T" || bytes.as_slice() == b"true" || bytes.as_slice() == b"TRUE" {
+                                    Some(vec![b't'])
+                                } else if let Ok(s) = std::str::from_utf8(bytes) {
+                                    let pg_bool = match s.trim() {
+                                        "0" | "f" | "F" | "false" | "FALSE" => "f",
+                                        "1" | "t" | "T" | "true" | "TRUE" => "t",
+                                        _ => "f",
                                     };
-                                    Some(pg_bool_str.as_bytes().to_vec())
+                                    Some(pg_bool.as_bytes().to_vec())
                                 } else {
-                                    Some(bytes.clone())
+                                    Some(vec![b'f'])
                                 }
                             }
                             // Date type - convert from INTEGER days to formatted string
@@ -4664,38 +4798,61 @@ impl ExtendedQueryHandler {
                     })
                     .collect()
             } else {
-                // Pre-fetch schema types for all columns if we have a table name
+                // Pre-fetch schema types for all columns
                 let mut schema_types = std::collections::HashMap::new();
-                if let Some(ref table) = table_name {
-                    let pragma_types = db.get_column_types_from_pragma(&session.id, table).await.unwrap_or_default();
-                    for col_name in &response.columns {
-                        // Try direct lookup first
-                        if let Ok(Some(pg_type)) = db.get_schema_type_with_session(&session.id, table, col_name).await {
+                let mut schema_types_by_idx = std::collections::HashMap::new();
+                let query_alias_map = crate::query::join_type_inference::extract_table_alias_mapping(query);
+                let pragma_types = if let Some(ref table) = table_name {
+                    db.get_column_types_from_pragma(&session.id, table).await.unwrap_or_default()
+                } else {
+                    std::collections::HashMap::new()
+                };
+
+                for (col_idx, col_name) in response.columns.iter().enumerate() {
+                    let col_lower = col_name.to_ascii_lowercase();
+                    if col_lower.contains("json_object") || col_lower.contains("row_to_json") || col_lower.contains("to_json") {
+                        schema_types_by_idx.insert(col_idx, "json".to_string());
+                        schema_types.insert(col_name.clone(), "json".to_string());
+                        continue;
+                    }
+
+                    // Try direct source table.col lookup first
+                    if let Some((source_table, source_col)) = Self::extract_source_table_column_with_index(query, col_name, col_idx) {
+                        if let Ok(Some(pg_type)) = db.get_schema_type_with_session(&session.id, &source_table, &source_col).await {
+                            schema_types_by_idx.insert(col_idx, pg_type.clone());
                             schema_types.insert(col_name.clone(), pg_type);
-                        } else {
-                            // Parse the query to find the source column for this alias
-                            // Look for pattern like "table.column AS alias" in the SELECT clause
-                            let pattern = format!(r"(?i)(\w+)\.(\w+)\s+AS\s+{}", regex::escape(col_name));
-                            if let Ok(re) = regex::Regex::new(&pattern)
-                                && let Some(captures) = re.captures(query)
-                                    && let Some(src_table) = captures.get(1)
-                                        && let Some(src_col) = captures.get(2) {
-                                            let src_table_name = src_table.as_str();
-                                            let src_col_name = src_col.as_str();
-                                            // Only use if it's the same table we identified
-                                            if src_table_name == table
-                                                && let Ok(Some(pg_type)) = db.get_schema_type_with_session(&session.id, table, src_col_name).await {
-                                                    info!("Found type for aliased column '{}' from query pattern '{}.{}': {}", col_name, src_table_name, src_col_name, pg_type);
-                                                    schema_types.insert(col_name.clone(), pg_type);
-                                                }
-                                        }
+                            continue;
                         }
-                        // PRAGMA table_info fallback
-                        if !schema_types.contains_key(col_name) {
-                            if let Some(pg_type) = pragma_types.get(col_name) {
-                                info!("Found PRAGMA type for '{}.{}' -> {}", table, col_name, pg_type);
-                                schema_types.insert(col_name.clone(), pg_type.clone());
+                    }
+
+                    // Try direct lookup in primary table
+                    if let Some(ref table) = table_name {
+                        if let Ok(Some(pg_type)) = db.get_schema_type_with_session(&session.id, table, col_name).await {
+                            schema_types_by_idx.insert(col_idx, pg_type.clone());
+                            schema_types.insert(col_name.clone(), pg_type);
+                            continue;
+                        }
+                    }
+
+                    // Try other tables in query
+                    for other_table in query_alias_map.values() {
+                        if Some(other_table) != table_name.as_ref() {
+                            if let Ok(Some(pg_type)) = db.get_schema_type_with_session(&session.id, other_table, col_name).await {
+                                schema_types_by_idx.insert(col_idx, pg_type.clone());
+                                schema_types.insert(col_name.clone(), pg_type);
+                                break;
                             }
+                        }
+                    }
+
+                    // PRAGMA table_info fallback
+                    if !schema_types_by_idx.contains_key(&col_idx) {
+                        if let Some(pg_type) = pragma_types.get(col_name) {
+                            if let Some(ref table) = table_name {
+                                info!("Found PRAGMA type for '{}.{}' -> {}", table, col_name, pg_type);
+                            }
+                            schema_types_by_idx.insert(col_idx, pg_type.clone());
+                            schema_types.insert(col_name.clone(), pg_type.clone());
                         }
                     }
                 }
@@ -4828,10 +4985,10 @@ impl ExtendedQueryHandler {
                         }
                         
                         // First priority: Check schema table for stored type mappings
-                        if let Some(pg_type) = schema_types.get(col_name) {
+                        if let Some(pg_type) = schema_types_by_idx.get(&i).or_else(|| schema_types.get(col_name)) {
                             // Use basic type OID mapping (enum checking would require async which isn't allowed in closure)
                             let oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(pg_type);
-                            info!("Column '{}' found in schema as type '{}' (OID {})", col_name, pg_type, oid);
+                            info!("Column {} '{}' found in schema as type '{}' (OID {})", i, col_name, pg_type, oid);
                             return oid;
                         }
                         
@@ -4973,8 +5130,9 @@ impl ExtendedQueryHandler {
                 // Try to infer types - we need async for schema lookup, so collect field descriptions first
                 let mut field_types = Vec::new();
                 
-                // Get table name for schema lookup
+                // Get table name and table aliases for schema lookup
                 let table_name = extract_table_name_from_select(&portal.query);
+                let portal_alias_map = crate::query::join_type_inference::extract_table_alias_mapping(&portal.query);
                 
                 for (i, col_name) in response.columns.iter().enumerate() {
                     info!("EXECUTE: Processing column {}: '{}'", i, col_name);
@@ -5000,42 +5158,60 @@ impl ExtendedQueryHandler {
                     // Try schema-based type inference ALWAYS (not just for empty result sets)
                     // This is crucial for datetime types which are stored as INTEGER in SQLite
                     let mut found_type = false;
-                    if let Some(ref table) = table_name {
-                        info!("EXECUTE: Looking up schema for column '{}' in table '{}'", col_name, table);
-                        // Try to extract source table.column from alias
-                        if let Some((source_table, source_col)) = Self::extract_source_table_column_for_alias(&portal.query, col_name) {
-                            if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, &source_table, &source_col).await {
+                    
+                    // 1. Try to extract source table.column from alias / query
+                    if let Some((source_table, source_col)) = Self::extract_source_table_column_with_index(&portal.query, col_name, i) {
+                        if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, &source_table, &source_col).await {
+                            let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str);
+                            info!("Column '{}': resolved type from schema '{}.{}' -> {} (OID {}) in execute_select", 
+                                  col_name, source_table, source_col, pg_type_str, type_oid);
+                            field_types.push(type_oid);
+                            found_type = true;
+                        }
+                    } else if col_name.contains('.') {
+                        // Handle columns with table prefix like "users.id"
+                        let parts: Vec<&str> = col_name.split('.').collect();
+                        if parts.len() == 2 {
+                            let table_part = parts[0];
+                            let column_part = parts[1];
+                            let real_table = portal_alias_map.get(&table_part.to_lowercase()).map(|s| s.as_str()).unwrap_or(table_part);
+                            info!("Column '{}': Attempting to resolve type from '{}.{}'", col_name, real_table, column_part);
+                            if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, real_table, column_part).await {
                                 let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str);
                                 info!("Column '{}': resolved type from schema '{}.{}' -> {} (OID {}) in execute_select", 
-                                      col_name, source_table, source_col, pg_type_str, type_oid);
+                                      col_name, real_table, column_part, pg_type_str, type_oid);
                                 field_types.push(type_oid);
                                 found_type = true;
                             }
-                        } else if col_name.contains('.') {
-                            // Handle columns with table prefix like "users.id"
-                            let parts: Vec<&str> = col_name.split('.').collect();
-                            if parts.len() == 2 {
-                                let table_part = parts[0];
-                                let column_part = parts[1];
-                                info!("Column '{}': Attempting to resolve type from '{}.{}'", col_name, table_part, column_part);
-                                if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, table_part, column_part).await {
+                        }
+                    }
+
+                    // 2. Direct lookup in primary table
+                    if !found_type {
+                        if let Some(ref table) = table_name {
+                            if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, table, col_name).await {
+                                let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str);
+                                info!("Column '{}': resolved type from schema '{}.{}' -> {} (OID {}) in execute_select", 
+                                      col_name, table, col_name, pg_type_str, type_oid);
+                                field_types.push(type_oid);
+                                found_type = true;
+                            }
+                        }
+                    }
+
+                    // 3. Search other tables in query
+                    if !found_type {
+                        for other_table in portal_alias_map.values() {
+                            if Some(other_table) != table_name.as_ref() {
+                                if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, other_table, col_name).await {
                                     let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str);
-                                    info!("Column '{}': resolved type from schema '{}.{}' -> {} (OID {}) in execute_select", 
-                                          col_name, table_part, column_part, pg_type_str, type_oid);
+                                    info!("Column '{}': resolved type from joined table schema '{}.{}' -> {} (OID {}) in execute_select", 
+                                          col_name, other_table, col_name, pg_type_str, type_oid);
                                     field_types.push(type_oid);
                                     found_type = true;
-                                } else {
-                                    info!("Column '{}': Could not find type for '{}.{}'", col_name, table_part, column_part);
+                                    break;
                                 }
-                            } else {
-                                info!("Column '{}': Contains dot but not in expected format", col_name);
                             }
-                        } else if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, table, col_name).await {
-                            let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str);
-                            info!("Column '{}': resolved type from schema '{}.{}' -> {} (OID {}) in execute_select", 
-                                  col_name, table, col_name, pg_type_str, type_oid);
-                            field_types.push(type_oid);
-                            found_type = true;
                         }
                     }
                     
@@ -5641,6 +5817,35 @@ impl ExtendedQueryHandler {
             return Ok(());
         };
         
+        // Handle ALTER TABLE
+        if query_starts_with_ignore_case(query, "ALTER TABLE") {
+            if let Some(actions) = crate::translator::AlterTableTranslator::parse(query) {
+                db.with_session_connection(&session.id, |conn| {
+                    crate::translator::AlterTableTranslator::execute_actions(conn, &actions)
+                }).await?;
+                for action in &actions {
+                    match action {
+                        crate::translator::AlterTableAction::DropColumn { table_name, .. }
+                        | crate::translator::AlterTableAction::AddColumn { table_name, .. }
+                        | crate::translator::AlterTableAction::RenameColumn { table_name, .. } => {
+                            db.get_schema_cache().invalidate(&table_name.trim_matches('"').to_lowercase());
+                            crate::query::executor::invalidate_table_schema_cache(table_name.trim_matches('"'));
+                        }
+                        crate::translator::AlterTableAction::RenameTable { old_table_name, new_table_name, .. } => {
+                            db.get_schema_cache().invalidate(&old_table_name.trim_matches('"').to_lowercase());
+                            db.get_schema_cache().invalidate(&new_table_name.trim_matches('"').to_lowercase());
+                            crate::query::executor::invalidate_table_schema_cache(old_table_name.trim_matches('"'));
+                            crate::query::executor::invalidate_table_schema_cache(new_table_name.trim_matches('"'));
+                        }
+                        _ => {}
+                    }
+                }
+                framed.send(BackendMessage::CommandComplete { tag: "ALTER TABLE".to_string() }).await
+                    .map_err(PgSqliteError::Io)?;
+                return Ok(());
+            }
+        }
+
         // Handle other DDL with potential translation
         let translated_query = if query.to_lowercase().contains("json") || query.to_lowercase().contains("jsonb") {
             JsonTranslator::translate_statement(query)?
@@ -5748,72 +5953,115 @@ impl ExtendedQueryHandler {
         let mut mapped_params = std::collections::HashSet::new();
         if let Some(values_pos) = query.to_uppercase().find("VALUES") {
             let after_values = query[values_pos + 6..].trim();
-            if let Some(open_paren) = after_values.find('(') {
-                let rest = &after_values[open_paren + 1..];
-                // Find closing paren respecting quotes and nested parens
-                let mut paren_depth = 0;
-                let mut in_quote = false;
-                let mut val_parts = Vec::new();
-                let mut cur = String::new();
-                let mut paren_depth = 0;
-                let mut bracket_depth = 0;
-                for ch in rest.chars() {
-                    if ch == '\'' && !in_quote {
-                        in_quote = true;
-                        cur.push(ch);
-                    } else if ch == '\'' && in_quote {
-                        in_quote = false;
-                        cur.push(ch);
-                    } else if in_quote {
-                        cur.push(ch);
-                    } else {
-                        match ch {
-                            '(' => {
-                                paren_depth += 1;
-                                cur.push(ch);
-                            }
-                            ')' if paren_depth > 0 => {
-                                paren_depth -= 1;
-                                cur.push(ch);
-                            }
-                            ')' if paren_depth == 0 => {
-                                if !cur.trim().is_empty() {
-                                    val_parts.push(cur.trim().to_string());
-                                }
-                                break;
-                            }
-                            '[' => {
-                                bracket_depth += 1;
-                                cur.push(ch);
-                            }
-                            ']' if bracket_depth > 0 => {
-                                bracket_depth -= 1;
-                                cur.push(ch);
-                            }
-                            ',' if paren_depth == 0 && bracket_depth == 0 => {
-                                val_parts.push(cur.trim().to_string());
-                                cur.clear();
-                            }
-                            _ => cur.push(ch),
+            let mut in_quote = false;
+            let mut paren_depth = 0;
+            let mut bracket_depth = 0;
+            let mut cur_expr = String::new();
+            let mut cur_tuple = Vec::new();
+            let mut in_tuple = false;
+
+            for ch in after_values.chars() {
+                if ch == '\'' && !in_quote {
+                    in_quote = true;
+                    if in_tuple { cur_expr.push(ch); }
+                } else if ch == '\'' && in_quote {
+                    in_quote = false;
+                    if in_tuple { cur_expr.push(ch); }
+                } else if in_quote {
+                    if in_tuple { cur_expr.push(ch); }
+                } else {
+                    match ch {
+                        '(' if paren_depth == 0 => {
+                            paren_depth = 1;
+                            in_tuple = true;
+                            cur_expr.clear();
+                            cur_tuple.clear();
                         }
+                        '(' => {
+                            paren_depth += 1;
+                            cur_expr.push(ch);
+                        }
+                        ')' if paren_depth == 1 => {
+                            paren_depth = 0;
+                            in_tuple = false;
+                            if !cur_expr.trim().is_empty() {
+                                cur_tuple.push(cur_expr.trim().to_string());
+                            }
+                            cur_expr.clear();
+
+                            // Process this tuple
+                            for (i, expr) in cur_tuple.iter().enumerate() {
+                                if let Some(col_name) = columns.get(i) {
+                                    if let Some(col_info) = table_schema.column_map.get(&col_name.to_lowercase()) {
+                                        let is_array_constructor = expr.to_ascii_uppercase().contains("ARRAY[");
+                                        let effective_col_oid = if is_array_constructor {
+                                            PgType::from_oid(col_info.pg_oid)
+                                                .and_then(|t| t.element_type())
+                                                .map(|t| t.to_oid())
+                                                .unwrap_or(col_info.pg_oid)
+                                        } else {
+                                            col_info.pg_oid
+                                        };
+
+                                        let param_oid = match effective_col_oid {
+                                            t if t == PgType::Macaddr8.to_oid() => PgType::Text.to_oid(),
+                                            t if t == PgType::Macaddr.to_oid() => PgType::Text.to_oid(),
+                                            t if t == PgType::Inet.to_oid() => PgType::Text.to_oid(),
+                                            t if t == PgType::Cidr.to_oid() => PgType::Text.to_oid(),
+                                            t if t == PgType::Money.to_oid() => PgType::Text.to_oid(),
+                                            t if t == PgType::Int4range.to_oid() => PgType::Text.to_oid(),
+                                            t if t == PgType::Int8range.to_oid() => PgType::Text.to_oid(),
+                                            t if t == PgType::Numrange.to_oid() => PgType::Text.to_oid(),
+                                            t if t == PgType::Bit.to_oid() => PgType::Text.to_oid(),
+                                            t if t == PgType::Varbit.to_oid() => PgType::Text.to_oid(),
+                                            _ => effective_col_oid,
+                                        };
+
+                                        // Find any $k in this expression
+                                        for param_idx in crate::query::ParameterParser::find_parameters(expr) {
+                                            if param_idx >= 1 && param_idx <= param_count {
+                                                param_types[param_idx - 1] = param_oid;
+                                                original_types[param_idx - 1] = effective_col_oid;
+                                                mapped_params.insert(param_idx);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ')' => {
+                            paren_depth -= 1;
+                            cur_expr.push(ch);
+                        }
+                        '[' => {
+                            bracket_depth += 1;
+                            cur_expr.push(ch);
+                        }
+                        ']' if bracket_depth > 0 => {
+                            bracket_depth -= 1;
+                            cur_expr.push(ch);
+                        }
+                        ',' if paren_depth == 1 && bracket_depth == 0 => {
+                            cur_tuple.push(cur_expr.trim().to_string());
+                            cur_expr.clear();
+                        }
+                        _ if in_tuple => {
+                            cur_expr.push(ch);
+                        }
+                        _ => {}
                     }
                 }
+            }
+        }
 
-                // For each expression that corresponds to a column
-                for (i, expr) in val_parts.iter().enumerate() {
-                    if let Some(col_name) = columns.get(i) {
-                        if let Some(col_info) = table_schema.column_map.get(&col_name.to_lowercase()) {
-                            let is_array_constructor = expr.to_ascii_uppercase().contains("ARRAY[");
-                            let effective_col_oid = if is_array_constructor {
-                                PgType::from_oid(col_info.pg_oid)
-                                    .and_then(|t| t.element_type())
-                                    .map(|t| t.to_oid())
-                                    .unwrap_or(col_info.pg_oid)
-                            } else {
-                                col_info.pg_oid
-                            };
-
-                            let param_oid = match effective_col_oid {
+        // Fallback for any unmapped parameters: if simple 1:1 or multi-row positional mapping matches
+        if !columns.is_empty() {
+            for param_idx in 1..=param_count {
+                if !mapped_params.contains(&param_idx) {
+                    let col_idx = (param_idx - 1) % columns.len();
+                    if let Some(column) = columns.get(col_idx) {
+                        if let Some(col_info) = table_schema.column_map.get(&column.to_lowercase()) {
+                            let param_oid = match col_info.pg_oid {
                                 t if t == PgType::Macaddr8.to_oid() => PgType::Text.to_oid(),
                                 t if t == PgType::Macaddr.to_oid() => PgType::Text.to_oid(),
                                 t if t == PgType::Inet.to_oid() => PgType::Text.to_oid(),
@@ -5824,43 +6072,13 @@ impl ExtendedQueryHandler {
                                 t if t == PgType::Numrange.to_oid() => PgType::Text.to_oid(),
                                 t if t == PgType::Bit.to_oid() => PgType::Text.to_oid(),
                                 t if t == PgType::Varbit.to_oid() => PgType::Text.to_oid(),
-                                _ => effective_col_oid,
+                                _ => col_info.pg_oid,
                             };
-
-                            // Find any $k in this expression
-                            for param_idx in crate::query::ParameterParser::find_parameters(expr) {
-                                if param_idx >= 1 && param_idx <= param_count {
-                                    param_types[param_idx - 1] = param_oid;
-                                    original_types[param_idx - 1] = effective_col_oid;
-                                    mapped_params.insert(param_idx);
-                                }
-                            }
+                            param_types[param_idx - 1] = param_oid;
+                            original_types[param_idx - 1] = col_info.pg_oid;
+                            mapped_params.insert(param_idx);
                         }
                     }
-                }
-            }
-        }
-
-        // Fallback for any unmapped parameters: if simple 1:1 positional mapping matches
-        for (i, column) in columns.iter().enumerate() {
-            let param_idx = i + 1;
-            if param_idx <= param_count && !mapped_params.contains(&param_idx) {
-                if let Some(col_info) = table_schema.column_map.get(&column.to_lowercase()) {
-                    let param_oid = match col_info.pg_oid {
-                        t if t == PgType::Macaddr8.to_oid() => PgType::Text.to_oid(),
-                        t if t == PgType::Macaddr.to_oid() => PgType::Text.to_oid(),
-                        t if t == PgType::Inet.to_oid() => PgType::Text.to_oid(),
-                        t if t == PgType::Cidr.to_oid() => PgType::Text.to_oid(),
-                        t if t == PgType::Money.to_oid() => PgType::Text.to_oid(),
-                        t if t == PgType::Int4range.to_oid() => PgType::Text.to_oid(),
-                        t if t == PgType::Int8range.to_oid() => PgType::Text.to_oid(),
-                        t if t == PgType::Numrange.to_oid() => PgType::Text.to_oid(),
-                        t if t == PgType::Bit.to_oid() => PgType::Text.to_oid(),
-                        t if t == PgType::Varbit.to_oid() => PgType::Text.to_oid(),
-                        _ => col_info.pg_oid,
-                    };
-                    param_types[param_idx - 1] = param_oid;
-                    original_types[param_idx - 1] = col_info.pg_oid;
                 }
             }
         }
@@ -5885,8 +6103,10 @@ impl ExtendedQueryHandler {
                 break;
             }
             
-            // Check for explicit cast first (e.g., $1::int4 or $2::bigint[])
-            let cast_pattern = format!(r"\${i}::\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\[\])?)");
+            // Check for explicit cast first (e.g., $1::int4 or $2::bigint[] or $3::double precision)
+            let cast_pattern = format!(
+                r"(?i)\${i}::\s*((?:double\s+precision|timestamp\s+with(?:out)?\s+time\s+zone|time\s+with(?:out)?\s+time\s+zone|character\s+varying|bit\s+varying|[a-zA-Z_][a-zA-Z0-9_]*)(?:\s*\[\])?)"
+            );
             let cast_regex = regex::Regex::new(&cast_pattern).unwrap();
             let mut found_type = false;
             
@@ -5907,6 +6127,25 @@ impl ExtendedQueryHandler {
             if query_lower.contains("pg_advisory_") {
                 param_types.push(crate::types::PgType::Int8.to_oid());
                 info!("Found pg_advisory function for parameter {}, setting type to INT8 (OID 20)", i);
+                continue;
+            }
+            
+            // Pattern for JSON text extraction: expr ->> 'key' = $n or $n = expr ->> 'key'
+            let json_text_patterns = vec![
+                format!(r"->>\s*'[^']+'\s*=\s*{}", regex::escape(&param)),
+                format!(r"{}\s*=\s*[^=]+->>\s*'[^']+'", regex::escape(&param)),
+            ];
+            for pattern in &json_text_patterns {
+                if let Ok(regex) = regex::Regex::new(pattern) {
+                    if regex.is_match(&query_lower) {
+                        param_types.push(crate::types::PgType::Text.to_oid());
+                        info!("Found JSON text extract comparison for parameter {}, setting type to TEXT (OID 25)", i);
+                        found_type = true;
+                        break;
+                    }
+                }
+            }
+            if found_type {
                 continue;
             }
             
@@ -5931,14 +6170,20 @@ impl ExtendedQueryHandler {
             // Look for patterns like "column = $n" or "$n = column"
             let param_escaped = regex::escape(&param);
             let patterns = vec![
-                format!(r"(\w+)\s*=\s*{}", param_escaped),
-                format!(r"{}\s*=\s*(\w+)", param_escaped),
-                format!(r"(\w+)\s*<\s*{}", param_escaped),
-                format!(r"(\w+)\s*>\s*{}", param_escaped),
-                format!(r"(\w+)\s*<=\s*{}", param_escaped),
-                format!(r"(\w+)\s*>=\s*{}", param_escaped),
-                format!(r"(\w+)\s*!=\s*{}", param_escaped),
-                format!(r"(\w+)\s*<>\s*{}", param_escaped),
+                format!(r"(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?\s*=\s*{}", param_escaped),
+                format!(r"{}\s*=\s*(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?", param_escaped),
+                format!(r"(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?\s*<\s*{}", param_escaped),
+                format!(r"{}\s*<\s*(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?", param_escaped),
+                format!(r"(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?\s*>\s*{}", param_escaped),
+                format!(r"{}\s*>\s*(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?", param_escaped),
+                format!(r"(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?\s*<=\s*{}", param_escaped),
+                format!(r"{}\s*<=\s*(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?", param_escaped),
+                format!(r"(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?\s*>=\s*{}", param_escaped),
+                format!(r"{}\s*>=\s*(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?", param_escaped),
+                format!(r"(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?\s*!=\s*{}", param_escaped),
+                format!(r"{}\s*!=\s*(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?", param_escaped),
+                format!(r"(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?\s*<>\s*{}", param_escaped),
+                format!(r"{}\s*<>\s*(?:coalesce\s*\(\s*)?(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*[^)]+\))?", param_escaped),
             ];
             
             for pattern in &patterns {
@@ -6108,8 +6353,7 @@ impl ExtendedQueryHandler {
                 
                 // Check for boolean values
                 if trimmed == "t" || trimmed == "f" || 
-                   trimmed == "true" || trimmed == "false" || 
-                   trimmed == "1" || trimmed == "0" {
+                   trimmed == "true" || trimmed == "false" {
                     return PgType::Bool.to_oid();
                 }
                 
@@ -6241,12 +6485,139 @@ impl ExtendedQueryHandler {
 }
 
 
+/// Split SELECT columns list on top-level commas (outside parentheses and quotes)
+fn split_select_columns(s: &str) -> Vec<&str> {
+    let mut cols = Vec::new();
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut depth = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut start = 0;
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if in_single_quote {
+            if b == b'\'' {
+                if i + 1 < len && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double_quote {
+            if b == b'"' {
+                if i + 1 < len && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'\'' => in_single_quote = true,
+            b'"' => in_double_quote = true,
+            b'(' => depth += 1,
+            b')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            b',' if depth == 0 => {
+                let col = s[start..i].trim();
+                if !col.is_empty() {
+                    cols.push(col);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let last = s[start..].trim();
+    if !last.is_empty() {
+        cols.push(last);
+    }
+    cols
+}
+
+/// Find position of top-level FROM keyword (at parenthesis depth 0 and outside quotes)
+fn find_top_level_from(query: &str) -> Option<usize> {
+    let bytes = query.as_bytes();
+    let len = bytes.len();
+    let mut depth = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if in_single_quote {
+            if b == b'\'' {
+                if i + 1 < len && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double_quote {
+            if b == b'"' {
+                if i + 1 < len && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'\'' => in_single_quote = true,
+            b'"' => in_double_quote = true,
+            b'(' => depth += 1,
+            b')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            b'f' | b'F' if depth == 0 => {
+                let is_word_boundary_before = i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+                if is_word_boundary_before && i + 4 <= len && bytes[i..i + 4].eq_ignore_ascii_case(b"from") {
+                    let is_word_boundary_after = i + 4 == len || (!bytes[i + 4].is_ascii_alphanumeric() && bytes[i + 4] != b'_');
+                    if is_word_boundary_after {
+                        return Some(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Extract table name from SELECT query
 fn extract_table_name_from_select(query: &str) -> Option<String> {
     static FROM_REGEX: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
         regex::Regex::new(r#"(?i)\bFROM\s+(?:ONLY\s+)?("[^"]+"|[a-zA-Z_][a-zA-Z0-9_]*)"#).unwrap()
     });
-    if let Some(caps) = FROM_REGEX.captures(query) {
+    let search_slice = if let Some(pos) = find_top_level_from(query) {
+        &query[pos..]
+    } else {
+        query
+    };
+    if let Some(caps) = FROM_REGEX.captures(search_slice) {
         let table = caps.get(1)?.as_str().trim_matches('"').trim_matches('\'').trim();
         if !table.is_empty() {
             return Some(table.to_string());

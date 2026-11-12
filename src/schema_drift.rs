@@ -102,7 +102,7 @@ impl SchemaDriftDetector {
     
     fn get_tracked_tables(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT table_name FROM __pgsqlite_schema ORDER BY table_name"
+            "SELECT DISTINCT table_name FROM __pgsqlite_schema WHERE table_name NOT LIKE '__pgsqlite_%' ORDER BY table_name"
         )?;
         
         let tables = stmt.query_map([], |row| row.get::<_, String>(0))?

@@ -417,6 +417,7 @@ impl CastTranslator {
         let bytes = before.as_bytes();
         let mut paren_depth = 0;
         let mut bracket_depth = 0;
+        let mut case_depth = 0;
         let mut quote_char = None;
         
         // Scan backwards to find expression start
@@ -455,9 +456,35 @@ impl CastTranslator {
                 }
             }
             
-            // If we're not in parentheses or brackets, look for expression boundaries
-            if paren_depth == 0 && bracket_depth == 0
-                && (ch == b' ' || ch == b',' || ch == b'(' || ch == b'=' || ch == b'<' || ch == b'>') {
+            // Handle CASE ... END blocks when scanning backwards
+            if paren_depth == 0 && bracket_depth == 0 {
+                if i >= 2
+                    && (bytes[i] == b'D' || bytes[i] == b'd')
+                    && (bytes[i - 1] == b'N' || bytes[i - 1] == b'n')
+                    && (bytes[i - 2] == b'E' || bytes[i - 2] == b'e')
+                    && (i == 2 || (!bytes[i - 3].is_ascii_alphanumeric() && bytes[i - 3] != b'_'))
+                    && (i + 1 == bytes.len() || (!bytes[i + 1].is_ascii_alphanumeric() && bytes[i + 1] != b'_'))
+                {
+                    case_depth += 1;
+                } else if case_depth > 0
+                    && (bytes[i] == b'C' || bytes[i] == b'c')
+                    && i + 3 < bytes.len()
+                    && (bytes[i + 1] == b'A' || bytes[i + 1] == b'a')
+                    && (bytes[i + 2] == b'S' || bytes[i + 2] == b's')
+                    && (bytes[i + 3] == b'E' || bytes[i + 3] == b'e')
+                    && (i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_'))
+                    && (i + 4 == bytes.len() || (!bytes[i + 4].is_ascii_alphanumeric() && bytes[i + 4] != b'_'))
+                {
+                    case_depth -= 1;
+                    if case_depth == 0 {
+                        return i;
+                    }
+                }
+            }
+            
+            // If we're not in parentheses, brackets, or CASE blocks, look for expression boundaries
+            if paren_depth == 0 && bracket_depth == 0 && case_depth == 0
+                && (ch == b' ' || ch == b',' || ch == b'=' || ch == b'<' || ch == b'>') {
                     return i + 1;
                 }
         }
@@ -643,7 +670,7 @@ impl CastTranslator {
     }
     
     /// Convert PostgreSQL type names to SQLite type names
-    fn postgres_to_sqlite_type(pg_type: &str) -> &'static str {
+    pub(crate) fn postgres_to_sqlite_type(pg_type: &str) -> &'static str {
         // Fast path: check for common simple types first (case-insensitive)
         match pg_type {
             // Exact matches (common case)
@@ -812,5 +839,38 @@ impl CastTranslator {
         }
         
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_coalesce_cast() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = "SELECT CASE WHEN COALESCE(a.worker,'')='mainagent' THEN 'main:' || COALESCE(a.main_seg,0)::text END";
+        let res1 = crate::query::executor::preprocess_query(sql);
+        println!("1. preprocess_query: {}", res1);
+        let (res2, _) = CastTranslator::translate_with_metadata(&res1, Some(&conn));
+        println!("2. CastTranslator: {}", res2);
+        let res3 = crate::translator::RegexTranslator::translate_query(&res2).unwrap_or(res2.clone());
+        println!("3. RegexTranslator: {}", res3);
+        let res4 = crate::translator::UnnestTranslator::translate_unnest(&res3).unwrap_or(res3.clone());
+        println!("4. UnnestTranslator: {}", res4);
+        let res5 = crate::translator::SqliteMasterFilter::translate(&res4);
+        println!("5. SqliteMasterFilter: {}", res5);
+    }
+
+    #[test]
+    fn test_case_end_cast() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = "SELECT CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END::text FROM t";
+        let (res, _) = CastTranslator::translate_with_metadata(sql, Some(&conn));
+        assert!(
+            res.contains("CAST(CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END AS TEXT)"),
+            "Should cast entire CASE block to TEXT: {res}"
+        );
+        assert!(!res.contains("CAST(END"), "Should not contain CAST(END: {res}");
     }
 }

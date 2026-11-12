@@ -2,6 +2,39 @@ use rusqlite::{Connection, Result, Error};
 use rusqlite::functions::FunctionFlags;
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc, Datelike, Timelike};
 
+fn parse_timestamp_val(val: rusqlite::types::ValueRef<'_>) -> Result<i64> {
+    use rusqlite::types::ValueRef;
+    match val {
+        ValueRef::Integer(i) => Ok(i),
+        ValueRef::Real(r) => Ok(r as i64),
+        ValueRef::Text(s) => {
+            let s_str = std::str::from_utf8(s).map_err(|e| Error::UserFunctionError(e.to_string().into()))?;
+            if let Ok(micros) = s_str.parse::<i64>() {
+                Ok(micros)
+            } else if let Ok(parsed) = DateTime::parse_from_rfc3339(s_str) {
+                Ok(parsed.timestamp_micros())
+            } else if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(s_str, "%Y-%m-%d %H:%M:%S%.f") {
+                Ok(parsed.and_utc().timestamp_micros())
+            } else if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(s_str, "%Y-%m-%d %H:%M:%S") {
+                Ok(parsed.and_utc().timestamp_micros())
+            } else if let Ok(parsed) = NaiveDate::parse_from_str(s_str, "%Y-%m-%d") {
+                Ok(parsed.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros())
+            } else {
+                Err(Error::UserFunctionError(format!("Invalid timestamp string: {s_str}").into()))
+            }
+        }
+        ValueRef::Blob(b) => {
+            let s_str = std::str::from_utf8(b).map_err(|e| Error::UserFunctionError(e.to_string().into()))?;
+            if let Ok(micros) = s_str.parse::<i64>() {
+                Ok(micros)
+            } else {
+                Err(Error::UserFunctionError(format!("Invalid timestamp blob: {s_str}").into()))
+            }
+        }
+        _ => Err(Error::UserFunctionError("Expected integer or text timestamp".into())),
+    }
+}
+
 /// Register datetime-related functions in SQLite
 pub fn register_datetime_functions(conn: &Connection) -> Result<()> {
     // now() / current_timestamp - Return current timestamp as formatted string
@@ -51,7 +84,7 @@ pub fn register_datetime_functions(conn: &Connection) -> Result<()> {
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
             let field: String = ctx.get(0)?;
-            let timestamp: i64 = ctx.get(1)?;
+            let timestamp = parse_timestamp_val(ctx.get_raw(1))?;
             extract_date_part(&field, timestamp)
         },
     )?;
@@ -78,7 +111,7 @@ pub fn register_datetime_functions(conn: &Connection) -> Result<()> {
                 _ => return Err(Error::UserFunctionError("Expected text field name".into())),
             };
             
-            let timestamp: i64 = ctx.get(1)?;
+            let timestamp = parse_timestamp_val(ctx.get_raw(1))?;
             extract_date_part(&field, timestamp)
         },
     )?;
@@ -106,7 +139,7 @@ pub fn register_datetime_functions(conn: &Connection) -> Result<()> {
                 _ => return Err(Error::UserFunctionError("Expected text field name".into())),
             };
             
-            let timestamp: i64 = ctx.get(1)?;
+            let timestamp = parse_timestamp_val(ctx.get_raw(1))?;
             truncate_date(&field, timestamp)
         },
     )?;
@@ -117,8 +150,8 @@ pub fn register_datetime_functions(conn: &Connection) -> Result<()> {
         2,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
-            let ts1: i64 = ctx.get(0)?;
-            let ts2: i64 = ctx.get(1)?;
+            let ts1 = parse_timestamp_val(ctx.get_raw(0))?;
+            let ts2 = parse_timestamp_val(ctx.get_raw(1))?;
             Ok(ts1 - ts2) // Return difference in microseconds
         },
     )?;
@@ -129,7 +162,7 @@ pub fn register_datetime_functions(conn: &Connection) -> Result<()> {
         1,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
-            let ts: i64 = ctx.get(0)?;
+            let ts = parse_timestamp_val(ctx.get_raw(0))?;
             let now = Utc::now().timestamp_micros();
             Ok(now - ts) // Return difference in microseconds
         },
@@ -394,7 +427,206 @@ pub fn register_datetime_functions(conn: &Connection) -> Result<()> {
         },
     )?;
     
+    // to_char(val, format) - Format timestamp or date to text
+    conn.create_scalar_function(
+        "to_char",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            use rusqlite::types::ValueRef;
+            let fmt_str: String = ctx.get(1)?;
+            let chrono_fmt = pg_format_to_chrono(&fmt_str);
+            
+            let dt = match ctx.get_raw(0) {
+                ValueRef::Null => return Ok(None),
+                ValueRef::Integer(micros) => {
+                    let secs = micros / 1_000_000;
+                    let nanos = ((micros % 1_000_000) * 1000) as u32;
+                    DateTime::from_timestamp(secs, nanos)
+                }
+                ValueRef::Real(r) => {
+                    let micros = r as i64;
+                    let secs = micros / 1_000_000;
+                    let nanos = ((micros % 1_000_000) * 1000) as u32;
+                    DateTime::from_timestamp(secs, nanos)
+                }
+                ValueRef::Text(s) => {
+                    let s_str = std::str::from_utf8(s).unwrap_or("");
+                    if let Ok(micros) = s_str.parse::<i64>() {
+                        let secs = micros / 1_000_000;
+                        let nanos = ((micros % 1_000_000) * 1000) as u32;
+                        DateTime::from_timestamp(secs, nanos)
+                    } else if let Ok(parsed) = DateTime::parse_from_rfc3339(s_str) {
+                        Some(parsed.with_timezone(&Utc))
+                    } else if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(s_str, "%Y-%m-%d %H:%M:%S%.f") {
+                        Some(DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc))
+                    } else if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(s_str, "%Y-%m-%d %H:%M:%S") {
+                        Some(DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc))
+                    } else if let Ok(parsed) = NaiveDate::parse_from_str(s_str, "%Y-%m-%d") {
+                        Some(DateTime::<Utc>::from_naive_utc_and_offset(parsed.and_hms_opt(0, 0, 0).unwrap(), Utc))
+                    } else {
+                        None
+                    }
+                }
+                ValueRef::Blob(b) => {
+                    let s_str = std::str::from_utf8(b).unwrap_or("");
+                    if let Ok(micros) = s_str.parse::<i64>() {
+                        let secs = micros / 1_000_000;
+                        let nanos = ((micros % 1_000_000) * 1000) as u32;
+                        DateTime::from_timestamp(secs, nanos)
+                    } else {
+                        None
+                    }
+                }
+            };
+            
+            match dt {
+                Some(d) => Ok(Some(d.format(&chrono_fmt).to_string())),
+                None => Ok(None),
+            }
+        },
+    )?;
+
+    // pgsqlite_to_rfc3339(val) - Format timestamp as RFC3339 for JSON serialization
+    conn.create_scalar_function(
+        "pgsqlite_to_rfc3339",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            use rusqlite::types::ValueRef;
+            match ctx.get_raw(0) {
+                ValueRef::Null => Ok(None),
+                ValueRef::Integer(micros) => {
+                    let secs = micros / 1_000_000;
+                    let nanos = ((micros % 1_000_000).unsigned_abs() * 1000) as u32;
+                    if let Some(dt) = DateTime::from_timestamp(secs, nanos) {
+                        Ok(Some(dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                ValueRef::Text(s) => {
+                    let s_str = std::str::from_utf8(s).unwrap_or("");
+                    if let Ok(micros) = s_str.parse::<i64>() {
+                        let secs = micros / 1_000_000;
+                        let nanos = ((micros % 1_000_000).unsigned_abs() * 1000) as u32;
+                        if let Some(dt) = DateTime::from_timestamp(secs, nanos) {
+                            return Ok(Some(dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()));
+                        }
+                    }
+                    let mut iso = s_str.replacen(' ', "T", 1);
+                    if iso.ends_with("+00") || iso.ends_with("-00") {
+                        iso.push_str(":00");
+                    } else if !iso.ends_with('Z') && !iso.contains('+') && iso.len() >= 19 {
+                        iso.push('Z');
+                    }
+                    Ok(Some(iso))
+                }
+                _ => Ok(None),
+            }
+        },
+    )?;
+
+    // pgsqlite_parse_timestamp(val) - Parse timestamp text or integer into integer microseconds
+    conn.create_scalar_function(
+        "pgsqlite_parse_timestamp",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            use rusqlite::types::ValueRef;
+            match ctx.get_raw(0) {
+                ValueRef::Null => Ok(None),
+                ValueRef::Integer(micros) => Ok(Some(micros)),
+                ValueRef::Real(r) => Ok(Some(r as i64)),
+                ValueRef::Text(s) => {
+                    let s_str = std::str::from_utf8(s).unwrap_or("");
+                    if let Ok(micros) = s_str.parse::<i64>() {
+                        Ok(Some(micros))
+                    } else if let Ok(parsed) = DateTime::parse_from_rfc3339(s_str) {
+                        let dt = parsed.with_timezone(&Utc);
+                        Ok(Some(dt.timestamp_micros()))
+                    } else if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(s_str, "%Y-%m-%d %H:%M:%S%.f") {
+                        let dt = DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc);
+                        Ok(Some(dt.timestamp_micros()))
+                    } else if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(s_str, "%Y-%m-%d %H:%M:%S") {
+                        let dt = DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc);
+                        Ok(Some(dt.timestamp_micros()))
+                    } else if let Ok(parsed) = NaiveDate::parse_from_str(s_str, "%Y-%m-%d") {
+                        if let Some(hms) = parsed.and_hms_opt(0, 0, 0) {
+                            let dt = DateTime::<Utc>::from_naive_utc_and_offset(hms, Utc);
+                            Ok(Some(dt.timestamp_micros()))
+                        } else {
+                            Ok(None)
+                        }
+                    } else {
+                        Ok(None)
+                    }
+                }
+                _ => Ok(None),
+            }
+        },
+    )?;
+
+    // make_interval - Convert seconds to microseconds
+    conn.create_scalar_function(
+        "make_interval",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let secs: f64 = ctx.get(0)?;
+            Ok((secs * 1_000_000.0) as i64)
+        },
+    )?;
+    
     Ok(())
+}
+
+fn pg_format_to_chrono(pg_fmt: &str) -> String {
+    let mut s = pg_fmt.to_string();
+    let replacements = [
+        ("YYYY", "%Y"),
+        ("yyyy", "%Y"),
+        ("YY", "%y"),
+        ("yy", "%y"),
+        ("MONTH", "%B"),
+        ("Month", "%B"),
+        ("month", "%B"),
+        ("MON", "%b"),
+        ("Mon", "%b"),
+        ("mon", "%b"),
+        ("MM", "%m"),
+        ("mm", "%m"),
+        ("DAY", "%A"),
+        ("Day", "%A"),
+        ("day", "%a"),
+        ("DY", "%a"),
+        ("Dy", "%a"),
+        ("dy", "%a"),
+        ("DD", "%d"),
+        ("dd", "%d"),
+        ("HH24", "%H"),
+        ("hh24", "%H"),
+        ("HH12", "%I"),
+        ("hh12", "%I"),
+        ("HH", "%I"),
+        ("hh", "%I"),
+        ("MI", "%M"),
+        ("mi", "%M"),
+        ("SS", "%S"),
+        ("ss", "%S"),
+        ("MS", "%3f"),
+        ("ms", "%3f"),
+        ("US", "%6f"),
+        ("us", "%6f"),
+        ("OF", "%:z"),
+        ("of", "%:z"),
+        ("TZ", "UTC"),
+        ("tz", "UTC"),
+    ];
+    for (from, to) in replacements {
+        s = s.replace(from, to);
+    }
+    s
 }
 
 /// Extract a date part from microseconds since epoch

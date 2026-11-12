@@ -180,20 +180,20 @@ impl SchemaCache {
 
         // Bulk query for all PostgreSQL types for this table
         let mut pg_metadata = HashMap::new();
-        if let Ok(mut stmt) = conn.prepare("SELECT column_name, pg_type FROM __pgsqlite_schema WHERE table_name = ?1")
+        if let Ok(mut stmt) = conn.prepare("SELECT column_name, pg_type FROM __pgsqlite_schema WHERE LOWER(table_name) = LOWER(?1)")
             && let Ok(rows) = stmt.query_map([table_name], |row| {
                 let col_name: String = row.get(0)?;
                 let pg_type: String = row.get(1)?;
                 Ok((col_name, pg_type))
             }) {
                 for row in rows.flatten() {
-                    pg_metadata.insert(row.0, row.1);
+                    pg_metadata.insert(row.0.to_lowercase(), row.1);
                 }
             }
 
         // Build column data
         for (col_name, sqlite_type) in sqlite_columns {
-            let (pg_type, pg_oid) = if let Some(pg_type_str) = pg_metadata.get(&col_name) {
+            let (pg_type, pg_oid) = if let Some(pg_type_str) = pg_metadata.get(&col_name.to_lowercase()) {
                 let oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(pg_type_str);
                 (pg_type_str.clone(), oid)
             } else {
@@ -264,7 +264,9 @@ impl SchemaCache {
 
         // If still not found, load this specific table
         let schema = self.load_table_schema_direct(conn, table_name)?;
-        self.insert(table_name.to_string(), schema.clone());
+        if !schema.columns.is_empty() {
+            self.insert(table_name.to_string(), schema.clone());
+        }
         
         // Check for decimal columns and update bloom filter
         let has_decimal = schema.columns.iter().any(|col| {

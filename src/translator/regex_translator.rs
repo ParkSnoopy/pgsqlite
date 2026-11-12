@@ -93,14 +93,47 @@ impl RegexTranslator {
     
     /// Translate a boxed query
     fn translate_query_box(query: &mut Box<Query>) -> Result<(), PgSqliteError> {
-        if let SetExpr::Select(select) = &mut *query.body {
-            Self::translate_select(select)?;
+        if let Some(with) = &mut query.with {
+            for cte in &mut with.cte_tables {
+                Self::translate_query_box(&mut cte.query)?;
+            }
+        }
+        Self::translate_set_expr(&mut query.body)
+    }
+
+    /// Translate a SetExpr (Select, Query, or SetOperation like UNION)
+    fn translate_set_expr(body: &mut SetExpr) -> Result<(), PgSqliteError> {
+        match body {
+            SetExpr::Select(select) => Self::translate_select(select)?,
+            SetExpr::Query(q) => Self::translate_query_box(q)?,
+            SetExpr::SetOperation { left, right, .. } => {
+                Self::translate_set_expr(left)?;
+                Self::translate_set_expr(right)?;
+            }
+            _ => {}
         }
         Ok(())
     }
     
     /// Translate a SELECT statement
     fn translate_select(select: &mut Box<Select>) -> Result<(), PgSqliteError> {
+        // Translate FROM and JOIN clauses
+        for table_with_joins in &mut select.from {
+            Self::translate_table_factor(&mut table_with_joins.relation)?;
+            for join in &mut table_with_joins.joins {
+                Self::translate_table_factor(&mut join.relation)?;
+                match &mut join.join_operator {
+                    sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr))
+                    | sqlparser::ast::JoinOperator::LeftOuter(sqlparser::ast::JoinConstraint::On(expr))
+                    | sqlparser::ast::JoinOperator::RightOuter(sqlparser::ast::JoinConstraint::On(expr))
+                    | sqlparser::ast::JoinOperator::FullOuter(sqlparser::ast::JoinConstraint::On(expr)) => {
+                        Self::translate_expression(expr)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Translate WHERE clause
         if let Some(selection) = &mut select.selection {
             Self::translate_expression(selection)?;
@@ -122,6 +155,20 @@ impl RegexTranslator {
             Self::translate_expression(having)?;
         }
         
+        Ok(())
+    }
+
+    /// Translate a TableFactor (e.g. subqueries in FROM/JOIN)
+    fn translate_table_factor(factor: &mut sqlparser::ast::TableFactor) -> Result<(), PgSqliteError> {
+        match factor {
+            sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+                Self::translate_query_box(subquery)?;
+            }
+            sqlparser::ast::TableFactor::TableFunction { expr, .. } => {
+                Self::translate_expression(expr)?;
+            }
+            _ => {}
+        }
         Ok(())
     }
     
@@ -154,19 +201,33 @@ impl RegexTranslator {
                     }
                 }
             }
-            // Handle OPERATOR(pg_catalog.~) syntax
-            Expr::Function(func) if func.name.to_string().contains("OPERATOR") => {
-                if let sqlparser::ast::FunctionArguments::List(arg_list) = &func.args
-                    && arg_list.args.len() >= 2 {
-                        // Check if this is a regex operator
-                        let func_str = func.name.to_string();
-                        if func_str.contains("~") && !func_str.contains("!~") {
-                            trace!("Translating OPERATOR(pg_catalog.~) syntax");
-                            let pattern = Self::extract_function_arg(&arg_list.args[1]);
-                            let text = Self::extract_function_arg(&arg_list.args[0]);
-                            *expr = Self::create_regexp_function(text, pattern, false);
+            // Handle OPERATOR(pg_catalog.~) syntax and recurse into function args
+            Expr::Function(func) => {
+                if func.name.to_string().contains("OPERATOR") {
+                    if let sqlparser::ast::FunctionArguments::List(arg_list) = &func.args
+                        && arg_list.args.len() >= 2 {
+                            // Check if this is a regex operator
+                            let func_str = func.name.to_string();
+                            if func_str.contains("~") && !func_str.contains("!~") {
+                                trace!("Translating OPERATOR(pg_catalog.~) syntax");
+                                let pattern = Self::extract_function_arg(&arg_list.args[1]);
+                                let text = Self::extract_function_arg(&arg_list.args[0]);
+                                *expr = Self::create_regexp_function(text, pattern, false);
+                                return Ok(());
+                            }
+                        }
+                }
+                if let sqlparser::ast::FunctionArguments::List(arg_list) = &mut func.args {
+                    for arg in &mut arg_list.args {
+                        match arg {
+                            FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. }
+                            | FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                Self::translate_expression(e)?;
+                            }
+                            _ => {}
                         }
                     }
+                }
             }
             // Recursively process nested expressions
             Expr::Nested(nested) => Self::translate_expression(nested)?,
@@ -190,7 +251,16 @@ impl RegexTranslator {
                     Self::translate_expression(item)?;
                 }
             }
-            Expr::InSubquery { expr: inner, .. } => Self::translate_expression(inner)?,
+            Expr::InSubquery { expr: inner, subquery, .. } => {
+                Self::translate_expression(inner)?;
+                Self::translate_query_box(subquery)?;
+            }
+            Expr::Subquery(subquery) => {
+                Self::translate_query_box(subquery)?;
+            }
+            Expr::Exists { subquery, .. } => {
+                Self::translate_query_box(subquery)?;
+            }
             Expr::Between { expr: inner, low, high, .. } => {
                 Self::translate_expression(inner)?;
                 Self::translate_expression(low)?;
@@ -329,6 +399,22 @@ mod tests {
         let query = "SELECT * FROM users WHERE id = 1";
         let result = RegexTranslator::translate_query(query).unwrap();
         assert_eq!(result, query);
+    }
+
+    #[test]
+    fn test_regex_in_subquery_and_union() {
+        let query = "SELECT * FROM (SELECT id FROM assets WHERE id IN (SELECT 1 UNION SELECT 2 WHERE val ~ '^[0-9]+$')) sub";
+        let result = RegexTranslator::translate_query(query).unwrap();
+        assert!(result.contains("regexp"));
+        assert!(!result.contains(" ~ "));
+    }
+
+    #[test]
+    fn test_regex_in_cte() {
+        let query = "WITH candidate AS (SELECT id FROM findings WHERE val ~ '^[0-9]+$') SELECT * FROM candidate";
+        let result = RegexTranslator::translate_query(query).unwrap();
+        assert!(result.contains("regexp"));
+        assert!(!result.contains(" ~ "));
     }
     
     #[test]

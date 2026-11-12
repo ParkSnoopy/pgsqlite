@@ -138,6 +138,22 @@ pub async fn handle_test_connection_with_pool(
     // Create a connection for this session
     session.initialize_connection().await
         .map_err(|e| anyhow::anyhow!("Failed to create session connection: {}", e))?;
+
+    struct SessionCleanupGuard {
+        session_id: uuid::Uuid,
+        db_handler: Arc<session::DbHandler>,
+    }
+
+    impl Drop for SessionCleanupGuard {
+        fn drop(&mut self) {
+            self.db_handler.remove_session_connection(&self.session_id);
+        }
+    }
+
+    let _cleanup_guard = SessionCleanupGuard {
+        session_id,
+        db_handler: db_handler.clone(),
+    };
     
     // Set up connection pooling infrastructure (optional - can be enabled via config)
     let config = Arc::new(Config::load());
@@ -203,11 +219,14 @@ pub async fn handle_test_connection_with_pool(
                                 session.set_transaction_status(TransactionStatus::InFailedTransaction).await;
                             }
                             
-                            let err = ErrorResponse::new(
-                                "ERROR".to_string(),
-                                "42000".to_string(),
-                                format!("Query execution failed: {e}"),
-                            );
+                            let err = match &e {
+                                PgSqliteError::Validation(pg_err) => pg_err.to_error_response(),
+                                _ => ErrorResponse::new(
+                                    "ERROR".to_string(),
+                                    "42000".to_string(),
+                                    format!("Query execution failed: {e}"),
+                                ),
+                            };
                             framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
                         }
                     }
@@ -237,11 +256,17 @@ pub async fn handle_test_connection_with_pool(
                     match ExtendedQueryHandler::handle_bind(&mut framed, &session, portal, statement, formats, values, result_formats).await {
                         Ok(()) => {},
                         Err(e) => {
-                            let err = ErrorResponse::new(
-                                "ERROR".to_string(),
-                                "42000".to_string(),
-                                format!("Bind failed: {e}"),
-                            );
+                            if session.in_transaction().await {
+                                session.set_transaction_status(TransactionStatus::InFailedTransaction).await;
+                            }
+                            let err = match &e {
+                                PgSqliteError::Validation(pg_err) => pg_err.to_error_response(),
+                                _ => ErrorResponse::new(
+                                    "ERROR".to_string(),
+                                    "42000".to_string(),
+                                    format!("Bind failed: {e}"),
+                                ),
+                            };
                             framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
                         }
                     }
@@ -251,11 +276,17 @@ pub async fn handle_test_connection_with_pool(
                     match ExtendedQueryHandler::handle_execute(&mut framed, &db_handler, &session, portal, max_rows).await {
                         Ok(()) => {},
                         Err(e) => {
-                            let err = ErrorResponse::new(
-                                "ERROR".to_string(),
-                                "42000".to_string(),
-                                format!("Execute failed: {e}"),
-                            );
+                            if session.in_transaction().await {
+                                session.set_transaction_status(TransactionStatus::InFailedTransaction).await;
+                            }
+                            let err = match &e {
+                                PgSqliteError::Validation(pg_err) => pg_err.to_error_response(),
+                                _ => ErrorResponse::new(
+                                    "ERROR".to_string(),
+                                    "42000".to_string(),
+                                    format!("Execute failed: {e}"),
+                                ),
+                            };
                             framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
                         }
                     }

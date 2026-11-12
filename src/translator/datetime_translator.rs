@@ -160,6 +160,9 @@ impl DateTimeTranslator {
         // Handle timestamp arithmetic with intervals
         result = Self::translate_interval_arithmetic(&result);
         
+        // Handle make_interval
+        result = Self::translate_make_interval(&result);
+        
         (result, metadata)
     }
     
@@ -222,6 +225,41 @@ impl DateTimeTranslator {
         }).to_string();
         
         result
+    }
+
+    /// Translate make_interval(...) syntax
+    pub fn translate_make_interval(query: &str) -> String {
+        use regex::Regex;
+        // now() +/- make_interval(...)
+        let now_interval_re = match Regex::new(
+            r"(?i)\bnow\s*\(\s*\)\s*([+-])\s*make_interval\s*\(\s*(?:secs\s*=>\s*)?([^)]+?)(?:::double precision)?\s*\)",
+        ) {
+            Ok(r) => r,
+            Err(_) => return query.to_string(),
+        };
+        let result = now_interval_re.replace_all(query, |caps: &regex::Captures<'_>| {
+            let op = &caps[1];
+            let secs_expr = caps[2].trim();
+            if op == "+" {
+                format!("strftime('%Y-%m-%d %H:%M:%S+00', 'now', (CASE WHEN ({secs_expr}) >= 0 THEN '+' ELSE '' END) || ({secs_expr}) || ' seconds')")
+            } else {
+                format!("strftime('%Y-%m-%d %H:%M:%S+00', 'now', '-' || ({secs_expr}) || ' seconds')")
+            }
+        });
+
+        // make_interval(secs => ...) standalone
+        let standalone_re = match Regex::new(
+            r"(?i)\bmake_interval\s*\(\s*(?:secs\s*=>\s*)?([^)]+?)(?:::double precision)?\s*\)",
+        ) {
+            Ok(r) => r,
+            Err(_) => return result.to_string(),
+        };
+        let result = standalone_re.replace_all(&result, |caps: &regex::Captures<'_>| {
+            let secs_expr = caps[1].trim();
+            format!("(({}) * 1000000)", secs_expr)
+        });
+
+        result.to_string()
     }
     
     

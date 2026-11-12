@@ -54,6 +54,8 @@ impl CreateTableTranslator {
         pg_sql: &str,
         conn: Option<&Connection>
     ) -> Result<CreateTableResult, PgSqliteError> {
+        let cleaned_sql = crate::query::strip_sql_comments(pg_sql);
+        let pg_sql = cleaned_sql.trim();
         let mut type_mapping = HashMap::new();
 
         // Create context for tracking columns

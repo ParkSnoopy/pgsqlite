@@ -157,13 +157,15 @@ impl ExtendedFastPath {
         // First, try to infer types from CAST expressions in the query
         let inferred_types = Self::infer_types_from_query(query, bound_values.len());
         
-        // Use inferred types where available, fall back to original types
+        // Use inferred types where available, fall back to original types, then param types
         let effective_types: Vec<i32> = (0..bound_values.len())
             .map(|i| {
                 if inferred_types[i] != 0 {
                     inferred_types[i]
+                } else if let Some(&t) = original_types.get(i) && t != 0 {
+                    t
                 } else {
-                    original_types.get(i).copied().unwrap_or(0)
+                    _param_types.get(i).copied().unwrap_or(0)
                 }
             })
             .collect();
@@ -174,7 +176,10 @@ impl ExtendedFastPath {
                 None => params.push(rusqlite::types::Value::Null),
                 Some(bytes) => {
                     let format = param_formats.get(i).copied().unwrap_or(0);
-                    let effective_type = effective_types[i];
+                    let mut effective_type = effective_types[i];
+                    if effective_type == 0 && format == 0 {
+                        effective_type = crate::types::SchemaTypeMapper::infer_type_from_value(Some(bytes));
+                    }
                     
                     // Use cache for parameter value conversion, using effective type (includes CAST inference)
                     let converted = GLOBAL_PARAM_VALUE_CACHE.get_or_convert(
@@ -302,6 +307,10 @@ impl ExtendedFastPath {
         } else {
             // Binary format
             match param_type {
+                t if t == PgType::Bool.to_oid() => {
+                    let val = if bytes.first().copied().unwrap_or(0) != 0 { 1 } else { 0 };
+                    Ok(rusqlite::types::Value::Integer(val))
+                }
                 t if t == PgType::Int2.to_oid() => {
                     // INT2 - accept 2, 4, or 8 byte integers with appropriate conversion
                     match bytes.len() {
@@ -523,6 +532,9 @@ impl ExtendedFastPath {
                 }
                 0 => {
                     // Type not specified (OID 0) - try to infer from binary format
+                    if bytes.len() == 1 && (bytes[0] == 0 || bytes[0] == 1) {
+                        return Ok(rusqlite::types::Value::Integer(bytes[0] as i64));
+                    }
                     if bytes.len() == 8 {
                         // 8 bytes could be INT8, FLOAT8, TIME, or TIMESTAMP
                         // For now, try to parse as timestamp (common in SQLAlchemy)
@@ -667,8 +679,34 @@ impl ExtendedFastPath {
                     // Handle aliased columns like "orders_total_amount" -> table="orders", column="total_amount"
                     let mut inferred_type = PgType::Text.to_oid();
                     
-                    // Try to parse table_column pattern
-                    if col_name.contains('_') {
+                    // First try direct column lookup from table in query
+                    if let Some(table_name) = Self::extract_table_from_query(query) {
+                        if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, &table_name, col_name).await {
+                            let new_type = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str);
+                            debug!("Fast path: Inferred type for '{}' from table '{}' -> {} (OID {})", 
+                                  col_name, table_name, pg_type_str, new_type);
+                            inferred_type = new_type;
+                        }
+                    }
+
+                    if inferred_type == PgType::Text.to_oid() && (col_name == "created_at" || col_name == "deleted_at" || col_name == "updated_at" || col_name.ends_with("_at")) {
+                        inferred_type = PgType::Timestamptz.to_oid();
+                    }
+
+                    if inferred_type == PgType::Text.to_oid() && (col_name.eq_ignore_ascii_case("max") || col_name.eq_ignore_ascii_case("min")) {
+                        if let Ok(re) = regex::Regex::new(r"(?i)(?:MAX|MIN)\s*\(\s*(?:([a-zA-Z0-9_]+)\.)?([a-zA-Z0-9_]+)\s*\)")
+                            && let Some(caps) = re.captures(query)
+                            && let Some(inner_col) = caps.get(2).or_else(|| caps.get(1))
+                        {
+                            let inner_lower = inner_col.as_str().to_lowercase();
+                            if inner_lower == "created_at" || inner_lower == "updated_at" || inner_lower == "deleted_at" || inner_lower.ends_with("_at") {
+                                inferred_type = PgType::Timestamptz.to_oid();
+                            }
+                        }
+                    }
+                    
+                    // If still text, try to parse table_column pattern
+                    if inferred_type == PgType::Text.to_oid() && col_name.contains('_') {
                         // Split on first underscore to get potential table name
                         if let Some(underscore_pos) = col_name.find('_') {
                             let potential_table = &col_name[..underscore_pos];
@@ -680,26 +718,7 @@ impl ExtendedFastPath {
                                 debug!("Fast path: Inferred type for '{}' from schema ({}_{}) -> {} (OID {})", 
                                       col_name, potential_table, potential_column, pg_type_str, new_type);
                                 inferred_type = new_type;
-                            } else {
-                                debug!("Fast path: No schema type found for {}.{}", potential_table, potential_column);
                             }
-                        }
-                    }
-                    
-                    // If we still don't have a type, try direct column lookup in case it's not aliased
-                    if inferred_type == PgType::Text.to_oid() {
-                        // Extract table name from query if possible
-                        if let Some(table_name) = Self::extract_table_from_query(query) {
-                            if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, &table_name, col_name).await {
-                                let new_type = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str);
-                                debug!("Fast path: Inferred type for '{}' from table '{}' -> {} (OID {})", 
-                                      col_name, table_name, pg_type_str, new_type);
-                                inferred_type = new_type;
-                            } else {
-                                debug!("Fast path: No type found for column '{}' in table '{}'", col_name, table_name);
-                            }
-                        } else {
-                            debug!("Fast path: Could not extract table name from query");
                         }
                     }
                     

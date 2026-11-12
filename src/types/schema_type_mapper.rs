@@ -111,15 +111,17 @@ impl SchemaTypeMapper {
     
     /// Map PostgreSQL type string to OID
     pub fn pg_type_string_to_oid(pg_type: &str) -> i32 {
+        let clean_pg_type = pg_type.trim();
         // Handle array types first (before basic types)
-        if let Some(base_type) = pg_type.strip_suffix("[]") {
+        if let Some(base_type) = clean_pg_type.strip_suffix("[]") {
             // Remove any parameters like (50) from VARCHAR(50)
             let base_without_params = if let Some(paren_pos) = base_type.find('(') {
                 &base_type[..paren_pos]
             } else {
                 base_type
             };
-            return match base_without_params.to_lowercase().as_str() {
+            let base_trimmed = base_without_params.trim();
+            return match base_trimmed.to_lowercase().as_str() {
                 "boolean" | "bool" => 1000,       // BOOLEAN[]
                 "integer" | "int4" | "int" => 1007, // INTEGER[]
                 "bigint" | "int8" => 1016,        // BIGINT[]
@@ -152,7 +154,7 @@ impl SchemaTypeMapper {
             "smallint" | "SMALLINT" | "int2" | "INT2" => return PgType::Int2.to_oid(),
             "boolean" | "BOOLEAN" | "bool" | "BOOL" => return PgType::Bool.to_oid(),
             "real" | "REAL" | "float4" | "FLOAT4" => return PgType::Float4.to_oid(),
-            "double precision" | "DOUBLE PRECISION" | "float8" | "FLOAT8" => return PgType::Float8.to_oid(),
+            "double precision" | "DOUBLE PRECISION" | "double" | "DOUBLE" | "float8" | "FLOAT8" => return PgType::Float8.to_oid(),
             "numeric" | "NUMERIC" | "decimal" | "DECIMAL" => return PgType::Numeric.to_oid(),
             "varchar" | "VARCHAR" => return PgType::Varchar.to_oid(),
             "char" | "CHAR" => return PgType::Char.to_oid(),
@@ -188,7 +190,7 @@ impl SchemaTypeMapper {
             
             // Floating point
             "REAL" | "FLOAT4" => PgType::Float4.to_oid(),
-            "DOUBLE PRECISION" | "FLOAT8" | "FLOAT" => PgType::Float8.to_oid(),
+            "DOUBLE PRECISION" | "DOUBLE" | "FLOAT8" | "FLOAT" => PgType::Float8.to_oid(),
             "NUMERIC" | "DECIMAL" => PgType::Numeric.to_oid(),
             
             // Text types

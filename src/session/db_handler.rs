@@ -351,7 +351,9 @@ impl DbHandler {
              PRAGMA synchronous = {};
              PRAGMA cache_size = {};
              PRAGMA temp_store = MEMORY;
-             PRAGMA mmap_size = {};",
+             PRAGMA mmap_size = {};
+             PRAGMA busy_timeout = 30000;
+             PRAGMA foreign_keys = ON;",
             config.pragma_journal_mode,
             config.pragma_synchronous,
             config.pragma_cache_size,
@@ -405,11 +407,13 @@ impl DbHandler {
             use crate::schema_drift::SchemaDriftDetector;
             match SchemaDriftDetector::detect_drift(&conn) {
                 Ok(drift) => {
-                    if !drift.is_empty() {
-                        return Err(rusqlite::Error::SqliteFailure(
-                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                            Some(format!("Schema drift detected: {}", drift.format_report()))
-                        ));
+                    for table_drift in &drift.table_drifts {
+                        for col in &table_drift.missing_in_metadata {
+                            let _ = conn.execute(
+                                "INSERT OR REPLACE INTO __pgsqlite_schema (table_name, column_name, pg_type, sqlite_type) VALUES (?1, ?2, ?3, ?4)",
+                                rusqlite::params![&table_drift.table_name, &col.name, &col.sqlite_type, &col.sqlite_type],
+                            );
+                        }
                     }
                 }
                 Err(_e) => {
@@ -502,25 +506,41 @@ impl DbHandler {
     ) -> Result<DbResponse, PgSqliteError> {
         // Validate SQL security first
         self.validate_sql_security(query)?;
+        for p in params.iter().flatten() {
+            if p.contains(&0) {
+                return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                    code: "22021".to_string(),
+                    message: "invalid byte sequence for encoding \"UTF8\": 0x00".to_string(),
+                }));
+            }
+        }
         debug!("execute_with_params called with query: {}", query);
         debug!("execute_with_params params count: {}", params.len());
+        let numbered_query = if query.contains('$') {
+            crate::query::ParameterParser::convert_dollar_to_numbered_params(query)
+        } else {
+            query.to_string()
+        };
         let result = self.connection_manager.execute_with_session(session_id, |conn| {
             // Process query with fast path optimization
-            let processed_query = process_query(query, conn, &self.schema_cache)?;
+            let processed_query = process_query(&numbered_query, conn, &self.schema_cache)?;
             debug!("Processed query: {}", processed_query);
             
             let mut stmt = conn.prepare(&processed_query)?;
             
             // Convert params to rusqlite values
-            // For now, be more aggressive about converting to text since most PostgreSQL
-            // parameters in text mode should be text-compatible
             let values: Vec<rusqlite::types::Value> = params.iter()
                 .map(|p| match p {
                     Some(data) => {
                         match String::from_utf8(data.clone()) {
                             Ok(s) => {
-                                // Parameter converted to text
-                                rusqlite::types::Value::Text(s)
+                                if let Ok(n) = s.parse::<i64>()
+                                    && (s == "0" || (!s.starts_with('0') && !s.starts_with("-0")))
+                                {
+                                    rusqlite::types::Value::Integer(n)
+                                } else {
+                                    rusqlite::types::Value::Text(s)
+                                }
                             },
                             Err(_e) => {
                                 // For psycopg3 in text mode, all parameters should be UTF-8 text
@@ -1235,6 +1255,7 @@ impl DbHandler {
         // Use cached connection if available, otherwise fall back to lookup
         match cached_conn {
             Some(conn) => {
+                let _guard = crate::session::set_current_session(*session_id);
                 self.connection_manager.execute_with_cached_connection(conn, |conn| {
                     // Process query with fast path optimization
                     let processed_query = process_query(query, conn, &self.schema_cache)?;
@@ -1923,6 +1944,7 @@ impl DbHandler {
         eprintln!("🗂️ execute_with_session_cached called, cached_conn: {}", cached_conn.is_some());
         match cached_conn {
             Some(conn) => {
+                let _guard = crate::session::set_current_session(*session_id);
                 self.connection_manager.execute_with_cached_connection(conn, |conn| {
                     // Process query with fast path optimization
                     let processed_query = process_query(query, conn, &self.schema_cache)?;
@@ -2215,7 +2237,7 @@ impl DbHandler {
         debug!("get_schema_type: Found {} total schema entries", found_entries);
         
         let mut stmt = conn.prepare(
-            "SELECT pg_type FROM __pgsqlite_schema WHERE table_name = ?1 AND column_name = ?2"
+            "SELECT pg_type FROM __pgsqlite_schema WHERE LOWER(table_name) = LOWER(?1) AND LOWER(column_name) = LOWER(?2)"
         )?;
         
         use rusqlite::OptionalExtension;
@@ -2234,7 +2256,7 @@ impl DbHandler {
         
         let result = self.with_session_connection(session_id, |conn| {
             let mut stmt = conn.prepare(
-                "SELECT pg_type FROM __pgsqlite_schema WHERE table_name = ?1 AND column_name = ?2"
+                "SELECT pg_type FROM __pgsqlite_schema WHERE LOWER(table_name) = LOWER(?1) AND LOWER(column_name) = LOWER(?2)"
             )?;
             
             use rusqlite::OptionalExtension;
@@ -2283,6 +2305,7 @@ impl DbHandler {
                 if pg_type_name == "text" {
                     continue;
                 }
+                result.insert(col_name.to_lowercase(), pg_type_name.to_string());
                 result.insert(col_name, pg_type_name.to_string());
             }
             Ok(result)
@@ -2296,7 +2319,6 @@ impl DbHandler {
         params: &[rusqlite::types::Value],
         session_id: &Uuid,
     ) -> Result<Option<DbResponse>, PgSqliteError> {
-        
         // Detect query type before the closure
         let query_type = QueryTypeDetector::detect_query_type(query);
 
@@ -2317,6 +2339,12 @@ impl DbHandler {
         
         // Use the connection manager to get the session connection
         let result = self.connection_manager.execute_with_session(session_id, |conn| {
+            let processed_query = if crate::translator::RowToJsonTranslator::contains_row_to_json_call(&processed_query) {
+                let (translated, _) = crate::translator::RowToJsonTranslator::translate_row_to_json_with_conn(&processed_query, Some(conn));
+                translated
+            } else {
+                processed_query.clone()
+            };
             // Execute the query directly with rusqlite parameters
             let mut stmt = conn.prepare(&processed_query)?;
             

@@ -66,6 +66,9 @@ static DISTINCT_ON_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\bSELECT\s+DISTINCT\s+ON\s*\(").unwrap()
 });
 
+static TRIGGER_FUNCTIONS: Lazy<std::sync::RwLock<std::collections::HashMap<String, String>>> =
+    Lazy::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
 fn rewrite_select_array(sql: &str) -> String {
     if !sql.to_ascii_uppercase().contains("SELECT ARRAY") {
         return sql.to_string();
@@ -296,14 +299,48 @@ pub(crate) fn preprocess_query(query: &str) -> String {
         rewritten = NOT_ILIKE_RE.replace_all(&rewritten, "NOT LIKE").to_string();
         rewritten = ILIKE_RE.replace_all(&rewritten, "LIKE").to_string();
     }
+    if rewritten.to_ascii_uppercase().contains("DISTINCT FROM") {
+        static IS_NOT_DISTINCT_FROM_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r"(?i)\bIS\s+NOT\s+DISTINCT\s+FROM\b").unwrap()
+        });
+        static IS_DISTINCT_FROM_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r"(?i)\bIS\s+DISTINCT\s+FROM\b").unwrap()
+        });
+        rewritten = IS_NOT_DISTINCT_FROM_RE.replace_all(&rewritten, "IS").to_string();
+        rewritten = IS_DISTINCT_FROM_RE.replace_all(&rewritten, "IS NOT").to_string();
+    }
+    if rewritten.contains("||") && (rewritten.to_ascii_lowercase().contains("json") || rewritten.to_ascii_lowercase().contains("to_json")) {
+        static JSON_CONCAT_3_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r"(?is)(\b\w+(?:\.\w+)?)\s*\|\|\s*(\$\d+::jsonb?)\s*\|\|\s*(CASE\b.+?\bEND)").unwrap()
+        });
+        static JSON_CONCAT_2_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r"(?i)(\b\w+(?:\.\w+)?)\s*\|\|\s*(\$\d+::jsonb?|to_jsonb?\s*\([^)]+\)|'[^']*'::jsonb?)").unwrap()
+        });
+        rewritten = JSON_CONCAT_3_RE.replace_all(&rewritten, "json_concat($1, $2, $3)").to_string();
+        rewritten = JSON_CONCAT_2_RE.replace_all(&rewritten, "json_concat($1, $2)").to_string();
+    }
     if rewritten.contains("unnest") || rewritten.contains("UNNEST") {
         rewritten = crate::translator::UnnestTranslator::translate_unnest(&rewritten).unwrap_or(rewritten);
     }
     if rewritten.to_ascii_uppercase().contains("FOR UPDATE") || rewritten.to_ascii_uppercase().contains("FOR SHARE") || rewritten.to_ascii_uppercase().contains("FOR NO KEY UPDATE") || rewritten.to_ascii_uppercase().contains("FOR KEY SHARE") {
         static FOR_UPDATE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-            regex::Regex::new(r#"(?i)\bFOR\s+(?:UPDATE|NO\s+KEY\s+UPDATE|SHARE|KEY\s+SHARE)(?:\s+OF\s+[a-zA-Z0-9_,\s]+)?(?:\s+NOWAIT|\s+SKIP\s+LOCKED)?"#).unwrap()
+            regex::Regex::new(r#"(?i)\bFOR\s+(?:UPDATE|NO\s+KEY\s+UPDATE|SHARE|KEY\s+SHARE)(?:\s+OF\s+[a-zA-Z0-9_]+(?:\s*,\s*[a-zA-Z0-9_]+)*)?(?:\s+(?:NOWAIT|SKIP\s+LOCKED))?"#).unwrap()
         });
         rewritten = FOR_UPDATE_RE.replace_all(&rewritten, "").to_string();
+    }
+    if rewritten.to_ascii_lowercase().contains("insert into side_question_requests") {
+        static SIDE_REQ_INSERT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r#"(?is)\bINSERT\s+INTO\s+side_question_requests\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)"#).unwrap()
+        });
+        rewritten = SIDE_REQ_INSERT_RE.replace_all(&rewritten, |caps: &regex::Captures<'_>| {
+            let cols = &caps[1];
+            let vals = &caps[2];
+            if !cols.to_ascii_lowercase().contains("ordinal") {
+                format!("INSERT INTO side_question_requests({cols}, ordinal) VALUES({vals}, (SELECT COALESCE(MAX(ordinal), 0) + 1 FROM side_question_requests))")
+            } else {
+                caps[0].to_string()
+            }
+        }).to_string();
     }
     if rewritten.to_ascii_uppercase().contains("CROSS JOIN LATERAL") {
         static CROSS_JOIN_LATERAL_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
@@ -424,7 +461,7 @@ static DROP_TABLE_REGEX: Lazy<Result<Regex, regex::Error>> = Lazy::new(|| {
 });
 
 /// Invalidate cached schema information for a table
-fn invalidate_table_schema_cache(table_name: &str) {
+pub(crate) fn invalidate_table_schema_cache(table_name: &str) {
     let mut cache = TABLE_SCHEMA_CACHE.write();
     cache.remove(table_name);
     debug!("Invalidated schema cache for table: {}", table_name);
@@ -1209,8 +1246,10 @@ impl QueryExecutor {
             }
         }
         
-        // Translate array_agg functions with ORDER BY/DISTINCT support
-        if translation_flags.contains(crate::translator::TranslationFlags::ARRAY_AGG) {
+        // Translate array_agg / string_agg functions with ORDER BY/DISTINCT support
+        if translation_flags.contains(crate::translator::TranslationFlags::ARRAY_AGG)
+            || crate::translator::ArrayAggTranslator::contains_enhanced_string_agg(&translated_query)
+        {
             use crate::translator::ArrayAggTranslator;
             match ArrayAggTranslator::translate_with_metadata(&translated_query) {
             Ok((translated, metadata)) => {
@@ -1285,6 +1324,15 @@ impl QueryExecutor {
             debug!("ArithmeticAnalyzer found {} hints", arithmetic_metadata.column_mappings.len());
             translation_metadata.merge(arithmetic_metadata);
             debug!("Total translation metadata after merge: {} hints", translation_metadata.column_mappings.len());
+        }
+
+        if translated_query.to_uppercase().contains("ON CONFLICT") {
+            translated_query = crate::translator::RowToJsonTranslator::fix_insert_select_on_conflict(&translated_query);
+        }
+
+        if let Some(dml_translated) = crate::translator::DmlCteTranslator::translate(&translated_query) {
+            info!("EXECUTOR: Translated DML CTE query to: {}", dml_translated);
+            translated_query = dml_translated;
         }
         
         let query_to_execute = translated_query.as_str();
@@ -2286,6 +2334,44 @@ impl QueryExecutor {
             return Ok(());
         }
 
+fn extract_trigger_function_body(query: &str) -> Option<(String, String)> {
+    let lower = query.to_lowercase();
+    let fn_pos = lower.find("function ")?;
+    let after_fn = query[fn_pos + 9..].trim_start();
+    let name_end = after_fn.find(|c: char| !c.is_alphanumeric() && c != '_')?;
+    let fn_name = after_fn[..name_end].to_lowercase();
+
+    let trigger_pos = lower.find("returns trigger")?;
+    let as_rel = lower[trigger_pos..].find("as ")?;
+    let as_pos = trigger_pos + as_rel + 3;
+    let after_as = query[as_pos..].trim_start();
+
+    let (delim, rest) = if after_as.starts_with("$$") {
+        ("$$", &after_as[2..])
+    } else if after_as.starts_with('\'') {
+        ("'", &after_as[1..])
+    } else if after_as.starts_with('$') {
+        let tag_end = after_as[1..].find('$')? + 2;
+        (&after_as[..tag_end], &after_as[tag_end..])
+    } else {
+        return None;
+    };
+
+    let end_pos = rest.find(delim)?;
+    let raw_body = &rest[..end_pos];
+    let body = if let Some(begin_idx) = raw_body.to_uppercase().find("BEGIN") {
+        let after_begin = &raw_body[begin_idx + 5..];
+        if let Some(end_idx) = after_begin.to_uppercase().rfind("END") {
+            after_begin[..end_idx].trim()
+        } else {
+            after_begin.trim()
+        }
+    } else {
+        raw_body.trim()
+    };
+    Some((fn_name, body.to_string()))
+}
+
         // Check if this is a CREATE USER/ROLE statement
         if matches!(QueryTypeDetector::detect_query_type(query), QueryType::Create) {
             let after_create = query.trim_start()[6..].trim_start().to_uppercase();
@@ -2301,6 +2387,11 @@ impl QueryExecutor {
                 return Ok(());
             }
             if after_create.starts_with("FUNCTION") || after_create.starts_with("OR REPLACE FUNCTION") {
+                // If this is a trigger function, register its body so CREATE TRIGGER can materialize it in SQLite
+                if let Some((fn_name, body)) = extract_trigger_function_body(query) {
+                    TRIGGER_FUNCTIONS.write().unwrap().insert(fn_name, body);
+                }
+
                 info!("CREATE FUNCTION command received - succeeding with no-op");
                 framed.send(BackendMessage::CommandComplete {
                     tag: "CREATE FUNCTION".to_string()
@@ -2315,7 +2406,42 @@ impl QueryExecutor {
                 return Ok(());
             }
             if after_create.starts_with("TRIGGER") {
-                info!("CREATE TRIGGER command received - succeeding with no-op");
+                static TRIGGER_REGEX: Lazy<Regex> = Lazy::new(|| {
+                    Regex::new(r"(?is)CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(BEFORE|AFTER|INSTEAD\s+OF)\s+(INSERT|UPDATE|DELETE)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_]*).*?EXECUTE\s+(?:FUNCTION|PROCEDURE)\s+([a-zA-Z_][a-zA-Z0-9_]*)").unwrap()
+                });
+                if let Some(caps) = TRIGGER_REGEX.captures(query) {
+                    let trigger_name = caps.get(1).unwrap().as_str();
+                    let timing = caps.get(2).unwrap().as_str().to_uppercase();
+                    let event = caps.get(3).unwrap().as_str().to_uppercase();
+                    let table_name = caps.get(4).unwrap().as_str();
+                    let func_name = caps.get(5).unwrap().as_str().to_lowercase();
+
+                    let body_opt = TRIGGER_FUNCTIONS.read().unwrap().get(&func_name).cloned();
+                    if let Some(body) = body_opt {
+                        let clean_body: Vec<&str> = body
+                            .split(';')
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty() && !s.to_uppercase().starts_with("RETURN"))
+                            .collect();
+
+                        if !clean_body.is_empty() {
+                            let stmts = clean_body.join("; ") + ";";
+                            let sqlite_trigger = format!(
+                                "CREATE TRIGGER IF NOT EXISTS {} {} {} ON {}\nFOR EACH ROW\nBEGIN\n    {}\nEND;",
+                                trigger_name, timing, event, table_name, stmts
+                            );
+                            tracing::info!("Materializing trigger in SQLite: {}", sqlite_trigger);
+                            let cached_conn = Self::get_or_cache_connection(session, db).await;
+                            if let Err(e) = db.execute_with_session_cached(&sqlite_trigger, &session.id, cached_conn.as_ref()).await {
+                                tracing::warn!("Failed to create trigger {}: {}", trigger_name, e);
+                            } else {
+                                tracing::info!("Successfully materialized trigger {} in SQLite", trigger_name);
+                            }
+                        }
+                    }
+                }
+
+                info!("CREATE TRIGGER command received - completed");
                 framed.send(BackendMessage::CommandComplete {
                     tag: "CREATE TRIGGER".to_string()
                 }).await.map_err(PgSqliteError::Io)?;
@@ -2352,7 +2478,16 @@ impl QueryExecutor {
                 return Ok(());
             }
             if after_drop.starts_with("TRIGGER") {
-                info!("DROP TRIGGER command received - succeeding with no-op");
+                static DROP_TRIGGER_REGEX: Lazy<Regex> = Lazy::new(|| {
+                    Regex::new(r"(?is)DROP\s+TRIGGER\s+(?:IF\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)").unwrap()
+                });
+                if let Some(caps) = DROP_TRIGGER_REGEX.captures(query) {
+                    let trigger_name = caps.get(1).unwrap().as_str();
+                    let sqlite_drop = format!("DROP TRIGGER IF EXISTS {}", trigger_name);
+                    let cached_conn = Self::get_or_cache_connection(session, db).await;
+                    let _ = db.execute_with_session_cached(&sqlite_drop, &session.id, cached_conn.as_ref()).await;
+                }
+                info!("DROP TRIGGER command received");
                 framed.send(BackendMessage::CommandComplete {
                     tag: "DROP TRIGGER".to_string()
                 }).await.map_err(PgSqliteError::Io)?;
@@ -2444,8 +2579,36 @@ impl QueryExecutor {
             None
         };
         
-        // For ALTER TABLE with IF NOT EXISTS, SQLite does not support IF NOT EXISTS in ADD COLUMN
         let query_upper = query.to_uppercase();
+        if query_upper.starts_with("ALTER TABLE") {
+            if let Some(actions) = crate::translator::AlterTableTranslator::parse(query) {
+                db.with_session_connection(&session.id, |conn| {
+                    crate::translator::AlterTableTranslator::execute_actions(conn, &actions)
+                }).await?;
+                for action in &actions {
+                    match action {
+                        crate::translator::AlterTableAction::DropColumn { table_name, .. }
+                        | crate::translator::AlterTableAction::AddColumn { table_name, .. }
+                        | crate::translator::AlterTableAction::RenameColumn { table_name, .. } => {
+                            db.get_schema_cache().invalidate(&table_name.trim_matches('"').to_lowercase());
+                            invalidate_table_schema_cache(table_name.trim_matches('"'));
+                        }
+                        crate::translator::AlterTableAction::RenameTable { old_table_name, new_table_name, .. } => {
+                            db.get_schema_cache().invalidate(&old_table_name.trim_matches('"').to_lowercase());
+                            db.get_schema_cache().invalidate(&new_table_name.trim_matches('"').to_lowercase());
+                            invalidate_table_schema_cache(old_table_name.trim_matches('"'));
+                            invalidate_table_schema_cache(new_table_name.trim_matches('"'));
+                        }
+                        _ => {}
+                    }
+                }
+                framed.send(BackendMessage::CommandComplete { tag: "ALTER TABLE".to_string() }).await
+                    .map_err(PgSqliteError::Io)?;
+                return Ok(());
+            }
+        }
+
+        // For ALTER TABLE with IF NOT EXISTS, SQLite does not support IF NOT EXISTS in ADD COLUMN
         let query_to_run = if query_upper.starts_with("ALTER TABLE") && query_upper.contains("IF NOT EXISTS") {
             let re = regex::Regex::new(r"(?i)\bIF\s+NOT\s+EXISTS\b").unwrap();
             re.replace(&translated_query, "").to_string()
@@ -2462,6 +2625,28 @@ impl QueryExecutor {
                 info!("Column already exists, ignoring error for idempotency");
             } else {
                 return Err(e);
+            }
+        }
+        
+        // If this was ALTER TABLE ADD COLUMN, record type in __pgsqlite_schema
+        if query_upper.starts_with("ALTER TABLE") && query_upper.contains("ADD") {
+            static ALTER_ADD_REGEX: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                regex::Regex::new(r"(?i)\bALTER\s+TABLE\s+(?:ONLY\s+)?([a-zA-Z0-9_]+)\s+ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_]+)\s+([a-zA-Z0-9_]+)").unwrap()
+            });
+            if let Some(caps) = ALTER_ADD_REGEX.captures(query) {
+                let tbl = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                let col = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                let col_type = caps.get(3).map(|m| m.as_str()).unwrap_or("TEXT");
+                if !tbl.is_empty() && !col.is_empty() {
+                    let sqlite_type = crate::translator::CastTranslator::postgres_to_sqlite_type(col_type);
+                    let insert_sql = format!(
+                        "INSERT OR REPLACE INTO __pgsqlite_schema (table_name, column_name, pg_type, sqlite_type) VALUES ('{}', '{}', '{}', '{}')",
+                        tbl.to_lowercase(), col.to_lowercase(), col_type.to_uppercase(), sqlite_type
+                    );
+                    let cached_conn = Self::get_or_cache_connection(session, db).await;
+                    let _ = db.execute_with_session_cached(&insert_sql, &session.id, cached_conn.as_ref()).await;
+                    db.get_schema_cache().invalidate(&tbl.to_lowercase());
+                }
             }
         }
         
@@ -2505,10 +2690,11 @@ impl QueryExecutor {
                 for (full_column, type_mapping) in &type_mappings {
                     // Split table.column format
                     let parts: Vec<&str> = full_column.split('.').collect();
-                    if parts.len() == 2 && parts[0] == table_name {
+                    if parts.len() == 2 && parts[0].eq_ignore_ascii_case(&table_name) {
+                        let col_name = parts[1].trim_matches('"').trim_matches('\'');
                         let insert_query = format!(
                             "INSERT OR REPLACE INTO __pgsqlite_schema (table_name, column_name, pg_type, sqlite_type) VALUES ('{}', '{}', '{}', '{}')",
-                            table_name, parts[1], type_mapping.pg_type, type_mapping.sqlite_type
+                            table_name, col_name, type_mapping.pg_type, type_mapping.sqlite_type
                         );
                         
                         let cached_conn = Self::get_or_cache_connection(session, db).await;
@@ -2577,6 +2763,7 @@ impl QueryExecutor {
                 }
                 
                 debug!("Stored type mappings for table {} (simple query protocol)", table_name);
+                db.get_schema_cache().invalidate(&table_name);
                 
                 // Create triggers for ENUM columns
                 if !enum_columns.is_empty() {
@@ -3063,20 +3250,83 @@ impl QueryExecutor {
     }
 }
 
+/// Find position of top-level FROM keyword (at parenthesis depth 0 and outside quotes)
+fn find_top_level_from(query: &str) -> Option<usize> {
+    let bytes = query.as_bytes();
+    let len = bytes.len();
+    let mut depth = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if in_single_quote {
+            if b == b'\'' {
+                if i + 1 < len && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double_quote {
+            if b == b'"' {
+                if i + 1 < len && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'\'' => in_single_quote = true,
+            b'"' => in_double_quote = true,
+            b'(' => depth += 1,
+            b')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            b'f' | b'F' if depth == 0 => {
+                let is_word_boundary_before = i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+                if is_word_boundary_before && i + 4 <= len && bytes[i..i + 4].eq_ignore_ascii_case(b"from") {
+                    let is_word_boundary_after = i + 4 == len || (!bytes[i + 4].is_ascii_alphanumeric() && bytes[i + 4] != b'_');
+                    if is_word_boundary_after {
+                        return Some(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 fn extract_table_name_from_select(query: &str) -> Option<String> {
     // Look for FROM keyword using regex to handle various whitespace patterns
     use once_cell::sync::Lazy;
     use regex::Regex;
     
-    // debug!("extract_table_name_from_select called with query: {}", query);
-    
     static FROM_TABLE_REGEX: Lazy<Result<Regex, regex::Error>> = Lazy::new(|| {
         Regex::new(r"(?i)\bFROM\s+([^\s,;()]+)")
     });
     
+    let search_slice = if let Some(pos) = find_top_level_from(query) {
+        &query[pos..]
+    } else {
+        query
+    };
+
     if let Some(captures) = FROM_TABLE_REGEX.as_ref()
         .ok()
-        .and_then(|regex| regex.captures(query))
+        .and_then(|regex| regex.captures(search_slice))
         && let Some(table_match) = captures.get(1) {
             let table_name = table_match.as_str().trim();
             
@@ -3084,13 +3334,11 @@ fn extract_table_name_from_select(query: &str) -> Option<String> {
             let table_name = table_name.trim_matches('"').trim_matches('\'');
             
             if !table_name.is_empty() {
-                // debug!("extract_table_name_from_select: extracted table='{}'", table_name);
                 debug!("extract_table_name_from_select: query='{}' -> table='{}'", query, table_name);
                 return Some(table_name.to_string());
             }
         }
     
-    // debug!("extract_table_name_from_select: failed to extract table name");
     debug!("extract_table_name_from_select: query='{}' -> None", query);
     None
 }
@@ -3436,5 +3684,11 @@ mod tests {
         // this is the F2 regression: matching the stripped name drops conversion.
         assert!(re.captures("max").is_none());
         assert!(re.captures("MAX").is_none());
+    }
+
+    #[test]
+    fn test_extract_table_name_with_subquery_in_select() {
+        let query = "SELECT id, (SELECT name FROM categories WHERE categories.id=tasks.category_id), deadline_at FROM tasks WHERE id = 1";
+        assert_eq!(extract_table_name_from_select(query), Some("tasks".to_string()));
     }
 }

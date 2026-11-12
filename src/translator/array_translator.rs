@@ -7,15 +7,15 @@ use tracing::debug;
 
 /// Regex patterns for array operators
 static ARRAY_CONTAINS_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(\b\w+(?:\.\w+)*)\s*@>\s*('[^']+'|"[^"]+"|'\[[^\]]+\]'|json_array\([^)]*\)|array_to_json\([^)]*\)|\$\d+|\b\w+(?:\.\w+)*)"#).unwrap()
+    Regex::new(r#"(?i)(\b\w+(?:\.\w+)*)\s*@>\s*('[^']+'|"[^"]+"|'\[[^\]]+\]'|(?:to_jsonb|to_json|json_array|array_to_json)\s*\((?:[^()]|\([^()]*\))*\)|ARRAY\s*\[[^\]]*\]|\$\d+|\b\w+(?:\.\w+)*)"#).unwrap()
 });
 
 static ARRAY_CONTAINED_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"('[^']+'|"[^"]+"|'\[[^\]]+\]'|json_array\([^)]*\)|array_to_json\([^)]*\)|\$\d+|\b\w+(?:\.\w+)*)\s*<@\s*('[^']+'|"[^"]+"|'\[[^\]]+\]'|json_array\([^)]*\)|array_to_json\([^)]*\)|\$\d+|\b\w+(?:\.\w+)*)"#).unwrap()
+    Regex::new(r#"(?i)('[^']+'|"[^"]+"|'\[[^\]]+\]'|(?:to_jsonb|to_json|json_array|array_to_json)\s*\((?:[^()]|\([^()]*\))*\)|ARRAY\s*\[[^\]]*\]|\$\d+|\b\w+(?:\.\w+)*)\s*<@\s*('[^']+'|"[^"]+"|'\[[^\]]+\]'|(?:to_jsonb|to_json|json_array|array_to_json)\s*\((?:[^()]|\([^()]*\))*\)|ARRAY\s*\[[^\]]*\]|\$\d+|\b\w+(?:\.\w+)*)"#).unwrap()
 });
 
 static ARRAY_OVERLAP_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(\b\w+(?:\.\w+)*)\s*&&\s*('[^']+'|"[^"]+"|'\[[^\]]+\]'|json_array\([^)]*\)|array_to_json\([^)]*\)|\$\d+|\b\w+(?:\.\w+)*)"#).unwrap()
+    Regex::new(r#"(?i)(\b\w+(?:\.\w+)*)\s*&&\s*('[^']+'|"[^"]+"|'\[[^\]]+\]'|(?:to_jsonb|to_json|json_array|array_to_json)\s*\((?:[^()]|\([^()]*\))*\)|ARRAY\s*\[[^\]]*\]|\$\d+|\b\w+(?:\.\w+)*)"#).unwrap()
 });
 
 static ARRAY_LITERAL_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -199,8 +199,15 @@ impl ArrayTranslator {
         
         while let Some(captures) = ARRAY_LITERAL_REGEX.captures(&result) {
             let array_contents = &captures[1];
-            
-            if array_contents.contains('$') {
+            let has_col_ref = array_contents.split(',').any(|elem| {
+                let e = elem.trim();
+                !e.is_empty()
+                    && !e.starts_with('\'')
+                    && !e.starts_with('"')
+                    && e.contains('.')
+                    && e.parse::<f64>().is_err()
+            });
+            if array_contents.contains('$') || has_col_ref {
                 result = result.replace(&captures[0], &format!("json_array({})", array_contents));
             } else {
                 // Parse the array contents and convert to JSON format
@@ -356,11 +363,11 @@ impl ArrayTranslator {
             
             let replacement = if op == "@>" {
                 format!(
-                    "EXISTS (SELECT 1 FROM json_each(array_to_json({array_col})) AS _elem WHERE array_contains({value}, _elem.value))"
+                    "EXISTS (SELECT 1 FROM (SELECT value AS _val FROM json_each(array_to_json({array_col}))) WHERE array_contains({value}, _val))"
                 )
             } else {
                 format!(
-                    "EXISTS (SELECT 1 FROM json_each(array_to_json({array_col})) AS _elem WHERE (_elem.value = {value} OR '' || _elem.value = '' || {value}))"
+                    "EXISTS (SELECT 1 FROM (SELECT value AS _val FROM json_each(array_to_json({array_col}))) WHERE (_val = {value} OR '' || _val = '' || {value}))"
                 )
             };
             result = result.replace(&captures[0], &replacement);
@@ -876,7 +883,7 @@ mod tests {
         let sql = "SELECT * FROM products WHERE 'electronics' = ANY(tags)";
         let result = ArrayTranslator::translate_array_operators(sql).unwrap();
         println!("ANY operator result: {result}");
-        assert!(result.contains("EXISTS (SELECT 1 FROM json_each(array_to_json(tags)) AS _elem WHERE (_elem.value = 'electronics' OR '' || _elem.value = '' || 'electronics'))"));
+        assert!(result.contains("EXISTS (SELECT 1 FROM (SELECT value AS _val FROM json_each(array_to_json(tags))) WHERE (_val = 'electronics' OR '' || _val = '' || 'electronics'))"));
     }
     
     #[test]

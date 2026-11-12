@@ -306,16 +306,20 @@ impl ValueConverter {
     }
     
     /// Convert PostgreSQL TIMESTAMPTZ to microseconds since epoch in UTC (stored as INTEGER)
-    fn convert_timestamptz_to_unix(value: &str) -> Result<String, String> {
+    pub fn convert_timestamptz_to_unix(value: &str) -> Result<String, String> {
+        let trimmed = value.trim();
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+            return Ok(datetime_utils::datetime_to_microseconds(&dt.naive_utc()).to_string());
+        }
         // Try parsing with timezone offset
-        let (datetime_str, offset_seconds) = if let Some(caps) = TIMESTAMPTZ_REGEX.captures(value.trim()) {
+        let (datetime_str, offset_seconds) = if let Some(caps) = TIMESTAMPTZ_REGEX.captures(trimmed) {
             let dt_str = caps.get(1).unwrap().as_str();
             let offset_str = caps.get(2).unwrap().as_str();
             let offset = Self::parse_timezone_offset(offset_str)?;
             (dt_str.trim().to_string(), offset)
         } else {
             // No timezone specified, assume UTC
-            (value.trim().to_string(), 0)
+            (trimmed.to_string(), 0)
         };
         
         // Parse timestamp to microseconds

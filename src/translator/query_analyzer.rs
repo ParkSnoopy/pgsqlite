@@ -109,8 +109,8 @@ impl QueryAnalyzer {
             }
         }
         
-        // Check for array_agg
-        if query_lower.contains("array_agg") {
+        // Check for array_agg / string_agg
+        if query_lower.contains("array_agg") || (query_lower.contains("string_agg") && (query_lower.contains("distinct") || query_lower.contains("order by"))) {
             flags |= TranslationFlags::ARRAY_AGG;
         }
         

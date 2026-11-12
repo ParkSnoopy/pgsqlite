@@ -272,7 +272,13 @@ fn has_any_special_pattern_fast(bytes: &[u8]) -> bool {
     memchr::memmem::find(bytes, b"current_user").is_some() ||
     memchr::memmem::find(bytes, b"CURRENT_USER").is_some() ||
     memchr::memmem::find(bytes, b"session_user").is_some() ||
-    memchr::memmem::find(bytes, b"SESSION_USER").is_some()
+    memchr::memmem::find(bytes, b"SESSION_USER").is_some() ||
+    memchr::memmem::find(bytes, b"to_json").is_some() ||
+    memchr::memmem::find(bytes, b"TO_JSON").is_some() ||
+    memchr::memmem::find(bytes, b"json_populate_record").is_some() ||
+    memchr::memmem::find(bytes, b"JSON_POPULATE_RECORD").is_some() ||
+    memchr::memmem::find(bytes, b"make_interval").is_some() ||
+    memchr::memmem::find(bytes, b"MAKE_INTERVAL").is_some()
 }
 
 /// Check INSERT-specific patterns
@@ -375,13 +381,21 @@ fn process_complex_query<'a>(
     schema_cache: &SchemaCache,
 ) -> Result<Cow<'a, str>, rusqlite::Error> {
     let processor = UnifiedProcessor::analyze(query);
+    let has_row_to_json = crate::translator::RowToJsonTranslator::contains_row_to_json_call(query);
     
     // If no translations needed, return original
-    if processor.translations_needed.is_empty() {
+    if processor.translations_needed.is_empty() && !has_row_to_json {
         return Ok(Cow::Borrowed(query));
     }
     
     let mut result = Cow::Borrowed(query);
+
+    if has_row_to_json {
+        let (translated, _) = crate::translator::RowToJsonTranslator::translate_row_to_json_with_conn(&result, Some(conn));
+        if translated != result.as_ref() {
+            result = Cow::Owned(translated);
+        }
+    }
     
     // Apply translations in optimal order (destructive ones first)
     

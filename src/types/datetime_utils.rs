@@ -1,5 +1,5 @@
 /// Utility functions for datetime conversions using INTEGER microseconds
-use chrono::{NaiveDate, NaiveTime, NaiveDateTime, Datelike, Timelike};
+use chrono::{DateTime, NaiveDate, NaiveTime, NaiveDateTime, Datelike, Timelike};
 
 /// Unix epoch as a date (1970-01-01)
 const UNIX_EPOCH_DATE: i32 = 719163; // Days from 0000-01-01 to 1970-01-01
@@ -102,6 +102,10 @@ pub fn parse_timestamp_to_microseconds(timestamp_str: &str) -> Option<i64> {
         "-infinity" => return Some(i64::MIN),
         _ => {}
     }
+
+    if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp_str) {
+        return Some(datetime_to_microseconds(&dt.naive_utc()));
+    }
     
     // Parse various timestamp formats
     let formats = [
@@ -109,6 +113,10 @@ pub fn parse_timestamp_to_microseconds(timestamp_str: &str) -> Option<i64> {
         "%Y-%m-%d %H:%M:%S",        // YYYY-MM-DD HH:MM:SS
         "%Y-%m-%dT%H:%M:%S%.f",     // ISO format with T
         "%Y-%m-%dT%H:%M:%S",        // ISO format with T
+        "%Y-%m-%d %H:%M:%S%.fZ",    // ISO format with Z
+        "%Y-%m-%d %H:%M:%SZ",       // ISO format with Z
+        "%Y-%m-%dT%H:%M:%S%.fZ",    // ISO format with T and Z
+        "%Y-%m-%dT%H:%M:%SZ",       // ISO format with T and Z
     ];
     
     for format in &formats {

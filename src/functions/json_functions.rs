@@ -84,20 +84,24 @@ pub fn register_json_functions(conn: &Connection) -> Result<()> {
         1,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
-            // Try to get as string first
-            if let Ok(s) = ctx.get::<String>(0) {
-                Ok(serde_json::to_string(&s).unwrap())
-            } else {
-                match ctx.get_raw(0) {
-                    ValueRef::Null => Ok("null".to_string()),
-                    ValueRef::Integer(i) => Ok(i.to_string()),
-                    ValueRef::Real(f) => Ok(f.to_string()),
-                    ValueRef::Text(s) => Ok(serde_json::to_string(&s).unwrap()),
-                    ValueRef::Blob(b) => {
-                        // Convert blob to hex string for JSON
-                        let hex = b.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-                        Ok(serde_json::to_string(&hex).unwrap())
-                    },
+            match ctx.get_raw(0) {
+                ValueRef::Null => Ok("null".to_string()),
+                ValueRef::Integer(i) => Ok(i.to_string()),
+                ValueRef::Real(f) => Ok(f.to_string()),
+                ValueRef::Text(s) => {
+                    let s_str = std::str::from_utf8(s).unwrap_or("");
+                    let trimmed = s_str.trim();
+                    if ((trimmed.starts_with('[') && trimmed.ends_with(']'))
+                        || (trimmed.starts_with('{') && trimmed.ends_with('}')))
+                        && serde_json::from_str::<JsonValue>(trimmed).is_ok()
+                    {
+                        return Ok(trimmed.to_string());
+                    }
+                    Ok(serde_json::to_string(s_str).unwrap())
+                }
+                ValueRef::Blob(b) => {
+                    let hex = b.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+                    Ok(serde_json::to_string(&hex).unwrap())
                 }
             }
         },
@@ -109,46 +113,94 @@ pub fn register_json_functions(conn: &Connection) -> Result<()> {
         1,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
-            // Try to get as string first
-            if let Ok(s) = ctx.get::<String>(0) {
-                Ok(serde_json::to_string(&s).unwrap())
-            } else {
-                match ctx.get_raw(0) {
-                    ValueRef::Null => Ok("null".to_string()),
-                    ValueRef::Integer(i) => Ok(i.to_string()),
-                    ValueRef::Real(f) => Ok(f.to_string()),
-                    ValueRef::Text(s) => Ok(serde_json::to_string(&s).unwrap()),
-                    ValueRef::Blob(b) => {
-                        // Convert blob to hex string for JSON
-                        let hex = b.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-                        Ok(serde_json::to_string(&hex).unwrap())
-                    },
+            match ctx.get_raw(0) {
+                ValueRef::Null => Ok("null".to_string()),
+                ValueRef::Integer(i) => Ok(i.to_string()),
+                ValueRef::Real(f) => Ok(f.to_string()),
+                ValueRef::Text(s) => {
+                    let s_str = std::str::from_utf8(s).unwrap_or("");
+                    let trimmed = s_str.trim();
+                    if ((trimmed.starts_with('[') && trimmed.ends_with(']'))
+                        || (trimmed.starts_with('{') && trimmed.ends_with('}')))
+                        && serde_json::from_str::<JsonValue>(trimmed).is_ok()
+                    {
+                        return Ok(trimmed.to_string());
+                    }
+                    Ok(serde_json::to_string(s_str).unwrap())
+                }
+                ValueRef::Blob(b) => {
+                    let hex = b.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+                    Ok(serde_json::to_string(&hex).unwrap())
                 }
             }
         },
     )?;
     
-    // json_build_object(variadic) - Build JSON object from key-value pairs
-    // For simplicity, we'll implement a 2-argument version
+    // json_build_object(variadic) and jsonb_build_object(variadic) - Build JSON object from key-value pairs
     conn.create_scalar_function(
         "json_build_object",
-        2,
+        -1,
         FunctionFlags::SQLITE_UTF8,
+        json_build_object_variadic,
+    )?;
+    
+    conn.create_scalar_function(
+        "jsonb_build_object",
+        -1,
+        FunctionFlags::SQLITE_UTF8,
+        json_build_object_variadic,
+    )?;
+
+    // json_concat(variadic) and jsonb_concat(variadic) - JSON merge patch / concatenation
+    conn.create_scalar_function(
+        "json_concat",
+        -1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
-            let key: String = ctx.get(0)?;
-            let value: String = match ctx.get_raw(1) {
-                ValueRef::Null => "null".to_string(),
-                ValueRef::Integer(i) => i.to_string(),
-                ValueRef::Real(f) => f.to_string(),
-                ValueRef::Text(s) => serde_json::to_string(&s).unwrap(),
-                ValueRef::Blob(b) => {
-                    // Convert blob to hex string for JSON  
-                    let hex = b.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-                    serde_json::to_string(&hex).unwrap()
-                },
+            if ctx.is_empty() {
+                return Ok(None);
+            }
+            if ctx.len() == 1 {
+                return Ok(ctx.get::<Option<String>>(0)?);
+            }
+            let mut current = match json_concat_impl(ctx.get_raw(0), ctx.get_raw(1))? {
+                Some(c) => c,
+                None => return Ok(None),
             };
-            
-            Ok(format!("{{\"{key}\": {value}}}"))
+            for i in 2..ctx.len() {
+                let next_val = ctx.get_raw(i);
+                current = match json_concat_impl(ValueRef::Text(current.as_bytes()), next_val)? {
+                    Some(c) => c,
+                    None => return Ok(None),
+                };
+            }
+            Ok(Some(current))
+        },
+    )?;
+
+    conn.create_scalar_function(
+        "jsonb_concat",
+        -1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            if ctx.is_empty() {
+                return Ok(None);
+            }
+            if ctx.len() == 1 {
+                return Ok(ctx.get::<Option<String>>(0)?);
+            }
+            let mut current = match json_concat_impl(ctx.get_raw(0), ctx.get_raw(1))? {
+                Some(c) => c,
+                None => return Ok(None),
+            };
+            for i in 2..ctx.len() {
+                let next_val = ctx.get_raw(i);
+                current = match json_concat_impl(ValueRef::Text(current.as_bytes()), next_val)? {
+                    Some(c) => c,
+                    None => return Ok(None),
+                };
+            }
+            Ok(Some(current))
         },
     )?;
     
@@ -1631,6 +1683,106 @@ fn register_json_to_record(conn: &Connection) -> Result<()> {
     )?;
     
     Ok(())
+}
+
+fn json_build_object_variadic(ctx: &rusqlite::functions::Context) -> Result<String> {
+    let argc = ctx.len();
+    if argc % 2 != 0 {
+        return Err(rusqlite::Error::UserFunctionError(
+            "argument list must have even number of elements".into(),
+        ));
+    }
+    let mut map = serde_json::Map::new();
+    let mut i = 0;
+    while i < argc {
+        let key: String = ctx.get(i)?;
+        let val_json: JsonValue = match ctx.get_raw(i + 1) {
+            ValueRef::Null => JsonValue::Null,
+            ValueRef::Integer(n) => JsonValue::Number(n.into()),
+            ValueRef::Real(r) => {
+                if let Some(num) = serde_json::Number::from_f64(r) {
+                    JsonValue::Number(num)
+                } else {
+                    JsonValue::Null
+                }
+            }
+            ValueRef::Text(s) => {
+                let s_str = std::str::from_utf8(s).unwrap_or("");
+                if (s_str.starts_with('{') && s_str.ends_with('}'))
+                    || (s_str.starts_with('[') && s_str.ends_with(']'))
+                {
+                    if let Ok(parsed) = serde_json::from_str::<JsonValue>(s_str) {
+                        parsed
+                    } else {
+                        JsonValue::String(s_str.to_string())
+                    }
+                } else {
+                    JsonValue::String(s_str.to_string())
+                }
+            }
+            ValueRef::Blob(b) => {
+                let s_str = std::str::from_utf8(b).unwrap_or("");
+                if (s_str.starts_with('{') && s_str.ends_with('}'))
+                    || (s_str.starts_with('[') && s_str.ends_with(']'))
+                {
+                    if let Ok(parsed) = serde_json::from_str::<JsonValue>(s_str) {
+                        parsed
+                    } else {
+                        JsonValue::String(s_str.to_string())
+                    }
+                } else {
+                    JsonValue::String(s_str.to_string())
+                }
+            }
+        };
+        map.insert(key, val_json);
+        i += 2;
+    }
+    Ok(serde_json::to_string(&JsonValue::Object(map)).unwrap())
+}
+
+fn json_concat_impl(a_val: ValueRef, b_val: ValueRef) -> Result<Option<String>> {
+    let a_str = match a_val {
+        ValueRef::Null => return Ok(None),
+        ValueRef::Text(s) => std::str::from_utf8(s).unwrap_or(""),
+        ValueRef::Blob(b) => std::str::from_utf8(b).unwrap_or(""),
+        ValueRef::Integer(i) => return Ok(Some(i.to_string())),
+        ValueRef::Real(r) => return Ok(Some(r.to_string())),
+    };
+    let b_str = match b_val {
+        ValueRef::Null => return Ok(None),
+        ValueRef::Text(s) => std::str::from_utf8(s).unwrap_or(""),
+        ValueRef::Blob(b) => std::str::from_utf8(b).unwrap_or(""),
+        ValueRef::Integer(i) => return Ok(Some(format!("{a_str}{i}"))),
+        ValueRef::Real(r) => return Ok(Some(format!("{a_str}{r}"))),
+    };
+
+    let a_json: Option<JsonValue> = serde_json::from_str(a_str).ok();
+    let b_json: Option<JsonValue> = serde_json::from_str(b_str).ok();
+
+    match (a_json, b_json) {
+        (Some(JsonValue::Object(mut obj_a)), Some(JsonValue::Object(obj_b))) => {
+            for (k, v) in obj_b {
+                obj_a.insert(k, v);
+            }
+            Ok(Some(serde_json::to_string(&JsonValue::Object(obj_a)).unwrap()))
+        }
+        (Some(JsonValue::Array(mut arr_a)), Some(JsonValue::Array(arr_b))) => {
+            arr_a.extend(arr_b);
+            Ok(Some(serde_json::to_string(&JsonValue::Array(arr_a)).unwrap()))
+        }
+        (Some(JsonValue::Array(mut arr_a)), Some(b_elem)) => {
+            arr_a.push(b_elem);
+            Ok(Some(serde_json::to_string(&JsonValue::Array(arr_a)).unwrap()))
+        }
+        (Some(a_elem), Some(JsonValue::Array(mut arr_b))) => {
+            arr_b.insert(0, a_elem);
+            Ok(Some(serde_json::to_string(&JsonValue::Array(arr_b)).unwrap()))
+        }
+        _ => {
+            Ok(Some(format!("{a_str}{b_str}")))
+        }
+    }
 }
 
 #[cfg(test)]

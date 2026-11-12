@@ -165,9 +165,7 @@ impl SessionState {
 
 impl Drop for SessionState {
     fn drop(&mut self) {
-        // Note: We can't do async operations in Drop, so cleanup is handled
-        // explicitly when the session ends or via a background task
-        // For now, just decrement the session count
+        crate::session::ADVISORY_LOCK_MANAGER.release_all(&self.id);
         
         // Decrement active session count when session is destroyed
         ACTIVE_SESSION_COUNT.fetch_sub(1, Ordering::Relaxed);

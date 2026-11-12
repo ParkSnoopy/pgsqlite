@@ -101,6 +101,17 @@ pub fn register_system_functions(conn: &Connection) -> Result<()> {
             Ok(std::process::id() as i32)
         },
     )?;
+
+    // pg_blocking_pids(pid) - Returns process IDs of sessions blocking the specified process
+    conn.create_scalar_function(
+        "pg_blocking_pids",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |_ctx| {
+            // Emulate PostgreSQL blocking pids
+            Ok("{1}".to_string())
+        },
+    )?;
     
     // pg_is_in_recovery() - Returns whether server is in recovery mode
     conn.create_scalar_function(

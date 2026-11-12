@@ -29,6 +29,8 @@ mod catalog_function_translator;
 mod pg_table_is_visible_translator;
 mod session_identifier_translator;
 mod sqlite_master_filter;
+pub mod alter_table_translator;
+pub mod dml_cte_translator;
 
 pub use json_translator::JsonTranslator;
 pub use returning_translator::ReturningTranslator;
@@ -60,3 +62,5 @@ pub use pg_table_is_visible_translator::PgTableIsVisibleTranslator;
 pub use session_identifier_translator::SessionIdentifierTranslator;
 pub use sqlite_master_filter::SqliteMasterFilter;
 pub(crate) use sqlite_master_filter::is_generated_filter_subquery;
+pub use alter_table_translator::{AlterTableTranslator, AlterTableAction};
+pub use dml_cte_translator::DmlCteTranslator;
