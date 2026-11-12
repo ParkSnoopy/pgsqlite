@@ -424,7 +424,7 @@ where
     // Send backend key data
     framed
         .send(BackendMessage::BackendKeyData {
-            process_id: std::process::id() as i32,
+            process_id: pgsqlite::session::uuid_to_backend_pid(&session.id),
             secret_key: rand::random::<i32>(),
         })
         .await?;

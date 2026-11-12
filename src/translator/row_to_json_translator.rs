@@ -46,6 +46,8 @@ impl RowToJsonTranslator {
         query_lower.contains("row_to_json(")
             || query_lower.contains("to_jsonb(")
             || query_lower.contains("to_json(")
+            || query_lower.contains("json_agg(")
+            || query_lower.contains("jsonb_agg(")
             || query_lower.contains("json_populate_record(")
             || query_lower.contains("json_populate_recordset(")
             || (query_lower.contains("update ") && query_lower.contains(" set"))
@@ -82,7 +84,7 @@ impl RowToJsonTranslator {
         use regex::Regex;
 
         let call_re = Regex::new(
-            r"(?i)(?:CAST\s*\(\s*(row_to_json|to_jsonb|to_json)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\)|(row_to_json|to_jsonb|to_json)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)(?:::([a-zA-Z_][a-zA-Z0-9_]*))?)"
+            r"(?i)(?:CAST\s*\(\s*(row_to_json|to_jsonb|to_json|json_agg|jsonb_agg)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\)|(row_to_json|to_jsonb|to_json|json_agg|jsonb_agg)\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\)(?:::([a-zA-Z_][a-zA-Z0-9_]*))?)"
         ).ok()?;
         if !call_re.is_match(query) {
             return None;
@@ -228,13 +230,18 @@ impl RowToJsonTranslator {
             }
 
             let has_id = cols.iter().any(|(name, _)| name == "id");
-            let replacement = if has_id {
+            let inner_obj = if has_id && fn_name != "json_agg" && fn_name != "jsonb_agg" {
                 format!(
                     "CASE WHEN {alias}.id IS NULL THEN NULL ELSE json_object({}) END",
                     json_args.join(", ")
                 )
             } else {
                 format!("json_object({})", json_args.join(", "))
+            };
+            let replacement = if fn_name == "json_agg" || fn_name == "jsonb_agg" {
+                format!("{fn_name}({inner_obj})")
+            } else {
+                inner_obj
             };
             result = result.replace(full_match, &replacement);
             let suggested = if let Some(ref ct) = cast_type {

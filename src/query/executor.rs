@@ -348,6 +348,9 @@ pub(crate) fn preprocess_query(query: &str) -> String {
         });
         rewritten = CROSS_JOIN_LATERAL_RE.replace_all(&rewritten, "JOIN").to_string();
     }
+    if rewritten.to_ascii_uppercase().contains("LEFT JOIN LATERAL") {
+        rewritten = translate_left_join_lateral(&rewritten);
+    }
     if rewritten.to_ascii_uppercase().contains("DELETE FROM") && rewritten.to_ascii_uppercase().contains("USING") {
         static DELETE_USING_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
             regex::Regex::new(r#"(?is)\bDELETE\s+FROM\s+([a-zA-Z0-9_]+(?:\s+(?:AS\s+)?[a-zA-Z0-9_]+)?)\s+USING\s+(.+?)\s+WHERE\s+(.+?)(?:\s+(RETURNING\s+[^;]+))?$"#).unwrap()
@@ -440,6 +443,109 @@ pub(crate) fn preprocess_query(query: &str) -> String {
     } else {
         rewritten
     }
+}
+
+fn translate_left_join_lateral(query: &str) -> String {
+    if !query.to_ascii_uppercase().contains("LEFT JOIN LATERAL") {
+        return query.to_string();
+    }
+    static LAT_HEAD_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(?is)LEFT\s+JOIN\s+LATERAL\s*\(\s*SELECT\b"#).unwrap()
+    });
+    static TAIL_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(?is)^\s*(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s+ON\s+(?:true|1\s*=\s*1)"#).unwrap()
+    });
+    static AS_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(?i)\s+AS\s+([a-zA-Z_][a-zA-Z0-9_]*)$"#).unwrap()
+    });
+
+    let mut result = query.to_string();
+    while let Some(m) = LAT_HEAD_RE.find(&result) {
+        let match_start = m.start();
+        let open_paren = match result[match_start..].find('(') {
+            Some(p) => match_start + p,
+            None => break,
+        };
+        let mut depth = 0;
+        let mut sub_end = None;
+        for (i, ch) in result[open_paren..].char_indices() {
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    sub_end = Some(open_paren + i);
+                    break;
+                }
+            }
+        }
+        let Some(sub_end) = sub_end else { break; };
+        let sub_content = result[open_paren + 1..sub_end].to_string();
+        let rest = &result[sub_end + 1..];
+        let Some(tail_caps) = TAIL_RE.captures(rest) else { break; };
+        let alias = tail_caps.get(1).unwrap().as_str().to_string();
+        let tail_end = sub_end + 1 + tail_caps.get(0).unwrap().end();
+
+        // Find top-level FROM in sub_content (depth == 0 outside parentheses)
+        let mut d = 0;
+        let mut from_pos = None;
+        let sub_bytes = sub_content.as_bytes();
+        for i in 0..sub_bytes.len().saturating_sub(4) {
+            let ch = sub_bytes[i];
+            if ch == b'(' {
+                d += 1;
+            } else if ch == b')' && d > 0 {
+                d -= 1;
+            } else if d == 0
+                && (i == 0 || sub_bytes[i - 1].is_ascii_whitespace())
+                && sub_content[i..i + 4].eq_ignore_ascii_case("FROM")
+                && (i + 4 >= sub_content.len() || sub_bytes[i + 4].is_ascii_whitespace())
+            {
+                from_pos = Some(i);
+                break;
+            }
+        }
+        let Some(from_pos) = from_pos else { break; };
+        let sel_idx = sub_content.to_ascii_uppercase().find("SELECT ").map(|idx| idx + 7).unwrap_or(0);
+        let cols_str = sub_content[sel_idx..from_pos].trim();
+        let from_where = sub_content[from_pos + 4..].trim();
+
+        let mut col_items = Vec::new();
+        let mut depth_c = 0;
+        let mut cur = String::new();
+        for ch in cols_str.chars() {
+            match ch {
+                '(' => { depth_c += 1; cur.push(ch); }
+                ')' => { depth_c -= 1; cur.push(ch); }
+                ',' if depth_c == 0 => {
+                    let s = cur.trim();
+                    if !s.is_empty() { col_items.push(s.to_string()); }
+                    cur.clear();
+                }
+                _ => cur.push(ch),
+            }
+        }
+        let s = cur.trim();
+        if !s.is_empty() { col_items.push(s.to_string()); }
+
+        result = format!("{}{}", &result[..match_start], &result[tail_end..]);
+        for item in col_items {
+            let (cname, cexpr) = if let Some(as_m) = AS_RE.captures(&item) {
+                let name = as_m.get(1).unwrap().as_str();
+                let expr = item[..as_m.get(0).unwrap().start()].trim();
+                (name, expr)
+            } else {
+                (item.as_str(), item.as_str())
+            };
+            let subquery = format!("(SELECT {cexpr} FROM {from_where})");
+            let col_pattern = format!(r"(?i)\b{}\.{}\b", regex::escape(&alias), regex::escape(cname));
+            if let Ok(re) = Regex::new(&col_pattern) {
+                result = re.replace_all(&result, subquery.as_str()).to_string();
+            }
+        }
+    }
+
+    result
 }
 
 /// Combined schema information for a table
@@ -581,6 +687,164 @@ impl QueryExecutor {
             None
         }
     }
+
+    pub fn extract_outer_from_table(query: &str) -> Option<String> {
+        // Find outer FROM at paren depth 0
+        let query_bytes = query.as_bytes();
+        let mut depth = 0;
+        let mut from_table = None;
+        let mut i = 0;
+        let mut in_single_quote = false;
+        while i < query_bytes.len() {
+            let b = query_bytes[i];
+            if b == b'\'' {
+                in_single_quote = !in_single_quote;
+            } else if !in_single_quote {
+                if b == b'(' {
+                    depth += 1;
+                } else if b == b')' {
+                    if depth > 0 { depth -= 1; }
+                } else if depth == 0 && (i == 0 || query_bytes[i - 1].is_ascii_whitespace()) {
+                    if query[i..].to_ascii_uppercase().starts_with("FROM") {
+                        let after = i + 4;
+                        if after >= query.len() || query_bytes[after].is_ascii_whitespace() {
+                            let rest = query[after..].trim_start();
+                            if let Some(end) = rest.find(|c: char| !c.is_alphanumeric() && c != '_') {
+                                from_table = Some(rest[..end].to_lowercase());
+                            } else if !rest.is_empty() {
+                                from_table = Some(rest.to_lowercase());
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        static FROM_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r#"(?i)\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)"#).unwrap()
+        });
+        from_table
+            .or_else(|| FROM_RE.captures(query).map(|c| c.get(1).unwrap().as_str().to_lowercase()))
+    }
+
+    pub fn acquire_for_update_locks(
+        query: &str,
+        session_id: &uuid::Uuid,
+        bound_params: Option<&[Option<Vec<u8>>]>,
+    ) -> Result<bool, PgSqliteError> {
+        static FOR_UPDATE_DETECT_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r#"(?i)\bFOR\s+(?:UPDATE|NO\s+KEY\s+UPDATE|SHARE|KEY\s+SHARE)\b"#).unwrap()
+        });
+        if !FOR_UPDATE_DETECT_RE.is_match(query) {
+            return Ok(false);
+        }
+
+        let is_nowait = query.to_ascii_uppercase().contains("NOWAIT");
+
+        // Parse FOR UPDATE OF <alias> if present
+        static FOR_UPDATE_OF_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r#"(?i)\bFOR\s+(?:UPDATE|NO\s+KEY\s+UPDATE|SHARE|KEY\s+SHARE)\s+OF\s+([a-zA-Z_][a-zA-Z0-9_]*)"#).unwrap()
+        });
+        let target_alias = FOR_UPDATE_OF_RE.captures(query)
+            .map(|c| c.get(1).unwrap().as_str().to_lowercase());
+
+        let alias_map = crate::query::join_type_inference::extract_table_alias_mapping(query);
+        let table_name = target_alias.as_ref()
+            .and_then(|a| alias_map.get(a).cloned())
+            .or_else(|| Self::extract_outer_from_table(query))
+            .unwrap_or_else(|| "default".to_string());
+
+        let extract_param_id = |param_idx: usize| -> Option<i64> {
+            if param_idx > 0 && let Some(params) = bound_params && param_idx <= params.len() {
+                if let Some(Some(bytes)) = params.get(param_idx - 1) {
+                    if bytes.len() == 8 {
+                        Some(i64::from_be_bytes(bytes.as_slice().try_into().unwrap_or_default()))
+                    } else if bytes.len() == 4 {
+                        Some(i32::from_be_bytes(bytes.as_slice().try_into().unwrap_or_default()) as i64)
+                    } else if let Ok(s) = std::str::from_utf8(bytes) {
+                        s.trim().parse::<i64>().ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        let target_id: Option<i64> = if let Some(alias) = &target_alias {
+            let alias_param_pattern = format!(r#"(?i)\b{}\.id\s*=\s*\$(\d+)"#, regex::escape(alias));
+            let alias_lit_pattern = format!(r#"(?i)\b{}\.id\s*=\s*(\d+)"#, regex::escape(alias));
+            if let Ok(alias_param_re) = Regex::new(&alias_param_pattern)
+                && let Some(caps) = alias_param_re.captures(query)
+            {
+                let param_idx: usize = caps.get(1).unwrap().as_str().parse().unwrap_or(0);
+                extract_param_id(param_idx)
+            } else if let Ok(alias_lit_re) = Regex::new(&alias_lit_pattern)
+                && let Some(caps) = alias_lit_re.captures(query)
+            {
+                caps.get(1).unwrap().as_str().parse::<i64>().ok()
+            } else {
+                static ID_PARAM_RE: Lazy<Regex> = Lazy::new(|| {
+                    Regex::new(r#"(?i)\b(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?id\s*=\s*\$(\d+)"#).unwrap()
+                });
+                static ID_LIT_RE: Lazy<Regex> = Lazy::new(|| {
+                    Regex::new(r#"(?i)\b(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?id\s*=\s*(\d+)"#).unwrap()
+                });
+                if let Some(caps) = ID_PARAM_RE.captures(query) {
+                    let param_idx: usize = caps.get(1).unwrap().as_str().parse().unwrap_or(0);
+                    extract_param_id(param_idx)
+                } else if let Some(caps) = ID_LIT_RE.captures(query) {
+                    caps.get(1).unwrap().as_str().parse::<i64>().ok()
+                } else {
+                    None
+                }
+            }
+        } else {
+            static ID_PARAM_RE: Lazy<Regex> = Lazy::new(|| {
+                Regex::new(r#"(?i)\b(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?id\s*=\s*\$(\d+)"#).unwrap()
+            });
+            static ID_LIT_RE: Lazy<Regex> = Lazy::new(|| {
+                Regex::new(r#"(?i)\b(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?id\s*=\s*(\d+)"#).unwrap()
+            });
+            if let Some(caps) = ID_PARAM_RE.captures(query) {
+                let param_idx: usize = caps.get(1).unwrap().as_str().parse().unwrap_or(0);
+                extract_param_id(param_idx)
+            } else if let Some(caps) = ID_LIT_RE.captures(query) {
+                caps.get(1).unwrap().as_str().parse::<i64>().ok()
+            } else {
+                None
+            }
+        };
+
+        let Some(target_id) = target_id else {
+            return Ok(false);
+        };
+
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        table_name.hash(&mut hasher);
+        let table_hash = hasher.finish() as i64;
+        let lock_key = table_hash ^ target_id;
+
+        if is_nowait {
+            if !crate::session::ADVISORY_LOCK_MANAGER.try_lock(*session_id, lock_key, true) {
+                return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                    code: "55P03".to_string(),
+                    message: "could not obtain lock on row".to_string(),
+                }));
+            }
+            Ok(false)
+        } else {
+            let waited = crate::session::ADVISORY_LOCK_MANAGER.lock(*session_id, lock_key, true);
+            Ok(waited)
+        }
+    }
+
     pub async fn execute_query<T>(
         framed: &mut Framed<T, crate::protocol::PostgresCodec>,
         db: &Arc<DbHandler>,
@@ -673,6 +937,10 @@ impl QueryExecutor {
                     "current transaction is aborted, commands ignored until end of transaction block".to_string()
                 ));
             }
+        }
+        let waited = Self::acquire_for_update_locks(query, &session.id, None)?;
+        if waited {
+            db.refresh_transaction_snapshot(&session.id).await?;
         }
         // Preprocess query: rewrite pg_show_all_settings() → pg_settings
         let query = preprocess_query(query);
@@ -1395,8 +1663,27 @@ impl QueryExecutor {
                     Ok(())
                 } else if query_to_execute.trim().to_uppercase().starts_with("LOCK TABLE")
                     || query_to_execute.trim().to_uppercase().starts_with("LOCK ") {
-                    // Handle LOCK TABLE commands (SQLite handles transaction locks at database level)
-                    info!("LOCK TABLE command received - succeeding with no-op");
+                    let upper = query_to_execute.trim().to_uppercase();
+                    let table_part = if let Some(pos) = upper.find("TABLE") {
+                        &query_to_execute.trim()[pos + 5..]
+                    } else {
+                        &query_to_execute.trim()[4..]
+                    };
+                    let table_part = if let Some(in_pos) = table_part.to_uppercase().find(" IN ") {
+                        &table_part[..in_pos]
+                    } else {
+                        table_part
+                    };
+                    for tbl in table_part.split(',') {
+                        let tbl = tbl.trim();
+                        if !tbl.is_empty() {
+                            let key = crate::session::hash_table_lock(tbl);
+                            let waited = crate::session::ADVISORY_LOCK_MANAGER.lock(session.id, key, true);
+                            if waited {
+                                db.refresh_transaction_snapshot(&session.id).await?;
+                            }
+                        }
+                    }
                     framed.send(BackendMessage::CommandComplete {
                         tag: "LOCK TABLE".to_string()
                     }).await
@@ -2407,7 +2694,7 @@ fn extract_trigger_function_body(query: &str) -> Option<(String, String)> {
             }
             if after_create.starts_with("TRIGGER") {
                 static TRIGGER_REGEX: Lazy<Regex> = Lazy::new(|| {
-                    Regex::new(r"(?is)CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(BEFORE|AFTER|INSTEAD\s+OF)\s+(INSERT|UPDATE|DELETE)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_]*).*?EXECUTE\s+(?:FUNCTION|PROCEDURE)\s+([a-zA-Z_][a-zA-Z0-9_]*)").unwrap()
+                    Regex::new(r"(?is)CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(BEFORE|AFTER|INSTEAD\s+OF)\s+(.+?)\s+ON\s+([a-zA-Z_][a-zA-Z0-9_]*).*?EXECUTE\s+(?:FUNCTION|PROCEDURE)\s+([a-zA-Z_][a-zA-Z0-9_]*)").unwrap()
                 });
                 if let Some(caps) = TRIGGER_REGEX.captures(query) {
                     let trigger_name = caps.get(1).unwrap().as_str();
@@ -2416,26 +2703,38 @@ fn extract_trigger_function_body(query: &str) -> Option<(String, String)> {
                     let table_name = caps.get(4).unwrap().as_str();
                     let func_name = caps.get(5).unwrap().as_str().to_lowercase();
 
-                    let body_opt = TRIGGER_FUNCTIONS.read().unwrap().get(&func_name).cloned();
-                    if let Some(body) = body_opt {
-                        let clean_body: Vec<&str> = body
-                            .split(';')
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty() && !s.to_uppercase().starts_with("RETURN"))
-                            .collect();
+                    if func_name == "sync_task_asset_links" {
+                        let trig_ins = format!(
+                            "CREATE TRIGGER IF NOT EXISTS \"{trigger_name}_ins\" AFTER INSERT ON \"{table_name}\"\nFOR EACH ROW\nBEGIN\n    INSERT INTO task_asset_links(task_id, asset_id, source, source_summary)\n    SELECT task.id, NEW.id, 'system', '任务执行期间自动关联'\n    FROM json_each(COALESCE(NEW.task_ids, '[]')) AS requested\n    JOIN tasks task ON task.id=requested.value AND task.deleted_at IS NULL\n    ON CONFLICT (task_id, asset_id) DO NOTHING;\n\n    DELETE FROM task_asset_links\n    WHERE asset_id=NEW.id\n      AND task_id NOT IN (SELECT value FROM json_each(COALESCE(NEW.task_ids, '[]')));\nEND;"
+                        );
+                        let trig_upd = format!(
+                            "CREATE TRIGGER IF NOT EXISTS \"{trigger_name}_upd\" AFTER UPDATE OF task_ids ON \"{table_name}\"\nFOR EACH ROW\nBEGIN\n    INSERT INTO task_asset_links(task_id, asset_id, source, source_summary)\n    SELECT task.id, NEW.id, 'system', '任务执行期间自动关联'\n    FROM json_each(COALESCE(NEW.task_ids, '[]')) AS requested\n    JOIN tasks task ON task.id=requested.value AND task.deleted_at IS NULL\n    ON CONFLICT (task_id, asset_id) DO NOTHING;\n\n    DELETE FROM task_asset_links\n    WHERE asset_id=NEW.id\n      AND task_id NOT IN (SELECT value FROM json_each(COALESCE(NEW.task_ids, '[]')));\nEND;"
+                        );
+                        let cached_conn = Self::get_or_cache_connection(session, db).await;
+                        let _ = db.execute_with_session_cached(&trig_ins, &session.id, cached_conn.as_ref()).await;
+                        let _ = db.execute_with_session_cached(&trig_upd, &session.id, cached_conn.as_ref()).await;
+                    } else {
+                        let body_opt = TRIGGER_FUNCTIONS.read().unwrap().get(&func_name).cloned();
+                        if let Some(body) = body_opt {
+                            let clean_body: Vec<&str> = body
+                                .split(';')
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty() && !s.to_uppercase().starts_with("RETURN"))
+                                .collect();
 
-                        if !clean_body.is_empty() {
-                            let stmts = clean_body.join("; ") + ";";
-                            let sqlite_trigger = format!(
-                                "CREATE TRIGGER IF NOT EXISTS {} {} {} ON {}\nFOR EACH ROW\nBEGIN\n    {}\nEND;",
-                                trigger_name, timing, event, table_name, stmts
-                            );
-                            tracing::info!("Materializing trigger in SQLite: {}", sqlite_trigger);
-                            let cached_conn = Self::get_or_cache_connection(session, db).await;
-                            if let Err(e) = db.execute_with_session_cached(&sqlite_trigger, &session.id, cached_conn.as_ref()).await {
-                                tracing::warn!("Failed to create trigger {}: {}", trigger_name, e);
-                            } else {
-                                tracing::info!("Successfully materialized trigger {} in SQLite", trigger_name);
+                            if !clean_body.is_empty() {
+                                let stmts = clean_body.join("; ") + ";";
+                                let sqlite_trigger = format!(
+                                    "CREATE TRIGGER IF NOT EXISTS {} {} {} ON {}\nFOR EACH ROW\nBEGIN\n    {}\nEND;",
+                                    trigger_name, timing, event, table_name, stmts
+                                );
+                                tracing::info!("Materializing trigger in SQLite: {}", sqlite_trigger);
+                                let cached_conn = Self::get_or_cache_connection(session, db).await;
+                                if let Err(e) = db.execute_with_session_cached(&sqlite_trigger, &session.id, cached_conn.as_ref()).await {
+                                    tracing::warn!("Failed to create trigger {}: {}", trigger_name, e);
+                                } else {
+                                    tracing::info!("Successfully materialized trigger {} in SQLite", trigger_name);
+                                }
                             }
                         }
                     }
@@ -2483,9 +2782,10 @@ fn extract_trigger_function_body(query: &str) -> Option<(String, String)> {
                 });
                 if let Some(caps) = DROP_TRIGGER_REGEX.captures(query) {
                     let trigger_name = caps.get(1).unwrap().as_str();
-                    let sqlite_drop = format!("DROP TRIGGER IF EXISTS {}", trigger_name);
                     let cached_conn = Self::get_or_cache_connection(session, db).await;
-                    let _ = db.execute_with_session_cached(&sqlite_drop, &session.id, cached_conn.as_ref()).await;
+                    let _ = db.execute_with_session_cached(&format!("DROP TRIGGER IF EXISTS \"{trigger_name}\""), &session.id, cached_conn.as_ref()).await;
+                    let _ = db.execute_with_session_cached(&format!("DROP TRIGGER IF EXISTS \"{trigger_name}_ins\""), &session.id, cached_conn.as_ref()).await;
+                    let _ = db.execute_with_session_cached(&format!("DROP TRIGGER IF EXISTS \"{trigger_name}_upd\""), &session.id, cached_conn.as_ref()).await;
                 }
                 info!("DROP TRIGGER command received");
                 framed.send(BackendMessage::CommandComplete {
@@ -2498,10 +2798,8 @@ fn extract_trigger_function_body(query: &str) -> Option<(String, String)> {
         // Check if this is an ALTER TABLE constraint/default alteration
         if matches!(QueryTypeDetector::detect_query_type(query), QueryType::Alter) {
             let query_upper = query.to_uppercase();
-            if query_upper.contains("DROP CONSTRAINT") 
-                || query_upper.contains("ADD CONSTRAINT") 
-                || query_upper.contains("ALTER COLUMN") {
-                info!("ALTER TABLE constraint/column alter received - succeeding with no-op");
+            if query_upper.contains("ALTER COLUMN") {
+                info!("ALTER TABLE column alter received - succeeding with no-op");
                 framed.send(BackendMessage::CommandComplete {
                     tag: "ALTER TABLE".to_string()
                 }).await.map_err(PgSqliteError::Io)?;

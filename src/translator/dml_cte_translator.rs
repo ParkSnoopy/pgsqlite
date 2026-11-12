@@ -124,6 +124,29 @@ impl DmlCteTranslator {
             }
         }
 
+        // Try read-only CTE + INSERT CTE:
+        // e.g. WITH requested(...) AS ( ... ), inserted AS ( INSERT INTO task_scope(...) ... RETURNING ... ) SELECT count(*) FROM inserted
+        static CTE_INSERT_COUNT_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r#"(?is)^\s*WITH\s+([\s\S]+?),\s*([a-zA-Z0-9_]+)\s+AS\s*\(\s*(INSERT\s+INTO\s+[\s\S]+?)\s+RETURNING\s+[\s\S]+?\)\s*SELECT\s+count\(\*\)\s+FROM\s+([a-zA-Z0-9_]+)\s*;?\s*$"#).unwrap()
+        });
+        if let Some(caps) = CTE_INSERT_COUNT_RE.captures(trimmed) {
+            let cte1 = caps.get(1)?.as_str().trim();
+            let ins_name = caps.get(2)?.as_str();
+            let ins_stmt = caps.get(3)?.as_str().trim();
+            let from_tbl = caps.get(4)?.as_str();
+
+            if ins_name.eq_ignore_ascii_case(from_tbl) {
+                let from_idx = ins_stmt.to_ascii_uppercase().find("FROM ")?;
+                let mut from_part = ins_stmt[from_idx + 5..].trim();
+                if let Some(order_idx) = from_part.to_ascii_uppercase().find("ORDER BY ") {
+                    from_part = from_part[..order_idx].trim();
+                }
+                return Some(format!(
+                    "WITH {cte1}\n{ins_stmt}\nRETURNING (SELECT count(*) FROM {from_part}) AS count"
+                ));
+            }
+        }
+
         None
     }
 }
@@ -186,5 +209,27 @@ FROM selected, updated"#;
         assert!(translated.starts_with("UPDATE tasks SET category_id=$2"));
         assert!(translated.contains("EXISTS (SELECT 1 FROM task_categories WHERE id=$2)"));
         assert!(translated.contains("RETURNING (SELECT id FROM task_categories WHERE id=$2) AS id"));
+    }
+
+    #[test]
+    fn test_translate_insert_count_cte() {
+        let sql = r#"
+WITH requested(company_id, position) AS (
+    SELECT company_id, position
+    FROM unnest($2::bigint[]) WITH ORDINALITY AS requested(company_id, position)
+), inserted AS (
+    INSERT INTO task_scope(task_id, kind, company_id, source, reason)
+    SELECT $1, 'company', companies.id, 'manual', '작업 생성 시 연결된 회사'
+    FROM requested
+    JOIN companies ON companies.id=requested.company_id
+    ORDER BY requested.position
+    RETURNING company_id
+)
+SELECT count(*) FROM inserted"#;
+
+        let translated = DmlCteTranslator::translate(sql).expect("translation failed");
+        assert!(translated.starts_with("WITH requested(company_id, position) AS"));
+        assert!(translated.contains("INSERT INTO task_scope"));
+        assert!(translated.contains("RETURNING (SELECT count(*) FROM requested\n    JOIN companies ON companies.id=requested.company_id) AS count"));
     }
 }

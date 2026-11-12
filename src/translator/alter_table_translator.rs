@@ -33,6 +33,18 @@ pub enum AlterTableAction {
         new_table_name: String,
         sql: String,
     },
+    /// Add a check constraint.
+    AddConstraintCheck {
+        table_name: String,
+        constraint_name: String,
+        check_expr: String,
+    },
+    /// Drop a constraint.
+    DropConstraint {
+        table_name: String,
+        constraint_name: String,
+        if_exists: bool,
+    },
     /// Raw SQL fallback.
     RawSql {
         sql: String,
@@ -47,6 +59,35 @@ impl AlterTableTranslator {
         let trimmed = query.trim().trim_end_matches(';').trim();
         if !trimmed.to_uppercase().starts_with("ALTER TABLE") {
             return None;
+        }
+
+        static ADD_CONSTRAINT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r#"(?is)^\s*ALTER\s+TABLE\s+([^\s]+)\s+ADD\s+CONSTRAINT\s+([^\s]+)\s+CHECK\s*\((.*)\)(?:\s+NOT\s+VALID)?\s*$"#).unwrap()
+        });
+        static DROP_CONSTRAINT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r#"(?is)^\s*ALTER\s+TABLE\s+([^\s]+)\s+DROP\s+CONSTRAINT\s+(?:IF\s+EXISTS\s+)?([^\s;]+)\s*$"#).unwrap()
+        });
+
+        if let Some(caps) = ADD_CONSTRAINT_RE.captures(trimmed) {
+            let table_name = caps[1].to_string();
+            let constraint_name = caps[2].to_string();
+            let check_expr = caps[3].to_string();
+            return Some(vec![AlterTableAction::AddConstraintCheck {
+                table_name,
+                constraint_name,
+                check_expr,
+            }]);
+        }
+
+        if let Some(caps) = DROP_CONSTRAINT_RE.captures(trimmed) {
+            let table_name = caps[1].to_string();
+            let constraint_name = caps[2].to_string();
+            let if_exists = trimmed.to_uppercase().contains("IF EXISTS");
+            return Some(vec![AlterTableAction::DropConstraint {
+                table_name,
+                constraint_name,
+                if_exists,
+            }]);
         }
 
         let statements = Parser::parse_sql(&PostgreSqlDialect {}, trimmed).ok()?;
@@ -203,6 +244,42 @@ impl AlterTableTranslator {
                         rusqlite::params![clean_new, clean_old],
                     );
                 }
+                AlterTableAction::AddConstraintCheck { table_name, constraint_name, check_expr } => {
+                    let clean_tbl = table_name.trim_matches('"');
+                    let clean_con = constraint_name.trim_matches('"');
+                    let clean_expr = check_expr.trim();
+                    let _ = conn.execute(
+                        "INSERT OR REPLACE INTO pg_constraint (conname, contype, conrelid) VALUES (?1, 'c', (SELECT oid FROM pg_class WHERE relname = ?2))",
+                        rusqlite::params![clean_con, clean_tbl],
+                    );
+                    let col_names: Vec<String> = if let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info(\"{clean_tbl}\")")) {
+                        stmt.query_map([], |r| r.get::<_, String>(1))
+                            .map(|rows| rows.filter_map(Result::ok).collect())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let new_expr = prefix_check_columns(clean_expr, &col_names);
+                    let trig_ins = format!(
+                        "CREATE TRIGGER IF NOT EXISTS \"pg_chk_ins_{clean_con}\" BEFORE INSERT ON \"{clean_tbl}\"\nBEGIN\n    SELECT RAISE(FAIL, 'CHECK constraint failed: {clean_con}') WHERE NOT ({new_expr});\nEND;"
+                    );
+                    let trig_upd = format!(
+                        "CREATE TRIGGER IF NOT EXISTS \"pg_chk_upd_{clean_con}\" BEFORE UPDATE ON \"{clean_tbl}\"\nBEGIN\n    SELECT RAISE(FAIL, 'CHECK constraint failed: {clean_con}') WHERE NOT ({new_expr});\nEND;"
+                    );
+                    conn.execute(&trig_ins, [])?;
+                    conn.execute(&trig_upd, [])?;
+                }
+                AlterTableAction::DropConstraint { table_name: _, constraint_name, if_exists: _ } => {
+                    let clean_con = constraint_name.trim_matches('"');
+                    let _ = conn.execute(
+                        "DELETE FROM pg_constraint WHERE lower(conname) = lower(?1)",
+                        rusqlite::params![clean_con],
+                    );
+                    let drop_ins = format!("DROP TRIGGER IF EXISTS \"pg_chk_ins_{clean_con}\"");
+                    let drop_upd = format!("DROP TRIGGER IF EXISTS \"pg_chk_upd_{clean_con}\"");
+                    let _ = conn.execute(&drop_ins, []);
+                    let _ = conn.execute(&drop_upd, []);
+                }
                 AlterTableAction::RawSql { sql } => {
                     conn.execute(sql, [])?;
                 }
@@ -210,6 +287,42 @@ impl AlterTableTranslator {
         }
         Ok(())
     }
+}
+
+fn prefix_check_columns(expr: &str, col_names: &[String]) -> String {
+    if col_names.is_empty() {
+        return expr.to_string();
+    }
+    let parts: Vec<&str> = expr.split('\'').collect();
+    let ident_re = regex::Regex::new(r#"(?i)(?:\b([a-zA-Z_][a-zA-Z0-9_]*)\b|"([^"]+)")"#).unwrap();
+    let mut result_parts = Vec::new();
+
+    for (idx, part) in parts.iter().enumerate() {
+        if idx % 2 == 1 {
+            result_parts.push(part.to_string());
+        } else {
+            let mut last_end = 0;
+            let mut out = String::new();
+            for m in ident_re.find_iter(part) {
+                let start = m.start();
+                let end = m.end();
+                out.push_str(&part[last_end..start]);
+                let matched_text = m.as_str();
+                let clean_ident = matched_text.trim_matches('"');
+                let is_preceded_by_dot = start > 0 && part.as_bytes()[start - 1] == b'.';
+                if !is_preceded_by_dot && col_names.iter().any(|c| c.eq_ignore_ascii_case(clean_ident)) {
+                    out.push_str(&format!("NEW.\"{clean_ident}\""));
+                } else {
+                    out.push_str(matched_text);
+                }
+                last_end = end;
+            }
+            out.push_str(&part[last_end..]);
+            result_parts.push(out);
+        }
+    }
+
+    result_parts.join("'")
 }
 
 #[cfg(test)]
@@ -249,6 +362,23 @@ mod tests {
                 assert_eq!(table_name, "llm_records");
                 assert_eq!(column_name, "task_id");
                 assert!(if_not_exists);
+            }
+            _ => panic!("unexpected action"),
+        }
+    }
+
+    #[test]
+    fn test_parse_add_constraint_check_and_prefix() {
+        let sql = "ALTER TABLE mcp_servers ADD CONSTRAINT mcp_servers_transport_check CHECK (transport IN ('stdio','http','sse')) NOT VALID";
+        let actions = AlterTableTranslator::parse(sql).expect("parse failed");
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            AlterTableAction::AddConstraintCheck { table_name, constraint_name, check_expr } => {
+                assert_eq!(table_name, "mcp_servers");
+                assert_eq!(constraint_name, "mcp_servers_transport_check");
+                assert_eq!(check_expr, "transport IN ('stdio','http','sse')");
+                let prefixed = prefix_check_columns(check_expr, &["transport".to_string(), "name".to_string()]);
+                assert_eq!(prefixed, "NEW.\"transport\" IN ('stdio','http','sse')");
             }
             _ => panic!("unexpected action"),
         }

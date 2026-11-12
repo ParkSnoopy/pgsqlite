@@ -189,7 +189,7 @@ pub async fn handle_test_connection_with_pool(
     
     // Send backend key data
     framed.send(BackendMessage::BackendKeyData {
-        process_id: std::process::id() as i32,
+        process_id: crate::session::uuid_to_backend_pid(&session.id),
         secret_key: 12345,
     }).await?;
     

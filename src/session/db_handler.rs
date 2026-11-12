@@ -521,6 +521,8 @@ impl DbHandler {
         } else {
             query.to_string()
         };
+        crate::session::ADVISORY_LOCK_MANAGER.on_write_executed(session_id);
+        crate::session::ADVISORY_LOCK_MANAGER.on_write_start(session_id);
         let result = self.connection_manager.execute_with_session(session_id, |conn| {
             // Process query with fast path optimization
             let processed_query = process_query(&numbered_query, conn, &self.schema_cache)?;
@@ -619,7 +621,9 @@ impl DbHandler {
             }
             
             Ok(result)
-        })?;
+        });
+        crate::session::ADVISORY_LOCK_MANAGER.on_write_end(session_id);
+        let result = result?;
         
         // After the closure completes, check if we need WAL refresh
         let query_type = QueryTypeDetector::detect_query_type(query);
@@ -1945,6 +1949,7 @@ impl DbHandler {
         match cached_conn {
             Some(conn) => {
                 let _guard = crate::session::set_current_session(*session_id);
+                crate::session::ADVISORY_LOCK_MANAGER.on_write_executed(session_id);
                 self.connection_manager.execute_with_cached_connection(conn, |conn| {
                     // Process query with fast path optimization
                     let processed_query = process_query(query, conn, &self.schema_cache)?;
@@ -2014,8 +2019,9 @@ impl DbHandler {
             });
         }
 
-        self.connection_manager.execute_with_session(session_id, |conn| {
-            // Check if this is a CREATE TABLE statement that needs special handling
+        crate::session::ADVISORY_LOCK_MANAGER.on_write_executed(session_id);
+        crate::session::ADVISORY_LOCK_MANAGER.on_write_start(session_id);
+        let res = self.connection_manager.execute_with_session(session_id, |conn| {
             let (processed_query, type_mappings, _array_columns, _enum_columns) =
                 if query.trim_start().to_uppercase().starts_with("CREATE TABLE") {
                     debug!("Processing CREATE TABLE statement with translation...");
@@ -2143,25 +2149,57 @@ impl DbHandler {
                 rows: vec![],
                 rows_affected,
             })
-        })
+        });
+        crate::session::ADVISORY_LOCK_MANAGER.on_write_end(session_id);
+        res
     }
     
     /// Transaction control methods
     pub async fn begin_with_session(&self, session_id: &Uuid) -> Result<(), PgSqliteError> {
-        self.connection_manager.execute_with_session(session_id, |conn| {
+        crate::session::ADVISORY_LOCK_MANAGER.on_begin_start(session_id);
+        let res = self.connection_manager.execute_with_session(session_id, |conn| {
             conn.execute("BEGIN", [])?;
+            Ok(())
+        });
+        if res.is_ok() {
+            crate::session::ADVISORY_LOCK_MANAGER.on_begin_success(session_id);
+        } else {
+            crate::session::ADVISORY_LOCK_MANAGER.on_transaction_end(session_id);
+        }
+        res
+    }
+
+    pub async fn refresh_transaction_snapshot(&self, session_id: &Uuid) -> Result<(), PgSqliteError> {
+        if crate::session::ADVISORY_LOCK_MANAGER.has_written(session_id) {
+            debug!("refresh_transaction_snapshot: skipped because session {} has written", session_id);
+            return Ok(());
+        }
+        self.connection_manager.execute_with_session(session_id, |conn| {
+            if !conn.is_autocommit() {
+                if let Err(e) = conn.execute("ROLLBACK", []) {
+                    warn!("refresh_transaction_snapshot: ROLLBACK error: {}", e);
+                }
+                if let Err(e) = conn.execute("BEGIN", []) {
+                    warn!("refresh_transaction_snapshot: BEGIN error: {}", e);
+                } else {
+                    debug!("refresh_transaction_snapshot: successfully refreshed tx snapshot for session {}", session_id);
+                }
+            }
             Ok(())
         })
     }
     
     pub async fn commit(&self, session_id: &Uuid) -> Result<(), PgSqliteError> {
         // Execute the commit on the current session
-        self.connection_manager.execute_with_session(session_id, |conn| {
+        let res = self.connection_manager.execute_with_session(session_id, |conn| {
             conn.execute("COMMIT", [])?;
             Ok(())
-        })?;
+        });
         
         crate::session::ADVISORY_LOCK_MANAGER.release_xact_locks(session_id);
+        crate::session::ADVISORY_LOCK_MANAGER.on_transaction_end(session_id);
+
+        res?;
 
         // Force all other connections to refresh their WAL view (WAL mode only)
         // This ensures committed data is visible to all other sessions
@@ -2189,6 +2227,7 @@ impl DbHandler {
             Ok(())
         });
         crate::session::ADVISORY_LOCK_MANAGER.release_xact_locks(session_id);
+        crate::session::ADVISORY_LOCK_MANAGER.on_transaction_end(session_id);
         res
     }
     

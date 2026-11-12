@@ -97,8 +97,11 @@ pub fn register_system_functions(conn: &Connection) -> Result<()> {
         0,
         FunctionFlags::SQLITE_UTF8,
         |_ctx| {
-            // Return the current process ID
-            Ok(std::process::id() as i32)
+            if let Some(session_id) = crate::session::get_current_session() {
+                Ok(crate::session::uuid_to_backend_pid(&session_id))
+            } else {
+                Ok(std::process::id() as i32)
+            }
         },
     )?;
 
@@ -106,10 +109,14 @@ pub fn register_system_functions(conn: &Connection) -> Result<()> {
     conn.create_scalar_function(
         "pg_blocking_pids",
         1,
-        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-        |_ctx| {
-            // Emulate PostgreSQL blocking pids
-            Ok("{1}".to_string())
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let pid: i32 = ctx.get(0)?;
+            if let Some(blocker_pid) = crate::session::ADVISORY_LOCK_MANAGER.get_blocking_pid(pid) {
+                Ok(format!("{{{}}}", blocker_pid))
+            } else {
+                Ok("{}".to_string())
+            }
         },
     )?;
     

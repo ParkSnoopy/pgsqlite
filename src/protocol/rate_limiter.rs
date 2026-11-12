@@ -36,9 +36,9 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            max_requests: 1000,
+            max_requests: 10_000_000,
             window_duration: Duration::from_secs(60),
-            per_ip_limiting: true,
+            per_ip_limiting: false,
             max_tracked_ips: 10000,
             cleanup_interval: Duration::from_secs(300), // 5 minutes
         }
@@ -88,10 +88,10 @@ pub struct CircuitBreakerConfig {
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
-            failure_threshold: 50,
+            failure_threshold: 100_000,
             timeout_duration: Duration::from_secs(60),
             success_threshold: 10,
-            enabled: true,
+            enabled: false,
         }
     }
 }

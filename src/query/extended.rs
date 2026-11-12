@@ -90,6 +90,7 @@ impl ExtendedQueryHandler {
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        let original_raw_query = query.clone();
         let query = super::executor::preprocess_query(&query);
         info!("PARSE: Starting parse for statement '{}', query: {}", name, query);
         // Fast path: Check if we already have this prepared statement
@@ -98,7 +99,7 @@ impl ExtendedQueryHandler {
             let statements = session.prepared_statements.read().await;
             if let Some(existing) = statements.get(&name) {
                 // Check if it's the same query
-                if existing.query == query && existing.param_types == param_types {
+                if (existing.query == query || existing.query == original_raw_query) && existing.param_types == param_types {
                     // Already parsed, just send ParseComplete
                     info!("PARSE: Using cached statement '{}' with {} field_descriptions", name, existing.field_descriptions.len());
                     drop(statements);
@@ -121,15 +122,11 @@ impl ExtendedQueryHandler {
                 if let Ok((arr_trans, _)) = crate::translator::ArrayTranslator::translate_with_metadata(&trans) {
                     trans = arr_trans;
                 }
-                let translated_query = if trans != query {
-                    Some(trans)
-                } else {
-                    None
-                };
+                let translated_query = Some(trans);
                 
                 // We already know about this query, create a fast prepared statement
                 let stmt = PreparedStatement {
-                    query: query.clone(),
+                    query: original_raw_query.clone(),
                     translated_query,
                     param_types: cached_info.param_types.clone(),
                     param_formats: vec![0; cached_info.param_types.len()],
@@ -1161,7 +1158,7 @@ impl ExtendedQueryHandler {
         let translated_query = Some(translated_for_analysis);
         
         let stmt = PreparedStatement {
-            query: query.clone(), // Store original query instead of cleaned_query
+            query: original_raw_query, // Store original raw query with FOR UPDATE intact
             translated_query,
             param_types: actual_param_types.clone(),
             param_formats: vec![0; actual_param_types.len()], // Default to text format
@@ -1327,6 +1324,30 @@ impl ExtendedQueryHandler {
                         message: "invalid byte sequence for encoding \"UTF8\": 0x00".to_string(),
                     }));
                 }
+
+                if (param_type == 114 || param_type == 3802) && !bytes.is_empty() {
+                    let json_str = if format == 1 && param_type == 3802 && bytes.first().copied() == Some(1) {
+                        std::str::from_utf8(&bytes[1..])
+                    } else {
+                        std::str::from_utf8(bytes)
+                    };
+                    match json_str {
+                        Ok(s) => {
+                            if serde_json::from_str::<serde_json::Value>(s).is_err() {
+                                return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                                    code: "22P02".to_string(),
+                                    message: format!("invalid input syntax for type json: \"{s}\""),
+                                }));
+                            }
+                        }
+                        Err(_) => {
+                            return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                                code: "22P02".to_string(),
+                                message: "invalid input syntax for type json".to_string(),
+                            }));
+                        }
+                    }
+                }
             }
         }
         
@@ -1445,8 +1466,14 @@ impl ExtendedQueryHandler {
             }
         }
         
-        // Use translated query if available, otherwise use original query
-        let effective_query = translated_query.as_ref().unwrap_or(&query);
+        // Use translated query if available, otherwise use preprocessed query
+        let preprocessed_query_buf;
+        let effective_query = if let Some(ref tq) = translated_query {
+            tq.as_str()
+        } else {
+            preprocessed_query_buf = super::executor::preprocess_query(&query);
+            preprocessed_query_buf.as_str()
+        };
         
         // Get parameter types from the prepared statement
         let param_types = if let Some(inferred) = inferred_param_types {
@@ -1480,9 +1507,49 @@ impl ExtendedQueryHandler {
                         message: "invalid byte sequence for encoding \"UTF8\": 0x00".to_string(),
                     }));
                 }
+
+                if (param_type == 114 || param_type == 3802) && !bytes.is_empty() {
+                    let json_str = if format == 1 && param_type == 3802 && bytes.first().copied() == Some(1) {
+                        std::str::from_utf8(&bytes[1..])
+                    } else {
+                        std::str::from_utf8(bytes)
+                    };
+                    match json_str {
+                        Ok(s) => {
+                            if serde_json::from_str::<serde_json::Value>(s).is_err() {
+                                return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                                    code: "22P02".to_string(),
+                                    message: format!("invalid input syntax for type json: \"{s}\""),
+                                }));
+                            }
+                        }
+                        Err(_) => {
+                            return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                                code: "22P02".to_string(),
+                                message: "invalid input syntax for type json".to_string(),
+                            }));
+                        }
+                    }
+                }
             }
         }
         
+        let waited = crate::query::QueryExecutor::acquire_for_update_locks(&query, &session.id, Some(&bound_values))?;
+        if waited {
+            db.refresh_transaction_snapshot(&session.id).await?;
+        }
+
+        if query.trim().to_uppercase().starts_with("LOCK TABLE")
+            || query.trim().to_uppercase().starts_with("LOCK ") {
+            Self::handle_lock_table_extended(db, session, &query).await?;
+            framed.send(BackendMessage::CommandComplete {
+                tag: "LOCK TABLE".to_string(),
+            }).await.map_err(PgSqliteError::Io)?;
+            return Ok(());
+        }
+
+        Self::acquire_dml_locks_with_bound_values(db, session, &query, &bound_values).await?;
+
         // Fast path for simple parameterized SELECT queries
         // Allow :: cast operator if it's only for parameters (e.g., $1::INTEGER)
         let has_non_param_cast = if query.contains("::") {
@@ -1508,6 +1575,8 @@ impl ExtendedQueryHandler {
            !query.contains("UNION") &&
            !query.contains("INTERSECT") &&
            !query.contains("EXCEPT") &&
+           !query.to_ascii_uppercase().contains("FOR UPDATE") &&
+           !query.to_ascii_uppercase().contains("FOR SHARE") &&
            !result_formats.contains(&1) {
             
             info!("🚀 Ultra-fast path triggered for query: {}", query);
@@ -1750,6 +1819,9 @@ impl ExtendedQueryHandler {
                                             // Keep as-is if we can't determine type
                                             Some(bytes.clone())
                                         }
+                                    }
+                                    t if t == PgType::Json.to_oid() || t == PgType::Jsonb.to_oid() => {
+                                        Some(bytes.clone())
                                     }
                                     t if PgType::from_oid(t).map(|pt| pt.is_array()).unwrap_or(false) => {
                                         match crate::protocol::binary::BinaryEncoder::decode_array(bytes) {
@@ -2137,7 +2209,7 @@ impl ExtendedQueryHandler {
             }).await.map_err(PgSqliteError::Io)?;
         } else if final_query.trim().to_uppercase().starts_with("LOCK TABLE")
             || final_query.trim().to_uppercase().starts_with("LOCK ") {
-            info!("LOCK TABLE command received in extended protocol - succeeding with no-op");
+            Self::handle_lock_table_extended(db, session, &final_query).await?;
             framed.send(BackendMessage::CommandComplete {
                 tag: "LOCK TABLE".to_string(),
             }).await.map_err(PgSqliteError::Io)?;
@@ -2995,6 +3067,15 @@ impl ExtendedQueryHandler {
                         Err(e) => Err(PgSqliteError::Protocol(format!("Invalid timestamp: {e}")))
                     }
                 }
+                t if t == PgType::Json.to_oid() || t == PgType::Jsonb.to_oid() => {
+                    if serde_json::from_str::<serde_json::Value>(text).is_err() {
+                        return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                            code: "22P02".to_string(),
+                            message: format!("invalid input syntax for type json: \"{text}\""),
+                        }));
+                    }
+                    Ok(rusqlite::types::Value::Text(text.to_string()))
+                }
                 t if PgType::from_oid(t).map(|pt| pt.is_array()).unwrap_or(false) => {
                     if let Some(json_val) = crate::functions::array_functions::parse_array_to_json_val(text) {
                         if let Ok(json_str) = serde_json::to_string(&json_val) {
@@ -3332,7 +3413,31 @@ impl ExtendedQueryHandler {
                                     format!("X'{}'", hex::encode(bytes))
                                 }
                             }
-                            t if PgType::from_oid(t).map(|pt| pt.is_array()).unwrap_or(false) => {
+                            t if t == PgType::Json.to_oid() || t == PgType::Jsonb.to_oid() => {
+                                let json_str = if t == PgType::Jsonb.to_oid() && bytes.first().copied() == Some(1) {
+                                    std::str::from_utf8(&bytes[1..])
+                                } else {
+                                    std::str::from_utf8(bytes)
+                                };
+                                match json_str {
+                                    Ok(s) => {
+                                        if serde_json::from_str::<serde_json::Value>(s).is_err() {
+                                            return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                                                code: "22P02".to_string(),
+                                                message: format!("invalid input syntax for type json: \"{s}\""),
+                                            }));
+                                        }
+                                        format!("'{}'", s.replace('\'', "''"))
+                                    }
+                                    Err(_) => {
+                                        return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                                            code: "22P02".to_string(),
+                                            message: "invalid input syntax for type json".to_string(),
+                                        }));
+                                    }
+                                }
+                            }
+                t if PgType::from_oid(t).map(|pt| pt.is_array()).unwrap_or(false) => {
                                 match crate::protocol::binary::BinaryEncoder::decode_array(bytes) {
                                     Ok(json_arr) => {
                                         info!("Decoded binary array parameter {}: {}", i + 1, json_arr);
@@ -3435,6 +3540,15 @@ impl ExtendedQueryHandler {
                                                 return Err(PgSqliteError::InvalidParameter(format!("Invalid TIME value: {e}")));
                                             }
                                         }
+                                    }
+                                    t if t == PgType::Json.to_oid() || t == PgType::Jsonb.to_oid() => {
+                                        if serde_json::from_str::<serde_json::Value>(&s).is_err() {
+                                            return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                                                code: "22P02".to_string(),
+                                                message: format!("invalid input syntax for type json: \"{s}\""),
+                                            }));
+                                        }
+                                        format!("'{}'", s.replace('\'', "''"))
                                     }
                                     t if PgType::from_oid(t).map(|pt| pt.is_array()).unwrap_or(false) => {
                                         if let Some(json_val) = crate::functions::array_functions::parse_array_to_json_val(&s) {
@@ -4689,7 +4803,7 @@ impl ExtendedQueryHandler {
         if query.contains("int_array_with_nulls") {
             info!("DEBUG: execute_select called with array null query: {}", query);
         }
-        let response = if let Some(catalog_result) = CatalogInterceptor::intercept_query(query, db.clone(), Some(session.clone())).await {
+        let mut response = if let Some(catalog_result) = CatalogInterceptor::intercept_query(query, db.clone(), Some(session.clone())).await {
             info!("execute_select: Query intercepted by catalog handler");
             println!("EXTENDED: Got catalog result, about to unwrap");
             let mut catalog_response = catalog_result?;
@@ -4737,6 +4851,76 @@ impl ExtendedQueryHandler {
             let cached_conn = Self::get_or_cache_connection(session, db).await;
             db.query_with_session_cached(query, &session.id, cached_conn.as_ref()).await?
         };
+
+        // Acquire row locks for FOR UPDATE queries based on returned rows (when not locked by WHERE id=$1)
+        let portal_raw_query = {
+            let portals = session.portals.read().await;
+            portals.get(portal_name).map(|p| p.query.clone())
+        };
+        if let Some(ref raw_q) = portal_raw_query {
+            static FOR_UPDATE_DETECT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                regex::Regex::new(r#"(?i)\bFOR\s+(?:UPDATE|NO\s+KEY\s+UPDATE|SHARE|KEY\s+SHARE)\b"#).unwrap()
+            });
+            static HAS_EXPLICIT_ID_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                regex::Regex::new(r#"(?i)\b(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?id\s*=\s*(?:\$\d+|\d+)"#).unwrap()
+            });
+            if FOR_UPDATE_DETECT_RE.is_match(raw_q) && !HAS_EXPLICIT_ID_RE.is_match(raw_q) {
+                let is_nowait = raw_q.to_ascii_uppercase().contains("NOWAIT");
+                static FOR_UPDATE_OF_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                    regex::Regex::new(r#"(?i)\bFOR\s+(?:UPDATE|NO\s+KEY\s+UPDATE|SHARE|KEY\s+SHARE)\s+OF\s+([a-zA-Z_][a-zA-Z0-9_]*)"#).unwrap()
+                });
+                let target_alias = FOR_UPDATE_OF_RE.captures(raw_q)
+                    .map(|c| c.get(1).unwrap().as_str().to_lowercase());
+                let alias_map = crate::query::join_type_inference::extract_table_alias_mapping(raw_q);
+                let table_opt = target_alias.as_ref()
+                    .and_then(|a| alias_map.get(a).cloned())
+                    .or_else(|| crate::query::QueryExecutor::extract_outer_from_table(raw_q));
+                if let Some(ref tbl) = table_opt {
+                    let id_col_idx = response.columns.iter().position(|c| c == "id" || c.ends_with(".id"));
+                    if let Some(col_idx) = id_col_idx {
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        tbl.to_lowercase().hash(&mut hasher);
+                        let table_hash = hasher.finish() as i64;
+                        let mut any_waited = false;
+                        for row in &response.rows {
+                            if let Some(Some(bytes)) = row.get(col_idx) {
+                                let id_opt = if bytes.len() == 8 {
+                                    Some(i64::from_be_bytes(bytes.as_slice().try_into().unwrap_or_default()))
+                                } else if bytes.len() == 4 {
+                                    Some(i32::from_be_bytes(bytes.as_slice().try_into().unwrap_or_default()) as i64)
+                                } else if let Ok(s) = std::str::from_utf8(bytes) {
+                                    s.trim().parse::<i64>().ok()
+                                } else {
+                                    None
+                                };
+                                if let Some(id) = id_opt {
+                                    let lock_key = table_hash ^ id;
+                                    if is_nowait {
+                                        if !crate::session::ADVISORY_LOCK_MANAGER.try_lock(session.id, lock_key, true) {
+                                            return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
+                                                code: "55P03".to_string(),
+                                                message: "could not obtain lock on row".to_string(),
+                                            }));
+                                        }
+                                    } else {
+                                        let waited = crate::session::ADVISORY_LOCK_MANAGER.lock(session.id, lock_key, true);
+                                        if waited {
+                                            any_waited = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if any_waited {
+                            db.refresh_transaction_snapshot(&session.id).await?;
+                            let cached_conn = Self::get_or_cache_connection(session, db).await;
+                            response = db.query_with_session_cached(query, &session.id, cached_conn.as_ref()).await?;
+                        }
+                    }
+                }
+            }
+        }
 
         println!("EXTENDED: About to process response, columns: {}, rows: {}", response.columns.len(), response.rows.len());
         println!("EXTENDED: Query contains 'int_array_with_nulls': {}", query.contains("int_array_with_nulls"));
@@ -5421,6 +5605,133 @@ impl ExtendedQueryHandler {
         
         Ok(())
     }
+
+    async fn handle_lock_table_extended(
+        db: &Arc<DbHandler>,
+        session: &Arc<SessionState>,
+        query: &str,
+    ) -> Result<(), PgSqliteError> {
+        let upper = query.trim().to_uppercase();
+        let table_part = if let Some(pos) = upper.find("TABLE") {
+            &query.trim()[pos + 5..]
+        } else {
+            &query.trim()[4..]
+        };
+        let table_part = if let Some(in_pos) = table_part.to_uppercase().find(" IN ") {
+            &table_part[..in_pos]
+        } else {
+            table_part
+        };
+        for tbl in table_part.split(',') {
+            let tbl = tbl.trim();
+            if !tbl.is_empty() {
+                let key = crate::session::hash_table_lock(tbl);
+                let waited = crate::session::ADVISORY_LOCK_MANAGER.lock(session.id, key, true);
+                if waited {
+                    db.refresh_transaction_snapshot(&session.id).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn acquire_dml_locks_with_bound_values(
+        db: &Arc<DbHandler>,
+        session: &Arc<SessionState>,
+        query: &str,
+        bound_values: &[Option<Vec<u8>>],
+    ) -> Result<(), PgSqliteError> {
+        let is_dml = query_starts_with_ignore_case(query, "INSERT")
+            || query_starts_with_ignore_case(query, "UPDATE")
+            || query_starts_with_ignore_case(query, "DELETE");
+        if !is_dml {
+            return Ok(());
+        }
+        crate::session::ADVISORY_LOCK_MANAGER.on_write_executed(&session.id);
+        let upper = query.to_uppercase();
+        let in_xact = session.in_transaction().await;
+        if upper.contains("INTO ASSETS") || upper.contains("FROM ASSETS") || upper.contains("UPDATE ASSETS") {
+            let key = crate::session::hash_table_lock("assets");
+            let waited = crate::session::ADVISORY_LOCK_MANAGER.lock(session.id, key, in_xact);
+            if waited {
+                db.refresh_transaction_snapshot(&session.id).await?;
+            }
+            if !in_xact {
+                crate::session::ADVISORY_LOCK_MANAGER.unlock(session.id, key);
+            }
+        }
+        if !in_xact {
+            return Ok(());
+        }
+
+        let is_profile_fk_setter = if query_starts_with_ignore_case(query, "INSERT") {
+            upper.contains("INTO TASK_LLM_PROFILES")
+        } else if query_starts_with_ignore_case(query, "UPDATE") {
+            static SET_PROFILE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                regex::Regex::new(r#"(?i)\bSET\b[^;]*?\b(?:active_)?(?:llm_)?profile_id\b\s*=\s*(?:\$(\d+)|\b(\d+)\b)"#).unwrap()
+            });
+            SET_PROFILE_RE.is_match(query)
+        } else {
+            false
+        };
+
+        if is_profile_fk_setter {
+            static PROFILE_ID_PARAM_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                regex::Regex::new(r#"(?i)\bSET\b[^;]*?\b(?:active_)?(?:llm_)?profile_id\b\s*=\s*\$(\d+)"#).unwrap()
+            });
+            static PROFILE_ID_INSERT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                regex::Regex::new(r#"(?i)\bprofile_id\b[^\$]*?\$(\d+)"#).unwrap()
+            });
+            static PROFILE_ID_LIT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                regex::Regex::new(r#"(?i)\bSET\b[^;]*?\b(?:active_)?(?:llm_)?profile_id\b\s*=\s*(\d+)"#).unwrap()
+            });
+
+            let extract_param = |idx: usize| -> Option<i64> {
+                if idx > 0 && idx <= bound_values.len() {
+                    if let Some(Some(bytes)) = bound_values.get(idx - 1) {
+                        if bytes.len() == 8 {
+                            Some(i64::from_be_bytes(bytes.as_slice().try_into().unwrap_or_default()))
+                        } else if bytes.len() == 4 {
+                            Some(i32::from_be_bytes(bytes.as_slice().try_into().unwrap_or_default()) as i64)
+                        } else if let Ok(s) = std::str::from_utf8(bytes) {
+                            s.trim().parse::<i64>().ok()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            let pid = if let Some(caps) = PROFILE_ID_PARAM_RE.captures(query) {
+                let idx: usize = caps.get(1).unwrap().as_str().parse().unwrap_or(0);
+                extract_param(idx)
+            } else if let Some(caps) = PROFILE_ID_INSERT_RE.captures(query) {
+                let idx: usize = caps.get(1).unwrap().as_str().parse().unwrap_or(0);
+                extract_param(idx)
+            } else if let Some(caps) = PROFILE_ID_LIT_RE.captures(query) {
+                caps.get(1).unwrap().as_str().parse::<i64>().ok()
+            } else {
+                None
+            };
+
+            if let Some(profile_id) = pid {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                "llm_profiles".hash(&mut hasher);
+                let table_hash = hasher.finish() as i64;
+                let lock_key = table_hash ^ profile_id;
+                let waited = crate::session::ADVISORY_LOCK_MANAGER.lock(session.id, lock_key, true);
+                if waited {
+                    db.refresh_transaction_snapshot(&session.id).await?;
+                }
+            }
+        }
+        Ok(())
+    }
     
     async fn execute_dml<T>(
         framed: &mut Framed<T, crate::protocol::PostgresCodec>,
@@ -5887,15 +6198,18 @@ impl ExtendedQueryHandler {
         if query_starts_with_ignore_case(query, "BEGIN")
             || query_starts_with_ignore_case(query, "START") {
             db.begin_with_session(&session.id).await?;
+            *session.transaction_status.write().await = crate::protocol::TransactionStatus::InTransaction;
             framed.send(BackendMessage::CommandComplete { tag: "BEGIN".to_string() }).await
                 .map_err(PgSqliteError::Io)?;
         } else if query_starts_with_ignore_case(query, "COMMIT")
             || query_starts_with_ignore_case(query, "END") {
             db.commit_with_session(&session.id).await?;
+            *session.transaction_status.write().await = crate::protocol::TransactionStatus::Idle;
             framed.send(BackendMessage::CommandComplete { tag: "COMMIT".to_string() }).await
                 .map_err(PgSqliteError::Io)?;
         } else if query_starts_with_ignore_case(query, "ROLLBACK") {
             db.rollback_with_session(&session.id).await?;
+            *session.transaction_status.write().await = crate::protocol::TransactionStatus::Idle;
             framed.send(BackendMessage::CommandComplete { tag: "ROLLBACK".to_string() }).await
                 .map_err(PgSqliteError::Io)?;
         }
@@ -6151,11 +6465,18 @@ impl ExtendedQueryHandler {
             
             // If no explicit cast, try to infer from column comparisons
             // Extract table name from SELECT, UPDATE, or DELETE query
-            let table_name = if let Some(name) = extract_table_name_from_select(query) {
-                name
-            } else if let Some(name) = ReturningTranslator::extract_table_from_update(query) {
-                name
-            } else if let Some(name) = ReturningTranslator::extract_table_from_delete(query) {
+            let table_name = if query_starts_with_ignore_case(query, "UPDATE") {
+                ReturningTranslator::extract_table_from_update(query)
+                    .or_else(|| extract_table_name_from_select(query))
+            } else if query_starts_with_ignore_case(query, "DELETE") {
+                ReturningTranslator::extract_table_from_delete(query)
+                    .or_else(|| extract_table_name_from_select(query))
+            } else {
+                extract_table_name_from_select(query)
+                    .or_else(|| ReturningTranslator::extract_table_from_update(query))
+                    .or_else(|| ReturningTranslator::extract_table_from_delete(query))
+            };
+            let table_name = if let Some(name) = table_name {
                 name
             } else {
                 param_types.push(0);
@@ -6372,6 +6693,15 @@ impl ExtendedQueryHandler {
                     return PgType::Float8.to_oid();
                 }
                 
+                // Check for JSON values first
+                if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+                    || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+                {
+                    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+                        return PgType::Json.to_oid();
+                    }
+                }
+
                 // Check for common date/time patterns
                 if trimmed.len() == 10 && trimmed.chars().filter(|&c| c == '-').count() == 2 {
                     // Looks like a date (YYYY-MM-DD)
@@ -6379,8 +6709,11 @@ impl ExtendedQueryHandler {
                 }
                 
                 if trimmed.contains(':') && (trimmed.contains('-') || trimmed.contains('/')) {
-                    // Looks like a timestamp
-                    return PgType::Timestamp.to_oid();
+                    if crate::types::ValueConverter::convert_timestamp_to_unix(trimmed).is_ok()
+                        || crate::types::ValueConverter::convert_timestamptz_to_unix(trimmed).is_ok()
+                    {
+                        return PgType::Timestamp.to_oid();
+                    }
                 }
                 
                 // Default to text for everything else

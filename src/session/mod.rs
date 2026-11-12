@@ -18,4 +18,4 @@ pub use query_router::{QueryRouter, QueryRoute, QueryType, RouterError, RouterSt
 pub use portal_manager::{PortalManager, PortalExecutor, ManagedPortal, PortalExecutionState, CachedQueryResult};
 pub use connection_manager::{ConnectionManager, CURRENT_SESSION, CurrentSessionGuard, set_current_session, get_current_session};
 pub use thread_local_cache::ThreadLocalConnectionCache;
-pub use advisory_lock::{AdvisoryLockManager, ADVISORY_LOCK_MANAGER};
+pub use advisory_lock::{AdvisoryLockManager, ADVISORY_LOCK_MANAGER, uuid_to_backend_pid, hash_table_lock};
