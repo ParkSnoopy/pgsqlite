@@ -74,10 +74,21 @@ impl ConnectionManager {
         
         debug!("Creating connection for session {} with path: {}", session_id, self.db_path);
             
-        let conn = Connection::open_with_flags(&self.db_path, flags)
+        let mut conn = Connection::open_with_flags(&self.db_path, flags)
             .map_err(PgSqliteError::Sqlite)?;
-        conn.busy_timeout(std::time::Duration::from_millis(30000))
-            .map_err(PgSqliteError::Sqlite)?;
+        conn.busy_handler(Some(|count| {
+            if count < 10 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            } else if count < 50 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            } else if count < 200 {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            true
+        }))
+        .map_err(PgSqliteError::Sqlite)?;
         
         // Set pragmas
         let pragma_sql = format!(
@@ -86,7 +97,6 @@ impl ConnectionManager {
              PRAGMA cache_size = {};
              PRAGMA temp_store = MEMORY;
              PRAGMA mmap_size = {};
-             PRAGMA busy_timeout = 30000;
              PRAGMA foreign_keys = ON;",
             self.config.pragma_journal_mode,
             self.config.pragma_synchronous,
