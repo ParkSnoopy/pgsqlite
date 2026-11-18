@@ -51,6 +51,113 @@ impl CastTranslator {
         (translated, metadata)
     }
     
+    /// Remove parenthesized type modifiers like `(10, 2)` while preserving `[]` / time zone suffixes.
+    fn strip_type_modifiers(upper_type: &str) -> String {
+        let mut out = String::with_capacity(upper_type.len());
+        let mut depth = 0usize;
+        for ch in upper_type.chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => out.push(ch),
+                _ => {}
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Scan optional `(p, s)`, time zone suffix, and trailing `[]` after a matched base type name.
+    fn advance_past_modifiers_and_array(after: &str, mut end: usize) -> usize {
+        let bytes = after.as_bytes();
+        if bytes.get(end) == Some(&b'(') {
+            let mut depth = 0usize;
+            while end < bytes.len() {
+                match bytes[end] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        end += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                end += 1;
+            }
+        }
+        for tz_suffix in [" WITHOUT TIME ZONE", " WITH TIME ZONE"] {
+            if after[end..].to_uppercase().starts_with(tz_suffix) {
+                let cand = end + tz_suffix.len();
+                let next_ok = bytes
+                    .get(cand)
+                    .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_');
+                if next_ok {
+                    end = cand;
+                    break;
+                }
+            }
+        }
+        if bytes.get(end) == Some(&b'[') && bytes.get(end + 1) == Some(&b']') {
+            end += 2;
+        }
+        end
+    }
+
+    /// Translate non-ENUM PostgreSQL type casts cleanly into SQLite-compatible expressions.
+    fn translate_standard_cast(expr: &str, type_name: &str) -> String {
+        if type_name.eq_ignore_ascii_case("text") {
+            let clean_expr = if expr.starts_with('(') && expr.ends_with(')') {
+                &expr[1..expr.len() - 1]
+            } else {
+                expr
+            };
+
+            if clean_expr.contains('(')
+                || Self::is_aggregate_function(clean_expr)
+                || Self::might_need_text_cast(clean_expr)
+            {
+                if clean_expr.trim_start().starts_with("SELECT") {
+                    format!("CAST(({clean_expr}) AS TEXT)")
+                } else {
+                    format!("CAST({clean_expr} AS TEXT)")
+                }
+            } else {
+                clean_expr.to_string()
+            }
+        } else {
+            let sqlite_type = Self::postgres_to_sqlite_type(type_name);
+            let upper_type = Self::strip_type_modifiers(&type_name.to_uppercase());
+            match upper_type.as_str() {
+                "TIMESTAMP"
+                | "TIMESTAMP WITHOUT TIME ZONE"
+                | "TIMESTAMP WITH TIME ZONE"
+                | "TIMESTAMPTZ" => format!("pg_timestamp_from_text({expr})"),
+                "DATE" => format!("pg_date_from_text({expr})"),
+                "TIME"
+                | "TIME WITHOUT TIME ZONE"
+                | "TIME WITH TIME ZONE"
+                | "TIMETZ" => format!("pg_time_from_text({expr})"),
+                t if t.ends_with("[]") || t.ends_with(" ARRAY") => expr.to_string(),
+                _ => {
+                    if sqlite_type == "TEXT"
+                        && !matches!(
+                            upper_type.as_str(),
+                            "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING"
+                        )
+                    {
+                        expr.to_string()
+                    } else if expr.trim_start().starts_with("SELECT") {
+                        format!("CAST(({expr}) AS {sqlite_type})")
+                    } else {
+                        format!("CAST({expr} AS {sqlite_type})")
+                    }
+                }
+            }
+        }
+    }
+
     /// Extract metadata about cast expressions in the query
     fn extract_cast_metadata(query: &str) -> TranslationMetadata {
         let mut metadata = TranslationMetadata::new();
@@ -209,122 +316,11 @@ impl CastTranslator {
                 if Self::is_enum_type(conn, type_name) {
                     // For ENUM types, we validate the value
                     Self::translate_enum_cast(expr, type_name, conn)
-                } else if type_name.eq_ignore_ascii_case("text") {
-                    // For text cast, we need to handle parenthesized expressions carefully
-                    // Remove outer parentheses if present to avoid (CAST(...))
-                    let clean_expr = if expr.starts_with('(') && expr.ends_with(')') {
-                        &expr[1..expr.len()-1]
-                    } else {
-                        expr
-                    };
-                    
-                    // Always preserve cast for aggregate functions or complex expressions
-                    if clean_expr.contains('(') || Self::is_aggregate_function(clean_expr) || Self::might_need_text_cast(clean_expr) {
-                        // Check if this is a subquery that needs extra parentheses
-                        if clean_expr.trim_start().starts_with("SELECT") {
-                            format!("CAST(({clean_expr}) AS TEXT)")
-                        } else {
-                            format!("CAST({clean_expr} AS TEXT)")
-                        }
-                    } else {
-                        clean_expr.to_string()
-                    }
                 } else {
-                    // For other types, check if SQLite supports them
-                    let sqlite_type = Self::postgres_to_sqlite_type(type_name);
-                    
-                    // Special handling for timestamp/date/time types
-                    let upper_type = type_name.to_uppercase();
-                    match upper_type.as_str() {
-                        "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" | "TIMESTAMP WITH TIME ZONE" | "TIMESTAMPTZ" => {
-                            // Use pgsqlite's timestamp conversion function
-                            format!("pg_timestamp_from_text({expr})")
-                        }
-                        "DATE" => {
-                            // Use pgsqlite's date conversion function
-                            format!("pg_date_from_text({expr})")
-                        }
-                        "TIME" | "TIME WITHOUT TIME ZONE" | "TIME WITH TIME ZONE" | "TIMETZ" => {
-                            // Use pgsqlite's time conversion function
-                            format!("pg_time_from_text({expr})")
-                        }
-                        // Handle array types - arrays are stored as JSON strings in SQLite
-                        t if t.ends_with("[]") || t.ends_with(" ARRAY") => {
-                            // For array types, just return the expression without the cast
-                            // Arrays are stored as JSON strings in SQLite, so the cast is not needed
-                            expr.to_string()
-                        }
-                        _ => {
-                            // For non-datetime types, use regular cast logic
-                            // If postgres_to_sqlite_type returns TEXT and the original type is not a text type,
-                            // it means SQLite doesn't know this type
-                            if sqlite_type == "TEXT" && !matches!(upper_type.as_str(), "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING") {
-                                // Unknown type, just return the expression
-                                expr.to_string()
-                            } else if sqlite_type == upper_type.as_str() {
-                                // Same type name, use CAST
-                                // Check if expression is a subquery
-                                if expr.trim_start().starts_with("SELECT") {
-                                    format!("CAST(({expr}) AS {type_name})")
-                                } else {
-                                    format!("CAST({expr} AS {type_name})")
-                                }
-                            } else {
-                                // Use SQLite type
-                                // Check if expression is a subquery
-                                if expr.trim_start().starts_with("SELECT") {
-                                    format!("CAST(({expr}) AS {sqlite_type})")
-                                } else {
-                                    format!("CAST({expr} AS {sqlite_type})")
-                                }
-                            }
-                        }
-                    }
+                    Self::translate_standard_cast(expr, type_name)
                 }
             } else {
-                // No connection, use standard SQL cast
-                if type_name.eq_ignore_ascii_case("text") {
-                    // Remove outer parentheses if present
-                    let clean_expr = if expr.starts_with('(') && expr.ends_with(')') {
-                        &expr[1..expr.len()-1]
-                    } else {
-                        expr
-                    };
-                    // Keep CAST for expressions with function calls
-                    if clean_expr.contains('(') && clean_expr.contains(')') {
-                        // Check if this is a subquery that needs extra parentheses
-                        if clean_expr.trim_start().starts_with("SELECT") {
-                            format!("CAST(({clean_expr}) AS TEXT)")
-                        } else {
-                            format!("CAST({clean_expr} AS TEXT)")
-                        }
-                    } else {
-                        clean_expr.to_string()
-                    }
-                } else {
-                    // Special handling for timestamp/date/time types even without connection
-                    let upper_type = type_name.to_uppercase();
-                    match upper_type.as_str() {
-                        "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" | "TIMESTAMP WITH TIME ZONE" | "TIMESTAMPTZ" => {
-                            format!("pg_timestamp_from_text({expr})")
-                        }
-                        "DATE" => {
-                            format!("pg_date_from_text({expr})")
-                        }
-                        "TIME" | "TIME WITHOUT TIME ZONE" | "TIME WITH TIME ZONE" | "TIMETZ" => {
-                            format!("pg_time_from_text({expr})")
-                        }
-                        // Handle array types - arrays are stored as JSON strings in SQLite
-                        t if t.ends_with("[]") || t.ends_with(" ARRAY") => {
-                            // For array types, just return the expression without the cast
-                            // Arrays are stored as JSON strings in SQLite, so the cast is not needed
-                            expr.to_string()
-                        }
-                        _ => {
-                            format!("CAST({expr} AS {type_name})")
-                        }
-                    }
-                }
+                Self::translate_standard_cast(expr, type_name)
             };
             
             // If we trimmed a paren, add it back after the CAST
@@ -516,15 +512,12 @@ impl CastTranslator {
         
         for (pattern, len) in multiword_types {
             if upper_after.starts_with(pattern) {
-                // Make sure this is followed by a word boundary or end of string
                 if after.len() == len {
-                    // Exact match - this is the end of the string
                     return len;
-                } else if let Some(next_char) = after.as_bytes().get(len) {
-                    // There's a character after the pattern - make sure it's a word boundary
-                    if !next_char.is_ascii_alphanumeric() && *next_char != b'_' {
-                        return len;
-                    }
+                } else if let Some(next_char) = after.as_bytes().get(len)
+                    && (!next_char.is_ascii_alphanumeric() && *next_char != b'_')
+                {
+                    return Self::advance_past_modifiers_and_array(after, len);
                 }
             }
         }
@@ -549,22 +542,10 @@ impl CastTranslator {
                         eprintln!("DEBUG: Exact match for type '{type_name}', returning {len}");
                     }
                     return len;
-                } else if let Some(next_char) = after.as_bytes().get(len) {
-                    // Check if this is an array type (followed by [])
-                    if *next_char == b'[' && after.len() > len + 1 && after.as_bytes().get(len + 1) == Some(&b']') {
-                        // This is an array type like INTEGER[] - include the [] in the type name
-                        if after.contains("RETURNING") {
-                            eprintln!("DEBUG: Array type '{}[]' detected, returning {}", type_name, len + 2);
-                        }
-                        return len + 2;
-                    }
-                    // Check if next character is not alphanumeric (word boundary)
-                    else if !next_char.is_ascii_alphanumeric() && *next_char != b'_' {
-                        if after.contains("RETURNING") {
-                            eprintln!("DEBUG: Type '{}' followed by non-alphanumeric '{}', returning {}", type_name, *next_char as char, len);
-                        }
-                        return len;
-                    }
+                } else if let Some(next_char) = after.as_bytes().get(len)
+                    && (!next_char.is_ascii_alphanumeric() && *next_char != b'_')
+                {
+                    return Self::advance_past_modifiers_and_array(after, len);
                 }
             }
         }
@@ -764,67 +745,8 @@ impl CastTranslator {
                 if Self::is_enum_type(conn, type_name) {
                     // For ENUM types, use the enum cast translator
                     Self::translate_enum_cast(expr, type_name, conn)
-                } else if type_name.eq_ignore_ascii_case("text") {
-                    // For text cast, we need to handle parenthesized expressions carefully
-                    // Remove outer parentheses if present to avoid (CAST(...))
-                    let clean_expr = if expr.starts_with('(') && expr.ends_with(')') {
-                        &expr[1..expr.len()-1]
-                    } else {
-                        expr
-                    };
-                    
-                    // Always preserve cast for aggregate functions or complex expressions
-                    if clean_expr.contains('(') || Self::is_aggregate_function(clean_expr) || Self::might_need_text_cast(clean_expr) {
-                        // Check if this is a subquery that needs extra parentheses
-                        if clean_expr.trim_start().starts_with("SELECT") {
-                            format!("CAST(({clean_expr}) AS TEXT)")
-                        } else {
-                            format!("CAST({clean_expr} AS TEXT)")
-                        }
-                    } else {
-                        clean_expr.to_string()
-                    }
                 } else {
-                    // Check if SQLite supports this type
-                    let sqlite_type = Self::postgres_to_sqlite_type(type_name);
-                    
-                    // Special handling for timestamp/date/time types
-                    let upper_type = type_name.to_uppercase();
-                    match upper_type.as_str() {
-                        "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" | "TIMESTAMP WITH TIME ZONE" | "TIMESTAMPTZ" => {
-                            // Use pgsqlite's timestamp conversion function
-                            format!("pg_timestamp_from_text({expr})")
-                        }
-                        "DATE" => {
-                            // Use pgsqlite's date conversion function
-                            format!("pg_date_from_text({expr})")
-                        }
-                        "TIME" | "TIME WITHOUT TIME ZONE" | "TIME WITH TIME ZONE" | "TIMETZ" => {
-                            // Use pgsqlite's time conversion function
-                            format!("pg_time_from_text({expr})")
-                        }
-                        // Handle array types - arrays are stored as JSON strings in SQLite
-                        t if t.ends_with("[]") || t.ends_with(" ARRAY") => {
-                            // For array types, just return the expression without the cast
-                            // Arrays are stored as JSON strings in SQLite, so the cast is not needed
-                            expr.to_string()
-                        }
-                        _ => {
-                            // For non-datetime types, use regular cast logic
-                            if sqlite_type == "TEXT" && !matches!(upper_type.as_str(), "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING") {
-                                // Unknown type, just return the expression
-                                expr.to_string()
-                            } else {
-                                // Keep the CAST with SQLite type
-                                // Check if expression is a subquery
-                                if expr.trim_start().starts_with("SELECT") {
-                                    format!("CAST(({expr}) AS {sqlite_type})")
-                                } else {
-                                    format!("CAST({expr} AS {sqlite_type})")
-                                }
-                            }
-                        }
-                    }
+                    Self::translate_standard_cast(expr, type_name)
                 }
             } else {
                 // No connection, keep the CAST

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use parking_lot::{Mutex, Condvar};
 use uuid::Uuid;
 use once_cell::sync::Lazy;
@@ -28,7 +28,9 @@ struct AdvisoryLockState {
     locks: HashMap<i64, LockHolder>,
     blocking_pids: HashMap<i32, i32>,
     active_write_session: Option<(Uuid, i32)>,
-    sessions_with_writes: std::collections::HashSet<Uuid>,
+    sessions_with_writes: HashSet<Uuid>,
+    waiting_writers: HashMap<i64, HashSet<Uuid>>,
+    waiting_for: HashMap<Uuid, Uuid>,
 }
 
 pub fn hash_table_lock(name: &str) -> i64 {
@@ -45,7 +47,9 @@ impl AdvisoryLockManager {
                 locks: HashMap::new(),
                 blocking_pids: HashMap::new(),
                 active_write_session: None,
-                sessions_with_writes: std::collections::HashSet::new(),
+                sessions_with_writes: HashSet::new(),
+                waiting_writers: HashMap::new(),
+                waiting_for: HashMap::new(),
             }),
             cond: Condvar::new(),
         }
@@ -90,6 +94,11 @@ impl AdvisoryLockManager {
         let mut state = self.inner.lock();
         state.blocking_pids.remove(&session_pid);
         state.sessions_with_writes.remove(session_id);
+        state.waiting_for.remove(session_id);
+        for ws in state.waiting_writers.values_mut() {
+            ws.remove(session_id);
+        }
+        state.waiting_writers.retain(|_, ws| !ws.is_empty());
         if let Some((active_session, _)) = state.active_write_session {
             if active_session == *session_id {
                 state.active_write_session = None;
@@ -124,31 +133,70 @@ impl AdvisoryLockManager {
             let mut state = self.inner.lock();
             let mut waited = false;
             loop {
-                let AdvisoryLockState { locks, blocking_pids, .. } = &mut *state;
-                if let Some(holder) = locks.get_mut(&key) {
-                    if holder.session_id == session_id {
-                        blocking_pids.remove(&waiter_pid);
-                        tracing::debug!("AdvisoryLock::lock: re-entrant session={} key={}", session_id, key);
+                let is_writer = state.sessions_with_writes.contains(&session_id);
+                if let Some(holder_session) = state.locks.get(&key).map(|h| h.session_id) {
+                    if holder_session == session_id {
+                        let holder = state.locks.get_mut(&key).unwrap();
                         if is_xact {
                             holder.xact_count += 1;
                         } else {
                             holder.session_count += 1;
                         }
+                        state.blocking_pids.remove(&waiter_pid);
+                        state.waiting_for.remove(&session_id);
+                        if let Some(ws) = state.waiting_writers.get_mut(&key) {
+                            ws.remove(&session_id);
+                            if ws.is_empty() {
+                                state.waiting_writers.remove(&key);
+                            }
+                        }
+                        tracing::debug!("AdvisoryLock::lock: re-entrant session={} key={}", session_id, key);
                         return waited;
                     } else {
                         waited = true;
-                        let holder_pid = uuid_to_backend_pid(&holder.session_id);
-                        let holder_session_id = holder.session_id;
-                        blocking_pids.insert(waiter_pid, holder_pid);
-                        tracing::debug!("AdvisoryLock::lock: waiting session={} owner={} key={}", session_id, holder_session_id, key);
+                        let holder_pid = uuid_to_backend_pid(&holder_session);
+                        state.blocking_pids.insert(waiter_pid, holder_pid);
+                        state.waiting_for.insert(session_id, holder_session);
+                        if is_writer {
+                            state.waiting_writers.entry(key).or_default().insert(session_id);
+                        }
+                        tracing::debug!("AdvisoryLock::lock: waiting session={} owner={} key={}", session_id, holder_session, key);
                         self.cond.wait(&mut state);
                         state.blocking_pids.remove(&waiter_pid);
+                        state.waiting_for.remove(&session_id);
                         tracing::debug!("AdvisoryLock::lock: woke up session={} key={}", session_id, key);
                     }
                 } else {
-                    blocking_pids.remove(&waiter_pid);
+                    // Prioritize waiters that already hold SQLite's write lock so a
+                    // non-writer cannot acquire the key first and invert lock order.
+                    let waiting_writer = if !is_writer {
+                        state.waiting_writers.get(&key).and_then(|ws| {
+                            ws.iter()
+                                .copied()
+                                .find(|w| *w != session_id && state.sessions_with_writes.contains(w))
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(writer_sid) = waiting_writer {
+                        waited = true;
+                        state.blocking_pids.insert(waiter_pid, uuid_to_backend_pid(&writer_sid));
+                        state.waiting_for.insert(session_id, writer_sid);
+                        self.cond.wait(&mut state);
+                        state.blocking_pids.remove(&waiter_pid);
+                        state.waiting_for.remove(&session_id);
+                        continue;
+                    }
+                    state.blocking_pids.remove(&waiter_pid);
+                    state.waiting_for.remove(&session_id);
+                    if let Some(ws) = state.waiting_writers.get_mut(&key) {
+                        ws.remove(&session_id);
+                        if ws.is_empty() {
+                            state.waiting_writers.remove(&key);
+                        }
+                    }
                     tracing::debug!("AdvisoryLock::lock: acquired session={} key={}", session_id, key);
-                    locks.insert(key, LockHolder {
+                    state.locks.insert(key, LockHolder {
                         session_id,
                         session_count: if is_xact { 0 } else { 1 },
                         xact_count: if is_xact { 1 } else { 0 },
@@ -157,6 +205,30 @@ impl AdvisoryLockManager {
                 }
             }
         })
+    }
+
+    /// Returns true if any other session currently holding an uncommitted SQLite
+    /// write transaction is waiting (directly or transitively) on an advisory lock
+    /// owned by `session_id`.
+    pub fn is_deadlocked_with_sqlite_writer(&self, session_id: &Uuid) -> bool {
+        let state = self.inner.lock();
+        for writer in &state.sessions_with_writes {
+            if writer == session_id {
+                continue;
+            }
+            let mut cur = *writer;
+            for _ in 0..=state.waiting_for.len() {
+                if let Some(&holder) = state.waiting_for.get(&cur) {
+                    if holder == *session_id {
+                        return true;
+                    }
+                    cur = holder;
+                } else {
+                    break;
+                }
+            }
+        }
+        false
     }
 
     pub fn try_lock(&self, session_id: Uuid, key: i64, is_xact: bool) -> bool {
@@ -242,6 +314,11 @@ impl AdvisoryLockManager {
         let mut state = self.inner.lock();
         state.blocking_pids.remove(&session_pid);
         state.sessions_with_writes.remove(session_id);
+        state.waiting_for.retain(|k, v| k != session_id && v != session_id);
+        for ws in state.waiting_writers.values_mut() {
+            ws.remove(session_id);
+        }
+        state.waiting_writers.retain(|_, ws| !ws.is_empty());
         if let Some((active_session, _)) = state.active_write_session {
             if active_session == *session_id {
                 state.active_write_session = None;

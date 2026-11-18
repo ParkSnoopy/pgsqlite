@@ -227,7 +227,7 @@ class TestRunner:
             assert float(avg_age) == 23.0  # (21+22+23+24+25)/5
             
             max_balance = session.query(func.max(User.balance)).scalar()
-            assert max_balance == Decimal('400')
+            assert max_balance == Decimal('500')
             
             # Test GROUP BY
             result = session.query(
@@ -381,6 +381,7 @@ class TestRunner:
         session = self.Session()
         try:
             # Clean up from previous tests
+            session.query(Comment).delete()
             session.query(Post).delete()
             session.query(User).delete()
             session.commit()

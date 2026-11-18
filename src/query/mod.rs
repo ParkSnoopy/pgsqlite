@@ -26,7 +26,7 @@ pub use fast_path::{
     execute_fast_path_enhanced_with_params, query_fast_path_enhanced_with_params,
     clear_decimal_cache, FastPathQuery, FastPathOperation, WhereClause
 };
-pub use query_type_detection::{QueryTypeDetector, QueryType};
+pub use query_type_detection::{QueryTypeDetector, QueryType, is_rollback_to_savepoint};
 pub use comment_stripper::{strip_sql_comments, split_sql_statements};
 pub use lazy_processor::LazyQueryProcessor;
 pub use set_handler::SetHandler;

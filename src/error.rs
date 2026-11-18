@@ -266,6 +266,46 @@ pub fn sqlite_error_to_pg(err: &rusqlite::Error, _query: &str) -> ErrorResponse 
                                 line: None,
                                 routine: None,
                             };
+                        } else if msg.contains("NOT NULL constraint failed") {
+                            return ErrorResponse {
+                                severity: "ERROR".to_string(),
+                                code: "23502".to_string(),
+                                message: "null value violates not-null constraint".to_string(),
+                                detail: Some(msg.clone()),
+                                hint: None,
+                                position: None,
+                                internal_position: None,
+                                internal_query: None,
+                                where_: None,
+                                schema: None,
+                                table: None,
+                                column: None,
+                                datatype: None,
+                                constraint: None,
+                                file: None,
+                                line: None,
+                                routine: None,
+                            };
+                        } else if msg.contains("CHECK constraint failed") {
+                            return ErrorResponse {
+                                severity: "ERROR".to_string(),
+                                code: "23514".to_string(),
+                                message: "new row violates check constraint".to_string(),
+                                detail: Some(msg.clone()),
+                                hint: None,
+                                position: None,
+                                internal_position: None,
+                                internal_query: None,
+                                where_: None,
+                                schema: None,
+                                table: None,
+                                column: None,
+                                datatype: None,
+                                constraint: None,
+                                file: None,
+                                line: None,
+                                routine: None,
+                            };
                         } else if msg.contains("numeric field overflow") {
                             return ErrorResponse {
                                 severity: "ERROR".to_string(),

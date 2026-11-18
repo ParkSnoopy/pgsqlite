@@ -25,9 +25,17 @@ impl CatalogInterceptor {
     /// Check if a query is targeting pg_catalog and handle it
     pub async fn intercept_query(query: &str, db: Arc<DbHandler>, session: Option<Arc<SessionState>>) -> Option<Result<DbResponse, PgSqliteError>> {
         debug!("INTERCEPT_QUERY: {}", query);
-        // Quick check to avoid parsing if not a catalog query
+        // Complex SQLAlchemy reflection JOINs/subqueries execute directly against SQLite catalog views
         let lower_query = query.to_lowercase();
         debug!("INTERCEPT: lower_query = {}", lower_query);
+
+        if lower_query.contains("typeinfo_tree") && lower_query.contains("attrtypoids") {
+            return Some(Self::handle_typeinfo_tree_query(query, &db).await);
+        }
+
+        if crate::types::SchemaTypeMapper::is_reflection_query(query) {
+            return None;
+        }
         
         // Check for cache status query
         if lower_query.contains("select * from pgsqlite_cache_status") {
@@ -503,8 +511,8 @@ impl CatalogInterceptor {
                     if let TableFactor::Table { name, .. } = &select.from[0].relation {
                         let table_name = name.to_string().to_lowercase();
                         if table_name.contains("pg_type") || table_name.contains("pg_catalog.pg_type") {
-                            // This is a pg_type JOIN query - handle it specially
-                            let response = Self::handle_pg_type_join_query(select);
+                            // Evaluate pg_type JOINs through the unified pg_type handler so WHERE filters apply
+                            let response = Self::handle_pg_type_query(select, db.clone(), session.clone()).await;
                             return Some(response);
                         }
                     }
@@ -780,9 +788,8 @@ impl CatalogInterceptor {
     }
 
     async fn handle_pg_type_query(select: &Select, db: Arc<DbHandler>, session: Option<Arc<SessionState>>) -> DbResponse {
-        // Extract which columns are being selected
-        let mut columns = Vec::new();
-        let mut column_indices = Vec::new();
+        // Extract (source_column, wire_column_name) pairs from projection
+        let mut column_specs: Vec<(String, String)> = Vec::new();
         
         debug!("Processing pg_type query with {} projections", select.projection.len());
         
@@ -791,29 +798,24 @@ impl CatalogInterceptor {
                 SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
                     let col_name = parts.last().unwrap().value.to_lowercase();
                     debug!("  Column {}: {}", i, col_name);
-                    columns.push(col_name.clone());
-                    column_indices.push(i);
+                    column_specs.push((col_name.clone(), col_name));
                 }
                 SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
                     let col_name = ident.value.to_lowercase();
                     debug!("  Column {}: {}", i, col_name);
-                    columns.push(col_name.clone());
-                    column_indices.push(i);
+                    column_specs.push((col_name.clone(), col_name));
                 }
                 SelectItem::UnnamedExpr(Expr::Cast { expr, .. }) => {
-                    // Handle CAST expressions like CAST(oid AS TEXT)
                     match expr.as_ref() {
                         Expr::Identifier(ident) => {
                             let col_name = ident.value.to_lowercase();
                             debug!("  Column {} (CAST): {}", i, col_name);
-                            columns.push(col_name.clone());
-                            column_indices.push(i);
+                            column_specs.push((col_name.clone(), col_name));
                         }
                         Expr::CompoundIdentifier(parts) => {
                             let col_name = parts.last().unwrap().value.to_lowercase();
                             debug!("  Column {} (CAST): {}", i, col_name);
-                            columns.push(col_name.clone());
-                            column_indices.push(i);
+                            column_specs.push((col_name.clone(), col_name));
                         }
                         _ => {
                             debug!("  Column {}: unknown CAST expression", i);
@@ -821,7 +823,6 @@ impl CatalogInterceptor {
                     }
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
-                    // For aliased expressions, we still need the source column for data lookup
                     let source_col = match expr {
                         Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
                         Expr::CompoundIdentifier(parts) => Some(parts.last().unwrap().value.to_lowercase()),
@@ -836,25 +837,18 @@ impl CatalogInterceptor {
                     };
                     
                     if let Some(col) = source_col {
-                        debug!("  Column {} (aliased as {}): {}", i, alias, col);
-                        columns.push(col);
-                        column_indices.push(i);
+                        let wire_name = Self::alias_output_name(alias);
+                        debug!("  Column {} (aliased as {}): {}", i, wire_name, col);
+                        column_specs.push((col, wire_name));
                     } else {
                         debug!("  Column {}: unknown aliased expression", i);
                     }
                 }
                 SelectItem::Wildcard(_) => {
-                    // Handle SELECT * queries - return all columns
                     debug!("  Wildcard selection - returning all columns");
-                    columns = vec![
-                        "oid".to_string(),
-                        "typname".to_string(),
-                        "typtype".to_string(),
-                        "typelem".to_string(),
-                        "typbasetype".to_string(),
-                        "typnamespace".to_string(),
-                        "typrelid".to_string(),
-                    ];
+                    for col in ["oid", "typname", "typtype", "typelem", "typbasetype", "typnamespace", "typrelid"] {
+                        column_specs.push((col.to_string(), col.to_string()));
+                    }
                     break;
                 }
                 _ => {
@@ -864,134 +858,153 @@ impl CatalogInterceptor {
         }
         
         // If no columns were detected, default to common columns for pg_type
-        if columns.is_empty() && !select.projection.is_empty() {
+        if column_specs.is_empty() && !select.projection.is_empty() {
             debug!("No columns detected from projections, using default pg_type columns");
-            columns = vec!["oid".to_string(), "typname".to_string()];
+            column_specs = vec![
+                ("oid".to_string(), "oid".to_string()),
+                ("typname".to_string(), "typname".to_string()),
+            ];
         }
+        let columns: Vec<String> = column_specs.iter().map(|(_, wire)| wire.clone()).collect();
 
-        // Check if there's a WHERE clause filtering by OID or typtype
+        // Check if there's a WHERE clause filtering by OID, typtype, or general predicate
         let mut filter_oid = None;
         let mut has_placeholder = false;
         let mut filter_typtype = None;
         
         if let Some(selection) = &select.selection {
             Self::extract_filters(selection, &mut filter_oid, &mut has_placeholder, &mut filter_typtype);
+            if Self::expr_contains_placeholder(selection) {
+                has_placeholder = true;
+            }
         }
         
         debug!("Filters - OID: {:?}, typtype: {:?}, has_placeholder: {}", filter_oid, filter_typtype, has_placeholder);
-        
-        // If query has a placeholder, we need to handle it differently
-        // Don't return empty result as tokio-postgres needs the type info
-        debug!("Query has placeholder: {}, filter_oid: {:?}", has_placeholder, filter_oid);
 
-        // Build response based on columns requested
         let mut rows = Vec::new();
         
         // Special case: if filter_oid is -1 (our sentinel for NULL), return empty result
         if filter_oid == Some(-1) {
             debug!("NULL OID filter detected - returning empty result set");
-            let rows_affected = 0;
             info!("pg_type query with NULL filter: returning 0 rows");
             return DbResponse {
                 columns,
                 rows,
-                rows_affected,
+                rows_affected: 0,
             };
         }
         
         // Define our basic types - matching all types from type_mapper.rs
         let types = vec![
             // Basic types
-            (16, "bool", "b", 0, 0, 11, 0),        // bool
-            (17, "bytea", "b", 0, 0, 11, 0),       // bytea
-            (20, "int8", "b", 0, 0, 11, 0),        // bigint
-            (21, "int2", "b", 0, 0, 11, 0),        // smallint
-            (23, "int4", "b", 0, 0, 11, 0),        // integer
-            (25, "text", "b", 0, 0, 11, 0),        // text
-            (114, "json", "b", 0, 0, 11, 0),       // json
-            (700, "float4", "b", 0, 0, 11, 0),     // real
-            (701, "float8", "b", 0, 0, 11, 0),     // double precision
-            (1042, "char", "b", 0, 0, 11, 0),      // char
-            (1043, "varchar", "b", 0, 0, 11, 0),   // varchar
-            (1082, "date", "b", 0, 0, 11, 0),      // date
-            (1083, "time", "b", 0, 0, 11, 0),      // time
-            (1114, "timestamp", "b", 0, 0, 11, 0), // timestamp
-            (1184, "timestamptz", "b", 0, 0, 11, 0), // timestamptz
-            (1700, "numeric", "b", 0, 0, 11, 0),   // numeric
-            (2950, "uuid", "b", 0, 0, 11, 0),      // uuid
-            (3802, "jsonb", "b", 0, 0, 11, 0),     // jsonb
+            (16, "bool", "b", 0, 0, 11, 0, "B"),
+            (17, "bytea", "b", 0, 0, 11, 0, "U"),
+            (20, "int8", "b", 0, 0, 11, 0, "N"),
+            (21, "int2", "b", 0, 0, 11, 0, "N"),
+            (23, "int4", "b", 0, 0, 11, 0, "N"),
+            (25, "text", "b", 0, 0, 11, 0, "S"),
+            (114, "json", "b", 0, 0, 11, 0, "U"),
+            (700, "float4", "b", 0, 0, 11, 0, "N"),
+            (701, "float8", "b", 0, 0, 11, 0, "N"),
+            (1042, "char", "b", 0, 0, 11, 0, "S"),
+            (1043, "varchar", "b", 0, 0, 11, 0, "S"),
+            (1082, "date", "b", 0, 0, 11, 0, "D"),
+            (1083, "time", "b", 0, 0, 11, 0, "D"),
+            (1114, "timestamp", "b", 0, 0, 11, 0, "D"),
+            (1184, "timestamptz", "b", 0, 0, 11, 0, "D"),
+            (1700, "numeric", "b", 0, 0, 11, 0, "N"),
+            (2950, "uuid", "b", 0, 0, 11, 0, "U"),
+            (3802, "jsonb", "b", 0, 0, 11, 0, "U"),
             // Array types
-            (1000, "_bool", "b", 16, 0, 11, 0),    // bool array
-            (1001, "_bytea", "b", 17, 0, 11, 0),   // bytea array
-            (1005, "_int2", "b", 21, 0, 11, 0),    // int2 array
-            (1007, "_int4", "b", 23, 0, 11, 0),    // int4 array
-            (1009, "_text", "b", 25, 0, 11, 0),    // text array
-            (1014, "_char", "b", 1042, 0, 11, 0),  // char array
-            (1015, "_varchar", "b", 1043, 0, 11, 0), // varchar array
-            (1016, "_int8", "b", 20, 0, 11, 0),    // int8 array
-            (1021, "_float4", "b", 700, 0, 11, 0), // float4 array
-            (1022, "_float8", "b", 701, 0, 11, 0), // float8 array
-            (1115, "_timestamp", "b", 1114, 0, 11, 0), // timestamp array
-            (1182, "_date", "b", 1082, 0, 11, 0),  // date array
-            (1183, "_time", "b", 1083, 0, 11, 0),  // time array
-            (1185, "_timestamptz", "b", 1184, 0, 11, 0), // timestamptz array
-            (1231, "_numeric", "b", 1700, 0, 11, 0), // numeric array
-            (2951, "_uuid", "b", 2950, 0, 11, 0),  // uuid array
-            (199, "_json", "b", 114, 0, 11, 0),    // json array
-            (3807, "_jsonb", "b", 3802, 0, 11, 0), // jsonb array
+            (1000, "_bool", "b", 16, 0, 11, 0, "A"),
+            (1001, "_bytea", "b", 17, 0, 11, 0, "A"),
+            (1005, "_int2", "b", 21, 0, 11, 0, "A"),
+            (1007, "_int4", "b", 23, 0, 11, 0, "A"),
+            (1009, "_text", "b", 25, 0, 11, 0, "A"),
+            (1014, "_char", "b", 1042, 0, 11, 0, "A"),
+            (1015, "_varchar", "b", 1043, 0, 11, 0, "A"),
+            (1016, "_int8", "b", 20, 0, 11, 0, "A"),
+            (1021, "_float4", "b", 700, 0, 11, 0, "A"),
+            (1022, "_float8", "b", 701, 0, 11, 0, "A"),
+            (1115, "_timestamp", "b", 1114, 0, 11, 0, "A"),
+            (1182, "_date", "b", 1082, 0, 11, 0, "A"),
+            (1183, "_time", "b", 1083, 0, 11, 0, "A"),
+            (1185, "_timestamptz", "b", 1184, 0, 11, 0, "A"),
+            (1231, "_numeric", "b", 1700, 0, 11, 0, "A"),
+            (2951, "_uuid", "b", 2950, 0, 11, 0, "A"),
+            (199, "_json", "b", 114, 0, 11, 0, "A"),
+            (3807, "_jsonb", "b", 3802, 0, 11, 0, "A"),
         ];
 
-        for (oid, typname, typtype, typelem, typbasetype, _typnamespace, typrelid) in types {
-            // Apply OID filter if specified
+        let col_map = HashMap::new();
+
+        for (oid, typname, typtype, typelem, typbasetype, typnamespace, typrelid, typcategory) in types {
             if let Some(filter) = filter_oid
                 && oid != filter {
                     continue;
                 }
-            
-            // Apply typtype filter if specified
             if let Some(ref filter) = filter_typtype
                 && typtype != filter {
                     continue;
                 }
 
+            let array_oid = match oid {
+                16 => 1000,
+                17 => 1001,
+                20 => 1016,
+                21 => 1005,
+                23 => 1007,
+                25 => 1009,
+                700 => 1021,
+                701 => 1022,
+                1042 => 1014,
+                1043 => 1015,
+                1082 => 1182,
+                1083 => 1183,
+                1114 => 1115,
+                1184 => 1185,
+                1700 => 1231,
+                2950 => 2951,
+                114 => 199,
+                3802 => 3807,
+                _ => 0,
+            };
+
+            if !has_placeholder
+                && let Some(selection) = &select.selection {
+                    let row_data = HashMap::from([
+                        ("oid".to_string(), oid.to_string()),
+                        ("typname".to_string(), typname.to_string()),
+                        ("typtype".to_string(), typtype.to_string()),
+                        ("typelem".to_string(), typelem.to_string()),
+                        ("typbasetype".to_string(), typbasetype.to_string()),
+                        ("typnamespace".to_string(), typnamespace.to_string()),
+                        ("typrelid".to_string(), typrelid.to_string()),
+                        ("nspname".to_string(), "pg_catalog".to_string()),
+                        ("typarray".to_string(), array_oid.to_string()),
+                        ("typdelim".to_string(), ",".to_string()),
+                        ("typcategory".to_string(), typcategory.to_string()),
+                    ]);
+                    if !WhereEvaluator::evaluate(selection, &row_data, &col_map) {
+                        continue;
+                    }
+                }
+
             let mut row = Vec::new();
-            for col in &columns {
+            for (col, _) in &column_specs {
                 let value = match col.as_str() {
                     "oid" => Some(oid.to_string().into_bytes()),
                     "typname" => Some(typname.to_string().into_bytes()),
                     "typtype" => Some(typtype.to_string().into_bytes()),
                     "typelem" => Some(typelem.to_string().into_bytes()),
                     "typbasetype" => Some(typbasetype.to_string().into_bytes()),
-                    "typnamespace" => Some(_typnamespace.to_string().into_bytes()),
+                    "typnamespace" => Some(typnamespace.to_string().into_bytes()),
                     "typrelid" => Some(typrelid.to_string().into_bytes()),
                     "nspname" => Some("pg_catalog".to_string().into_bytes()),
-                    "rngsubtype" => None, // NULL for non-range types
-                    "typarray" => {
-                        // Find the array type OID for this base type
-                        let array_oid = match oid {
-                            16 => 1000,   // bool -> _bool
-                            17 => 1001,   // bytea -> _bytea
-                            20 => 1016,   // int8 -> _int8
-                            21 => 1005,   // int2 -> _int2
-                            23 => 1007,   // int4 -> _int4
-                            25 => 1009,   // text -> _text
-                            700 => 1021,  // float4 -> _float4
-                            701 => 1022,  // float8 -> _float8
-                            1042 => 1014, // char -> _char
-                            1043 => 1015, // varchar -> _varchar
-                            1082 => 1182, // date -> _date
-                            1083 => 1183, // time -> _time
-                            1114 => 1115, // timestamp -> _timestamp
-                            1184 => 1185, // timestamptz -> _timestamptz
-                            1700 => 1231, // numeric -> _numeric
-                            2950 => 2951, // uuid -> _uuid
-                            114 => 199,   // json -> _json
-                            3802 => 3807, // jsonb -> _jsonb
-                            _ => 0,       // No array type
-                        };
-                        Some(array_oid.to_string().into_bytes())
-                    }
-                    "typdelim" => Some(",".to_string().into_bytes()), // Default delimiter
+                    "rngsubtype" => None,
+                    "typarray" => Some(array_oid.to_string().into_bytes()),
+                    "typdelim" => Some(",".to_string().into_bytes()),
+                    "typcategory" => Some(typcategory.to_string().into_bytes()),
                     _ => None,
                 };
                 row.push(value);
@@ -1004,7 +1017,6 @@ impl CatalogInterceptor {
         
         // Add ENUM types from metadata only if typtype filter allows it
         if filter_typtype.is_none() || filter_typtype.as_ref() == Some(&"e".to_string()) {
-            // Use session connection if available, otherwise fall back to get_mut_connection
             let enum_types_result = if let Some(ref session) = session {
                 db.with_session_connection(&session.id, |conn| {
                     crate::metadata::EnumMetadata::get_all_enum_types(conn)
@@ -1022,36 +1034,56 @@ impl CatalogInterceptor {
             if let Ok(enum_types) = enum_types_result {
                 debug!("Found {} enum types in metadata", enum_types.len());
                 for enum_type in enum_types {
-                        debug!("Processing enum type: {} (OID: {})", enum_type.type_name, enum_type.type_oid);
-                        // Apply OID filter if specified
-                        if let Some(filter) = filter_oid
-                            && enum_type.type_oid != filter {
+                    debug!("Processing enum type: {} (OID: {})", enum_type.type_name, enum_type.type_oid);
+                    if let Some(filter) = filter_oid
+                        && enum_type.type_oid != filter {
+                            continue;
+                        }
+
+                    if !has_placeholder
+                        && let Some(selection) = &select.selection {
+                            let row_data = HashMap::from([
+                                ("oid".to_string(), enum_type.type_oid.to_string()),
+                                ("typname".to_string(), enum_type.type_name.clone()),
+                                ("typtype".to_string(), "e".to_string()),
+                                ("typelem".to_string(), "0".to_string()),
+                                ("typbasetype".to_string(), "0".to_string()),
+                                ("typnamespace".to_string(), enum_type.namespace_oid.to_string()),
+                                ("typrelid".to_string(), "0".to_string()),
+                                ("nspname".to_string(), "public".to_string()),
+                                ("typarray".to_string(), "0".to_string()),
+                                ("typdelim".to_string(), ",".to_string()),
+                                ("typcategory".to_string(), "E".to_string()),
+                            ]);
+                            if !WhereEvaluator::evaluate(selection, &row_data, &col_map) {
                                 continue;
                             }
-                        
-                        let mut row = Vec::new();
-                        for col in &columns {
-                            let value = match col.as_str() {
-                                "oid" => Some(enum_type.type_oid.to_string().into_bytes()),
-                                "typname" => Some(enum_type.type_name.clone().into_bytes()),
-                                "typtype" => Some("e".to_string().into_bytes()), // 'e' for enum
-                                "typelem" => Some("0".to_string().into_bytes()),
-                                "typbasetype" => Some("0".to_string().into_bytes()),
-                                "typnamespace" => Some(enum_type.namespace_oid.to_string().into_bytes()),
-                                "typrelid" => Some("0".to_string().into_bytes()),
-                                "nspname" => Some("public".to_string().into_bytes()),
-                                "rngsubtype" => None, // NULL for non-range types
-                                "typarray" => Some("0".to_string().into_bytes()), // ENUMs don't have array types
-                                "typdelim" => Some(",".to_string().into_bytes()), // Default delimiter
-                                _ => None,
-                            };
-                            row.push(value);
                         }
-                        
-                        if !row.is_empty() {
-                            rows.push(row);
-                        }
+                    
+                    let mut row = Vec::new();
+                    for (col, _) in &column_specs {
+                        let value = match col.as_str() {
+                            "oid" => Some(enum_type.type_oid.to_string().into_bytes()),
+                            "typname" => Some(enum_type.type_name.clone().into_bytes()),
+                            "typtype" => Some("e".to_string().into_bytes()),
+                            "typelem" => Some("0".to_string().into_bytes()),
+                            "typbasetype" => Some("0".to_string().into_bytes()),
+                            "typnamespace" => Some(enum_type.namespace_oid.to_string().into_bytes()),
+                            "typrelid" => Some("0".to_string().into_bytes()),
+                            "nspname" => Some("public".to_string().into_bytes()),
+                            "rngsubtype" => None,
+                            "typarray" => Some("0".to_string().into_bytes()),
+                            "typdelim" => Some(",".to_string().into_bytes()),
+                            "typcategory" => Some("E".to_string().into_bytes()),
+                            _ => None,
+                        };
+                        row.push(value);
                     }
+                    
+                    if !row.is_empty() {
+                        rows.push(row);
+                    }
+                }
             }
         }
 
@@ -1063,6 +1095,200 @@ impl CatalogInterceptor {
             rows,
             rows_affected,
         }
+    }
+
+    async fn handle_typeinfo_tree_query(query: &str, db: &DbHandler) -> Result<DbResponse, PgSqliteError> {
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        let columns = vec![
+            "oid".to_string(),
+            "ns".to_string(),
+            "name".to_string(),
+            "kind".to_string(),
+            "basetype".to_string(),
+            "elemtype".to_string(),
+            "elemdelim".to_string(),
+            "range_subtype".to_string(),
+            "attrtypoids".to_string(),
+            "attrnames".to_string(),
+            "depth".to_string(),
+            "basetype_name".to_string(),
+            "elemtype_name".to_string(),
+            "range_subtype_name".to_string(),
+        ];
+
+        // Load all known types from pg_type view (includes builtin, arrays, and enums)
+        let db_res = db
+            .query("SELECT oid, typname, typtype, typelem, typnamespace, typdelim FROM pg_type")
+            .await?;
+
+        #[derive(Clone)]
+        struct TypeMeta {
+            oid: i32,
+            ns: String,
+            name: String,
+            kind: String,
+            elemtype: i32,
+            delim: String,
+        }
+
+        let mut type_map: HashMap<i32, TypeMeta> = HashMap::new();
+        for row in db_res.rows {
+            if row.len() >= 6 {
+                let s = |idx: usize| -> String {
+                    row[idx]
+                        .as_deref()
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                if let Ok(oid) = s(0).parse::<i32>() {
+                    let ns_oid = s(4);
+                    let ns = if ns_oid == "2200" {
+                        "public".to_string()
+                    } else {
+                        "pg_catalog".to_string()
+                    };
+                    let elemtype = s(3).parse::<i32>().unwrap_or(0);
+                    let delim = {
+                        let d = s(5);
+                        if d.is_empty() { ",".to_string() } else { d }
+                    };
+                    type_map.insert(
+                        oid,
+                        TypeMeta {
+                            oid,
+                            ns,
+                            name: s(1),
+                            kind: s(2),
+                            elemtype,
+                            delim,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Extract requested OIDs from the base WHERE clause (`ti.oid = any('[1015]')`
+        // or ArrayTranslator's `json_each(array_to_json('[1015]'))`).
+        let lower = query.to_lowercase();
+        let mut seed_oids: Vec<i32> = Vec::new();
+        let base_slice = if let Some(ti_pos) = lower.find("as ti") {
+            let after_ti = &lower[ti_pos..];
+            if let Some(ua_pos) = after_ti.find("union all") {
+                &after_ti[..ua_pos]
+            } else {
+                after_ti
+            }
+        } else {
+            lower.as_str()
+        };
+
+        let parse_digits = |slice: &str, out: &mut Vec<i32>| {
+            let mut num = String::new();
+            for ch in slice.chars() {
+                if ch.is_ascii_digit() {
+                    num.push(ch);
+                } else if !num.is_empty() {
+                    if let Ok(oid) = num.parse::<i32>() {
+                        out.push(oid);
+                    }
+                    num.clear();
+                }
+            }
+            if !num.is_empty()
+                && let Ok(oid) = num.parse::<i32>()
+            {
+                out.push(oid);
+            }
+        };
+
+        let mut chars = base_slice.char_indices().peekable();
+        while let Some((start, ch)) = chars.next() {
+            if ch == '\'' {
+                let mut end = base_slice.len();
+                while let Some((idx, c)) = chars.next() {
+                    if c == '\'' {
+                        if chars.peek().is_some_and(|(_, nc)| *nc == '\'') {
+                            chars.next();
+                            continue;
+                        }
+                        end = idx;
+                        break;
+                    }
+                }
+                let literal = &base_slice[start + 1..end];
+                if literal.chars().any(|c| c.is_ascii_digit()) {
+                    parse_digits(literal, &mut seed_oids);
+                    break;
+                }
+            }
+        }
+        if seed_oids.is_empty()
+            && let Some(arr_pos) = base_slice.find("array[")
+            && let Some(close_rel) = base_slice[arr_pos..].find(']')
+        {
+            parse_digits(&base_slice[arr_pos + 6..arr_pos + close_rel], &mut seed_oids);
+        }
+
+        let mut visited: HashSet<i32> = HashSet::new();
+        let mut queue: VecDeque<(i32, i32)> = seed_oids.into_iter().map(|oid| (oid, 0)).collect();
+        let mut collected: Vec<(i32, TypeMeta)> = Vec::new();
+
+        while let Some((oid, depth)) = queue.pop_front() {
+            if !visited.insert(oid) {
+                continue;
+            }
+            if let Some(meta) = type_map.get(&oid).cloned() {
+                if meta.elemtype != 0 && !visited.contains(&meta.elemtype) {
+                    queue.push_back((meta.elemtype, depth + 1));
+                }
+                collected.push((depth, meta));
+            }
+        }
+
+        // ORDER BY depth DESC so dependencies come first
+        collected.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.oid.cmp(&b.1.oid)));
+
+        let rows: Vec<Vec<Option<Vec<u8>>>> = collected
+            .into_iter()
+            .map(|(depth, meta)| {
+                let elem_meta = if meta.elemtype != 0 {
+                    type_map.get(&meta.elemtype)
+                } else {
+                    None
+                };
+                let elemdelim = elem_meta.map(|e| e.delim.as_bytes().to_vec());
+                let elemtype_name = if let Some(em) = elem_meta {
+                    em.name.as_bytes().to_vec()
+                } else {
+                    b"-".to_vec()
+                };
+                vec![
+                    Some(meta.oid.to_string().into_bytes()),
+                    Some(meta.ns.into_bytes()),
+                    Some(meta.name.into_bytes()),
+                    Some(meta.kind.into_bytes()),
+                    None, // basetype
+                    Some(meta.elemtype.to_string().into_bytes()),
+                    elemdelim,
+                    None, // range_subtype
+                    None, // attrtypoids
+                    None, // attrnames
+                    Some(depth.to_string().into_bytes()),
+                    None, // basetype_name
+                    Some(elemtype_name),
+                    None, // range_subtype_name
+                ]
+            })
+            .collect();
+
+        let rows_affected = rows.len();
+        Ok(DbResponse {
+            columns,
+            rows,
+            rows_affected,
+        })
     }
 
     fn handle_pg_range_query(_select: &Select) -> DbResponse {
@@ -1302,162 +1528,25 @@ impl CatalogInterceptor {
         }
     }
 
-    fn handle_pg_type_join_query(select: &Select) -> DbResponse {
-        // Handle the complex JOIN query that tokio-postgres uses
-        // Extract which columns are being selected
-        let mut columns = Vec::new();
-        
-        debug!("Processing pg_type JOIN query with {} projections", select.projection.len());
-        
-        for item in &select.projection {
-            match item {
-                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
-                    let col_name = parts.last().unwrap().value.to_lowercase();
-                    debug!("  Column: {}", col_name);
-                    columns.push(col_name);
-                }
-                SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                    let col_name = ident.value.to_lowercase();
-                    debug!("  Column: {}", col_name);
-                    columns.push(col_name);
-                }
-                _ => {
-                    debug!("  Unknown projection type");
-                }
+    fn expr_contains_placeholder(expr: &Expr) -> bool {
+        match expr {
+            Expr::Value(v) => matches!(v.value, sqlparser::ast::Value::Placeholder(_)),
+            Expr::BinaryOp { left, right, .. } => {
+                Self::expr_contains_placeholder(left) || Self::expr_contains_placeholder(right)
             }
-        }
-
-        // Check if there's a WHERE clause filtering by OID
-        let mut filter_oid = None;
-        
-        if let Some(selection) = &select.selection
-            && let Expr::BinaryOp { left, op, right } = selection
-                && matches!(op, sqlparser::ast::BinaryOperator::Eq) {
-                    let is_oid_column = if let Expr::CompoundIdentifier(left_parts) = left.as_ref() {
-                        left_parts.last().unwrap().value.to_lowercase() == "oid"
-                    } else if let Expr::Identifier(ident) = left.as_ref() {
-                        ident.value.to_lowercase() == "oid"
-                    } else {
-                        false
-                    };
-                    
-                    if is_oid_column {
-                        // Check if right side is a number or placeholder
-                        if let Expr::Value(sqlparser::ast::ValueWithSpan { value: sqlparser::ast::Value::Number(n, _), .. }) = right.as_ref() {
-                            filter_oid = n.parse::<i32>().ok();
-                        } else if let Expr::Value(sqlparser::ast::ValueWithSpan { value: sqlparser::ast::Value::Placeholder(_), .. }) = right.as_ref() {
-                            // For placeholders in JOIN queries, we return all types
-                            // tokio-postgres will filter client-side
-                            filter_oid = None;
-                        }
-                    }
-                }
-        
-        // Build response with all requested columns
-        let mut rows = Vec::new();
-        
-        // Define our types with proper values for JOIN query
-        let types = vec![
-            // Basic types
-            (16, "bool", "b", 0, 0, 11, 0),
-            (17, "bytea", "b", 0, 0, 11, 0),
-            (20, "int8", "b", 0, 0, 11, 0),
-            (21, "int2", "b", 0, 0, 11, 0),
-            (23, "int4", "b", 0, 0, 11, 0),
-            (25, "text", "b", 0, 0, 11, 0),
-            (114, "json", "b", 0, 0, 11, 0),
-            (700, "float4", "b", 0, 0, 11, 0),
-            (701, "float8", "b", 0, 0, 11, 0),
-            (1042, "char", "b", 0, 0, 11, 0),
-            (1043, "varchar", "b", 0, 0, 11, 0),
-            (1082, "date", "b", 0, 0, 11, 0),
-            (1083, "time", "b", 0, 0, 11, 0),
-            (1114, "timestamp", "b", 0, 0, 11, 0),
-            (1184, "timestamptz", "b", 0, 0, 11, 0),
-            (1700, "numeric", "b", 0, 0, 11, 0),
-            (2950, "uuid", "b", 0, 0, 11, 0),
-            (3802, "jsonb", "b", 0, 0, 11, 0),
-            // Array types - typtype is still 'b' for arrays in PostgreSQL
-            (1000, "_bool", "b", 16, 0, 11, 0),
-            (1001, "_bytea", "b", 17, 0, 11, 0),
-            (1005, "_int2", "b", 21, 0, 11, 0),
-            (1007, "_int4", "b", 23, 0, 11, 0),
-            (1009, "_text", "b", 25, 0, 11, 0),
-            (1014, "_char", "b", 1042, 0, 11, 0),
-            (1015, "_varchar", "b", 1043, 0, 11, 0),
-            (1016, "_int8", "b", 20, 0, 11, 0),
-            (1021, "_float4", "b", 700, 0, 11, 0),
-            (1022, "_float8", "b", 701, 0, 11, 0),
-            (1115, "_timestamp", "b", 1114, 0, 11, 0),
-            (1182, "_date", "b", 1082, 0, 11, 0),
-            (1183, "_time", "b", 1083, 0, 11, 0),
-            (1185, "_timestamptz", "b", 1184, 0, 11, 0),
-            (1231, "_numeric", "b", 1700, 0, 11, 0),
-            (2951, "_uuid", "b", 2950, 0, 11, 0),
-            (199, "_json", "b", 114, 0, 11, 0),
-            (3807, "_jsonb", "b", 3802, 0, 11, 0),
-        ];
-
-        for (oid, typname, typtype, typelem, typbasetype, _typnamespace, typrelid) in types {
-            // Apply filter if specified
-            if let Some(filter) = filter_oid
-                && oid != filter {
-                    continue;
-                }
-
-            let mut row = Vec::new();
-            for col in &columns {
-                let value = match col.as_str() {
-                    "oid" => Some(oid.to_string().into_bytes()),
-                    "typname" => Some(typname.to_string().into_bytes()),
-                    "typtype" => Some(typtype.to_string().into_bytes()),
-                    "typelem" => Some(typelem.to_string().into_bytes()),
-                    "rngsubtype" => None, // NULL for non-range types
-                    "typbasetype" => Some(typbasetype.to_string().into_bytes()),
-                    "nspname" => Some("pg_catalog".to_string().into_bytes()),
-                    "typrelid" => Some(typrelid.to_string().into_bytes()),
-                    "typarray" => {
-                        // Find the array type OID for this base type
-                        let array_oid = match oid {
-                            16 => 1000,   // bool -> _bool
-                            17 => 1001,   // bytea -> _bytea
-                            20 => 1016,   // int8 -> _int8
-                            21 => 1005,   // int2 -> _int2
-                            23 => 1007,   // int4 -> _int4
-                            25 => 1009,   // text -> _text
-                            700 => 1021,  // float4 -> _float4
-                            701 => 1022,  // float8 -> _float8
-                            1042 => 1014, // char -> _char
-                            1043 => 1015, // varchar -> _varchar
-                            1082 => 1182, // date -> _date
-                            1083 => 1183, // time -> _time
-                            1114 => 1115, // timestamp -> _timestamp
-                            1184 => 1185, // timestamptz -> _timestamptz
-                            1700 => 1231, // numeric -> _numeric
-                            2950 => 2951, // uuid -> _uuid
-                            114 => 199,   // json -> _json
-                            3802 => 3807, // jsonb -> _jsonb
-                            _ => 0,       // No array type
-                        };
-                        Some(array_oid.to_string().into_bytes())
-                    }
-                    "typdelim" => Some(",".to_string().into_bytes()), // Default delimiter
-                    _ => None,
-                };
-                row.push(value);
+            Expr::UnaryOp { expr, .. }
+            | Expr::Nested(expr)
+            | Expr::Cast { expr, .. }
+            | Expr::IsNull(expr)
+            | Expr::IsNotNull(expr) => Self::expr_contains_placeholder(expr),
+            Expr::InList { expr, list, .. } => {
+                Self::expr_contains_placeholder(expr)
+                    || list.iter().any(Self::expr_contains_placeholder)
             }
-            
-            if !row.is_empty() {
-                rows.push(row);
+            Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+                Self::expr_contains_placeholder(expr) || Self::expr_contains_placeholder(pattern)
             }
-        }
-
-        let rows_affected = rows.len();
-        debug!("Returning {} rows for pg_type JOIN query", rows_affected);
-        DbResponse {
-            columns,
-            rows,
-            rows_affected,
+            _ => false,
         }
     }
 

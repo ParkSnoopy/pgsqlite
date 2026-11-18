@@ -111,7 +111,9 @@ impl ExtendedQueryHandler {
         } else {
             // For unnamed statements, check if we have cached info about this query
             // This is important for benchmarks that use parameterized queries
-            if let Some(cached_info) = GLOBAL_PARAMETER_CACHE.get(&query) {
+            if let Some(cached_info) = GLOBAL_PARAMETER_CACHE.get(&query)
+                && let Some(cached_fields) = cached_info.field_descriptions
+            {
                 // Translate the query for cached statements too
                 // In per-session mode, we can't get a connection during parse,
                 // so we'll translate without connection (which handles most cases)
@@ -123,21 +125,22 @@ impl ExtendedQueryHandler {
                     trans = arr_trans;
                 }
                 let translated_query = Some(trans);
-                
+
                 // We already know about this query, create a fast prepared statement
                 let stmt = PreparedStatement {
                     query: original_raw_query.clone(),
                     translated_query,
                     param_types: cached_info.param_types.clone(),
                     param_formats: vec![0; cached_info.param_types.len()],
-                    field_descriptions: Vec::new(), // Will be populated during bind/execute
+                    field_descriptions: cached_fields,
                     translation_metadata: None,
                     projection_metadata: None,
                 };
-                
+
                 // Store as unnamed statement
                 session.prepared_statements.write().await.insert(String::new(), stmt);
-                
+                session.described_statements.write().await.remove("");
+
                 framed.send(BackendMessage::ParseComplete).await
                     .map_err(PgSqliteError::Io)?;
                 return Ok(());
@@ -154,11 +157,16 @@ impl ExtendedQueryHandler {
         
         // Removed verbose debug logging for parsing
         
-        // Extract cast type information BEFORE any query translation
-        let mut extracted_param_types = vec![0i32; ParameterParser::count_parameters(&cleaned_query)];
+        // Extract cast type information from original raw SQL BEFORE preprocess_query strips casts/SRFs
+        use crate::query::parameter_parser::ParameterParser;
+        let raw_cleaned = crate::query::strip_sql_comments(&original_raw_query);
+        let max_raw_param = ParameterParser::find_parameters(&raw_cleaned)
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        let mut extracted_param_types = vec![0i32; max_raw_param];
         
         // Check for Python-style parameters and convert to PostgreSQL-style
-        use crate::query::parameter_parser::ParameterParser;
         let python_params = ParameterParser::find_python_parameters(&cleaned_query);
         if !python_params.is_empty() {
             // Python-style parameters found
@@ -206,15 +214,15 @@ impl ExtendedQueryHandler {
             let mut python_param_mapping = session.python_param_mapping.write().await;
             python_param_mapping.insert(name.clone(), python_params);
         } else {
-            // Also extract types from PostgreSQL-style parameter casts ($1::TYPE)
+            // Extract types from PostgreSQL-style parameter casts ($1::TYPE) in original raw SQL
             for i in 1..=extracted_param_types.len() {
                 let cast_pattern = format!("${i}::");
-                if let Some(cast_start) = cleaned_query.find(&cast_pattern) {
+                if let Some(cast_start) = raw_cleaned.find(&cast_pattern) {
                     let raw_type_start = cast_start + cast_pattern.len();
-                    let trimmed_after = cleaned_query[raw_type_start..].trim_start();
-                    let offset = cleaned_query[raw_type_start..].len() - trimmed_after.len();
+                    let trimmed_after = raw_cleaned[raw_type_start..].trim_start();
+                    let offset = raw_cleaned[raw_type_start..].len() - trimmed_after.len();
                     let type_start = raw_type_start + offset;
-                    let after_cast = &cleaned_query[type_start..];
+                    let after_cast = &raw_cleaned[type_start..];
                     let upper_after = after_cast.to_uppercase();
                     let multiword_types = [
                         ("TIMESTAMP WITHOUT TIME ZONE", 27),
@@ -231,11 +239,11 @@ impl ExtendedQueryHandler {
                             if after_cast.len() == len {
                                 matched_len = Some(len);
                                 break;
-                            } else if let Some(next_char) = after_cast.as_bytes().get(len) {
-                                if !next_char.is_ascii_alphanumeric() && *next_char != b'_' {
-                                    matched_len = Some(len);
-                                    break;
-                                }
+                            } else if let Some(next_char) = after_cast.as_bytes().get(len)
+                                && !next_char.is_ascii_alphanumeric() && *next_char != b'_'
+                            {
+                                matched_len = Some(len);
+                                break;
                             }
                         }
                     }
@@ -243,18 +251,23 @@ impl ExtendedQueryHandler {
                         &after_cast[..len]
                     } else {
                         let mut type_end = type_start;
-                        while type_end < cleaned_query.len() {
-                            let c = cleaned_query.as_bytes()[type_end] as char;
+                        while type_end < raw_cleaned.len() {
+                            let c = raw_cleaned.as_bytes()[type_end] as char;
                             if !c.is_alphanumeric() && c != '_' {
                                 break;
                             }
                             type_end += 1;
                         }
-                        &cleaned_query[type_start..type_end]
+                        &raw_cleaned[type_start..type_end]
                     };
                     if !type_name.is_empty() {
                         let mut final_type = type_name.to_string();
-                        let rest = cleaned_query[type_start + type_name.len()..].trim_start();
+                        let mut rest = raw_cleaned[type_start + type_name.len()..].trim_start();
+                        if rest.starts_with('(')
+                            && let Some(close_idx) = rest.find(')')
+                        {
+                            rest = rest[close_idx + 1..].trim_start();
+                        }
                         if rest.starts_with("[]") {
                             final_type.push_str("[]");
                         }
@@ -295,6 +308,7 @@ impl ExtendedQueryHandler {
             };
             
             session.prepared_statements.write().await.insert(name.clone(), stmt);
+            session.described_statements.write().await.remove(&name);
             
             // Send ParseComplete
             framed.send(BackendMessage::ParseComplete).await
@@ -317,6 +331,7 @@ impl ExtendedQueryHandler {
             };
             
             session.prepared_statements.write().await.insert(name.clone(), stmt);
+            session.described_statements.write().await.remove(&name);
             
             framed.send(BackendMessage::ParseComplete).await
                 .map_err(PgSqliteError::Io)?;
@@ -343,6 +358,7 @@ impl ExtendedQueryHandler {
                 original_types: extracted_param_types.clone(), // Same as param_types since we extracted them directly
                 table_name: None, // Will be populated later if needed
                 column_names: Vec::new(), // Will be populated later if needed
+                field_descriptions: None,
                 created_at: std::time::Instant::now(),
             });
             // Cached parameter types
@@ -373,6 +389,7 @@ impl ExtendedQueryHandler {
                         original_types: actual_param_types.clone(), // Use same types since we don't have original info here
                         table_name: cached.table_names.first().cloned(),
                         column_names: Vec::new(), // Will be populated later if needed
+                        field_descriptions: None,
                         created_at: std::time::Instant::now(),
                     });
                 } else {
@@ -430,6 +447,7 @@ impl ExtendedQueryHandler {
                         original_types: original_types_opt.unwrap_or_else(|| actual_param_types.clone()),
                         table_name,
                         column_names,
+                        field_descriptions: None,
                         created_at: std::time::Instant::now(),
                     });
                     
@@ -515,12 +533,15 @@ impl ExtendedQueryHandler {
             translation_metadata.merge(metadata);
         }
         
-        // Translate catalog functions (remove pg_catalog prefix)
+        // Translate catalog functions, schema prefixes, and reflection SQL (remove pg_catalog prefix)
         #[cfg(not(feature = "unified_processor"))] // Skip when using unified processor
         {
-            use crate::translator::{CatalogFunctionTranslator, PgTableIsVisibleTranslator};
+            use crate::translator::{CatalogFunctionTranslator, PgTableIsVisibleTranslator, SchemaPrefixTranslator};
             translated_for_analysis = CatalogFunctionTranslator::translate(&translated_for_analysis);
+            translated_for_analysis = SchemaPrefixTranslator::translate_pg_table_is_visible_for_pg_class(&translated_for_analysis);
             translated_for_analysis = PgTableIsVisibleTranslator::translate(&translated_for_analysis);
+            translated_for_analysis = SchemaPrefixTranslator::translate_query(&translated_for_analysis);
+            translated_for_analysis = SchemaPrefixTranslator::translate_reflection_sql(&translated_for_analysis);
         }
         
         // Translate array operators with metadata
@@ -602,13 +623,14 @@ impl ExtendedQueryHandler {
         info!("PARSE: Original query: {}", cleaned_query);
         info!("PARSE: Is simple param select: {}", is_simple_param_select);
         let field_descriptions = if query_starts_with_ignore_case(&cleaned_query, "SELECT") || query_starts_with_ignore_case(&cleaned_query, "WITH") {
-            // Don't try to get field descriptions if this is a catalog query
-            // These queries are handled specially and don't need real field info
-            if cleaned_query.contains("pg_catalog") || cleaned_query.contains("pg_type") ||
+            // Don't try to get field descriptions if this is a non-reflection catalog query
+            // handled solely by the virtual catalog interceptor
+            let is_reflection = crate::types::SchemaTypeMapper::is_reflection_query(&cleaned_query);
+            if !is_reflection && (cleaned_query.contains("pg_catalog") || cleaned_query.contains("pg_type") ||
                cleaned_query.contains("pg_class") || cleaned_query.contains("pg_attribute") ||
                cleaned_query.contains("pg_namespace") || cleaned_query.contains("pg_enum") ||
                cleaned_query.contains("pg_constraint") || cleaned_query.contains("pg_depend") ||
-               cleaned_query.contains("pg_database") {
+               cleaned_query.contains("pg_database")) {
                 info!("PARSE: Skipping field description for catalog query: {}", cleaned_query);
                 Vec::new()
             } else {
@@ -634,18 +656,22 @@ impl ExtendedQueryHandler {
                 let cast_regex = regex::Regex::new(r"::[a-zA-Z]\w*(?:\[\])*").unwrap();
                 test_query = cast_regex.replace_all(&test_query, "").to_string();
                 
-                // Replace invalid LIMIT NULL / OFFSET NULL with valid literals for SQLite test query
+                // Replace invalid LIMIT/OFFSET NULL (including translated CAST(NULL AS ...))
+                // with valid integer literals for SQLite test query execution.
                 static LIMIT_NULL_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-                    regex::Regex::new(r"(?i)\bLIMIT\s+NULL\b").unwrap()
+                    regex::Regex::new(r"(?i)\bLIMIT\s+(?:CAST\s*\(\s*NULL\s+AS\s+[^)]+\)|NULL\b)").unwrap()
                 });
                 static OFFSET_NULL_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-                    regex::Regex::new(r"(?i)\bOFFSET\s+NULL\b").unwrap()
+                    regex::Regex::new(r"(?i)\bOFFSET\s+(?:CAST\s*\(\s*NULL\s+AS\s+[^)]+\)|NULL\b)").unwrap()
+                });
+                static HAS_LIMIT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                    regex::Regex::new(r"(?i)\bLIMIT\b").unwrap()
                 });
                 test_query = LIMIT_NULL_RE.replace_all(&test_query, "LIMIT 1").to_string();
                 test_query = OFFSET_NULL_RE.replace_all(&test_query, "OFFSET 0").to_string();
 
                 // Add LIMIT 1 to avoid processing too much data, but only if there's no existing LIMIT
-                if !test_query.to_uppercase().contains(" LIMIT ") {
+                if !HAS_LIMIT_RE.is_match(&test_query) {
                     test_query = format!("{test_query} LIMIT 1");
                 }
                 let cached_conn = Self::get_or_cache_connection(session, db).await;
@@ -661,7 +687,10 @@ impl ExtendedQueryHandler {
                         // Pre-fetch schema types for all columns
                         let mut schema_types = std::collections::HashMap::new();
                         let mut schema_types_by_idx = std::collections::HashMap::new();
-                        let pragma_types = if let Some(ref table) = table_name {
+                        let pragma_types = if let Some(ref table) = table_name
+                            && !table.starts_with("pg_")
+                            && !table.starts_with("information_schema")
+                        {
                             info!("PARSE: Fetching schema types for table '{}'", table);
                             db.get_column_types_from_pragma(&session.id, table).await.unwrap_or_default()
                         } else {
@@ -757,7 +786,10 @@ impl ExtendedQueryHandler {
                         // Try to infer types from the first row if available
                         // We need to handle this asynchronously for schema lookup
                         let mut inferred_types = Vec::new();
-                        let pragma_types_for_inferred = if let Some(ref table) = table_name {
+                        let pragma_types_for_inferred = if let Some(ref table) = table_name
+                            && !table.starts_with("pg_")
+                            && !table.starts_with("information_schema")
+                        {
                             db.get_column_types_from_pragma(&session.id, table).await.unwrap_or_default()
                         } else {
                             std::collections::HashMap::new()
@@ -944,11 +976,20 @@ impl ExtendedQueryHandler {
                             if !response.rows.is_empty() {
                                 if let Some(value) = response.rows[0].get(i) {
                                     let value_str = value.as_ref().and_then(|v| std::str::from_utf8(v).ok()).unwrap_or("<non-utf8>");
-                                    // Special case: For __pgsqlite_metadata.value column, always use TEXT
-                                    // to avoid incorrect type inference for metadata values like '25'
-                                    let inferred_type = if table_name.as_ref().map_or(false, |t| t == "__pgsqlite_metadata") && col_name == "value" {
+                                    let is_agg = crate::types::SchemaTypeMapper::get_aggregate_return_type_with_query(
+                                        col_name, None, None, Some(&cleaned_query)
+                                    ).is_some();
+                                    let is_catalog_source = !is_agg
+                                        && (table_name
+                                            .as_ref()
+                                            .is_some_and(|t| t.starts_with("pg_") || t.starts_with("information_schema"))
+                                            || cleaned_query.contains("pg_catalog")
+                                            || cleaned_query.contains("information_schema"));
+                                    let inferred_type = if table_name.as_ref().is_some_and(|t| t == "__pgsqlite_metadata") && col_name == "value" {
                                         info!("PARSE: Column 'value' in __pgsqlite_metadata: forcing TEXT type");
                                         PgType::Text.to_oid()
+                                    } else if is_catalog_source {
+                                        Self::get_catalog_column_type(col_name, &cleaned_query)
                                     } else {
                                         crate::types::SchemaTypeMapper::infer_type_from_value(value.as_deref())
                                     };
@@ -1061,7 +1102,7 @@ impl ExtendedQueryHandler {
                             }
                         }
                         
-                        let fields = response.columns.iter()
+                        let mut fields = response.columns.iter()
                             .enumerate()
                             .map(|(i, col_name)| FieldDescription {
                                 name: col_name.clone(),
@@ -1073,6 +1114,7 @@ impl ExtendedQueryHandler {
                                 format: 0,
                             })
                             .collect::<Vec<_>>();
+                        crate::types::SchemaTypeMapper::apply_reflection_field_oids(&mut fields, &cleaned_query);
                         
                         // Special logging for orders queries
                         if cleaned_query.contains("orders") {
@@ -1099,7 +1141,12 @@ impl ExtendedQueryHandler {
             }
         } else if ReturningTranslator::has_returning_clause(&cleaned_query) {
             info!("PARSE: Generating field descriptions for RETURNING clause: {}", cleaned_query);
-            if let Some((base_query, returning_clause)) = ReturningTranslator::extract_returning_clause(&cleaned_query) {
+            let returning_src = if ReturningTranslator::has_returning_clause(&translated_for_analysis) {
+                translated_for_analysis.as_str()
+            } else {
+                cleaned_query.as_str()
+            };
+            if let Some((base_query, returning_clause)) = ReturningTranslator::extract_returning_clause(returning_src) {
                 let table_name = ReturningTranslator::extract_table_from_insert(&base_query)
                     .or_else(|| ReturningTranslator::extract_table_from_update(&base_query))
                     .or_else(|| ReturningTranslator::extract_table_from_delete(&base_query));
@@ -1134,25 +1181,34 @@ impl ExtendedQueryHandler {
             Vec::new()
         };
         
-        // If param_types is empty but query has parameters, infer basic types
-        if actual_param_types.is_empty() && cleaned_query.contains('$') {
-            // Count parameters in the query
-            let mut max_param = 0;
+        // If param_types is empty but query has parameters, fill from extracted casts or leave unspecified (0)
+        if actual_param_types.is_empty() && (!extracted_param_types.is_empty() || cleaned_query.contains('$')) {
+            let mut max_param = extracted_param_types.len();
             for i in 1..=99 {
                 if cleaned_query.contains(&format!("${i}")) {
-                    max_param = i;
-                } else if max_param > 0 {
+                    max_param = max_param.max(i);
+                } else if i > max_param && max_param > 0 {
                     break;
                 }
             }
-            
-            info!("Query has {} parameters, leaving unspecified (0)", max_param);
-            // Leave as 0 (unspecified) so client types are respected
-            actual_param_types = vec![0; max_param];
+            actual_param_types = (0..max_param)
+                .map(|idx| extracted_param_types.get(idx).copied().unwrap_or(0))
+                .collect();
+            info!("Inferred parameter types from query/casts: {:?}", actual_param_types);
         }
         
         info!("Final param_types for statement: {:?}", actual_param_types);
-        
+
+        if let Some(mut cached_info) = GLOBAL_PARAMETER_CACHE.get(&query)
+            && (!field_descriptions.is_empty()
+                || (!query_starts_with_ignore_case(&cleaned_query, "SELECT")
+                    && !query_starts_with_ignore_case(&cleaned_query, "WITH")
+                    && !ReturningTranslator::has_returning_clause(&cleaned_query)))
+        {
+            cached_info.field_descriptions = Some(field_descriptions.clone());
+            GLOBAL_PARAMETER_CACHE.insert(query.clone(), cached_info);
+        }
+
         // Store the prepared statement
         // We already translated the query above for analysis, so just use that
         let translated_query = Some(translated_for_analysis);
@@ -1172,6 +1228,7 @@ impl ExtendedQueryHandler {
         };
         
         session.prepared_statements.write().await.insert(name.clone(), stmt);
+        session.described_statements.write().await.remove(&name);
         
         // Send ParseComplete
         framed.send(BackendMessage::ParseComplete).await
@@ -1402,6 +1459,11 @@ impl ExtendedQueryHandler {
         
         // Also maintain backward compatibility with direct portal storage
         session.portals.write().await.insert(portal.clone(), portal_obj);
+        if session.described_statements.read().await.contains(&statement) {
+            session.described_portals.write().await.insert(portal.clone());
+        } else {
+            session.described_portals.write().await.remove(&portal);
+        }
         
         // Send BindComplete
         framed.send(BackendMessage::BindComplete).await
@@ -1628,11 +1690,11 @@ impl ExtendedQueryHandler {
                                 info!("Ultra-fast path: Processing column expression {}: '{}'", col_idx, col_expr);
                                 let mut found_type = false;
                                 
-                                // Extract the alias name (after AS) if present
-                                let col_name = if let Some(as_pos) = col_expr.to_uppercase().rfind(" AS ") {
-                                    col_expr[as_pos + 4..].trim().trim_matches('"')
+                                // Extract expression before alias and the alias name (after AS) if present
+                                let (expr_part, col_name) = if let Some(as_pos) = col_expr.to_uppercase().rfind(" AS ") {
+                                    (col_expr[..as_pos].trim(), col_expr[as_pos + 4..].trim().trim_matches('"'))
                                 } else {
-                                    col_expr.trim().trim_matches('"')
+                                    (col_expr.trim(), col_expr.trim().trim_matches('"'))
                                 };
                                 
                                 // 1. Try to extract source table.column with index
@@ -1647,11 +1709,11 @@ impl ExtendedQueryHandler {
                                 }
                                 
                                 // 2. Handle table.column format directly in expression
-                                if !found_type && col_expr.contains('.') {
-                                    let parts: Vec<&str> = col_expr.split('.').collect();
+                                if !found_type && expr_part.contains('.') {
+                                    let parts: Vec<&str> = expr_part.split('.').collect();
                                     if parts.len() == 2 {
-                                        let table_alias = parts[0].trim();
-                                        let column_part = parts[1].trim();
+                                        let table_alias = parts[0].trim().trim_matches('"');
+                                        let column_part = parts[1].trim().trim_matches('"');
                                         let real_table = alias_map.get(table_alias).map(|s| s.as_str()).unwrap_or(table_alias);
                                         if let Ok(Some(pg_type_str)) = db.get_schema_type_with_session(&session.id, real_table, column_part).await {
                                             let type_oid = crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str);
@@ -1744,7 +1806,15 @@ impl ExtendedQueryHandler {
                                             Some(bytes.clone())
                                         }
                                     }
-                                    t if t == PgType::Int8.to_oid() => {
+                                    26 /* OID */ => {
+                                        if bytes.len() == 4 {
+                                            let val = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                                            Some(val.to_string().into_bytes())
+                                        } else {
+                                            Some(bytes.clone())
+                                        }
+                                    }
+                            t if t == PgType::Int8.to_oid() => {
                                         if bytes.len() == 8 {
                                             let val = i64::from_be_bytes([
                                                 bytes[0], bytes[1], bytes[2], bytes[3],
@@ -1817,6 +1887,16 @@ impl ExtendedQueryHandler {
                                             Some(val.to_string().into_bytes())
                                         } else {
                                             // Keep as-is if we can't determine type
+                                            Some(bytes.clone())
+                                        }
+                                    }
+                                    t if t == PgType::Uuid.to_oid() => {
+                                        if bytes.len() == 16 {
+                                            match crate::types::UuidHandler::bytes_to_uuid(bytes) {
+                                                Ok(uuid_str) => Some(uuid_str.into_bytes()),
+                                                Err(_) => Some(bytes.clone()),
+                                            }
+                                        } else {
                                             Some(bytes.clone())
                                         }
                                     }
@@ -2182,7 +2262,8 @@ impl ExtendedQueryHandler {
             || query_starts_with_ignore_case(&final_query, "START")
             || query_starts_with_ignore_case(&final_query, "COMMIT")
             || query_starts_with_ignore_case(&final_query, "END")
-            || query_starts_with_ignore_case(&final_query, "ROLLBACK") {
+            || (query_starts_with_ignore_case(&final_query, "ROLLBACK")
+                && !crate::query::is_rollback_to_savepoint(&final_query)) {
             Self::execute_transaction(framed, db, session, &final_query).await?;
         } else if crate::query::SetHandler::is_set_command(&final_query) {
             // Check if we should skip row description
@@ -2270,6 +2351,16 @@ impl ExtendedQueryHandler {
                                 info!("Correcting field '{}' from type_oid {} to Char type_oid {}", fd.name, fd.type_oid, PgType::Char.to_oid());
                                 fd.type_oid = PgType::Char.to_oid();
                             }
+                            "attname" => {
+                                fd.type_oid = PgType::Text.to_oid();
+                            }
+                            _ if query.contains("information_schema")
+                                && !col_lower.starts_with("count")
+                                && !col_lower.starts_with("sum")
+                                && !col_lower.starts_with("avg") =>
+                            {
+                                fd.type_oid = Self::get_catalog_column_type(&fd.name, query);
+                            }
                             _ => {}
                         }
                     }
@@ -2278,473 +2369,18 @@ impl ExtendedQueryHandler {
                 for (i, fd) in corrected_fields.iter().enumerate() {
                     info!("Field {}: name='{}', type_oid={}, table_oid={}", i, fd.name, fd.type_oid, fd.table_oid);
                 }
+                crate::types::SchemaTypeMapper::apply_reflection_field_oids(&mut corrected_fields, query);
+                drop(statements);
+                session.described_statements.write().await.insert(name.clone());
                 framed.send(BackendMessage::RowDescription(corrected_fields)).await
                     .map_err(PgSqliteError::Io)?;
-            } else if is_catalog_query && query_starts_with_ignore_case(query, "SELECT") {
-                // For catalog SELECT queries, we need to provide field descriptions
+            } else if (is_catalog_query || (query.contains("typeinfo_tree") && query.contains("attrtypoids")))
+                && (query_starts_with_ignore_case(query, "SELECT") || query_starts_with_ignore_case(query, "WITH"))
+            {
+                // For catalog SELECT/WITH queries, we need to provide field descriptions
                 // even though we skipped them during Parse
                 info!("Catalog query detected in Describe, generating field descriptions for: {}", query);
-                
-                // Parse the query to extract the selected columns (keep JSON path placeholders for now)
-                let field_descriptions = if let Ok(parsed) = sqlparser::parser::Parser::parse_sql(
-                    &sqlparser::dialect::PostgreSqlDialect {},
-                    query
-                ) {
-                    if let Some(sqlparser::ast::Statement::Query(query_stmt)) = parsed.first() {
-                        if let sqlparser::ast::SetExpr::Select(select) = &*query_stmt.body {
-                            let mut fields = Vec::new();
-                            
-                            // Check if it's SELECT *
-                            let is_select_star = select.projection.len() == 1 && 
-                                matches!(&select.projection[0], sqlparser::ast::SelectItem::Wildcard(_));
-                            
-                            if is_select_star {
-                                // For SELECT *, we need to determine which catalog table is being queried
-                                // and return all its columns
-                                if query.contains("pg_database") {
-                                    info!("DESCRIBE: Generating field descriptions for pg_database SELECT *");
-                                    println!("DEBUG: pg_database field descriptions being generated");
-                                    // Return all pg_database columns
-                                    let all_columns = vec![
-                                        ("oid", PgType::Int4.to_oid()),
-                                        ("datname", PgType::Text.to_oid()),
-                                        ("datdba", PgType::Int4.to_oid()),
-                                        ("encoding", PgType::Int4.to_oid()),
-                                        ("datlocprovider", PgType::Text.to_oid()),
-                                        ("datistemplate", PgType::Text.to_oid()),   // Using Text since we return 'f'/'t'
-                                        ("datallowconn", PgType::Text.to_oid()),    // Using Text since we return 'f'/'t'
-                                        ("dathasloginevt", PgType::Text.to_oid()),  // Using Text since we return 'f'/'t'
-                                        ("datconnlimit", PgType::Int4.to_oid()),
-                                        ("datfrozenxid", PgType::Text.to_oid()),
-                                        ("datminmxid", PgType::Text.to_oid()),
-                                        ("dattablespace", PgType::Int4.to_oid()),
-                                        ("datcollate", PgType::Text.to_oid()),
-                                        ("datctype", PgType::Text.to_oid()),
-                                        ("datlocale", PgType::Text.to_oid()),
-                                        ("daticurules", PgType::Text.to_oid()),
-                                        ("datcollversion", PgType::Text.to_oid()),
-                                        ("datacl", PgType::Text.to_oid()),
-                                    ];
-
-                                    for (i, (name, oid)) in all_columns.into_iter().enumerate() {
-                                        if i == 5 {
-                                            println!("DEBUG: pg_database column 5 ({}): type_oid = {}", name, oid);
-                                        }
-                                        fields.push(FieldDescription {
-                                            name: name.to_string(),
-                                            table_oid: 0,
-                                            column_id: (i + 1) as i16,
-                                            type_oid: oid,
-                                            type_size: -1,
-                                            type_modifier: -1,
-                                            format: 0,
-                                        });
-                                    }
-                                } else if query.contains("pg_class") {
-                                    // Return all pg_class columns (33 total in current PostgreSQL)
-                                    const OID_TYPE: i32 = 26;
-                                    const XID_TYPE: i32 = 28;
-                                    const ACLITEM_ARRAY_TYPE: i32 = 1034;
-                                    const TEXT_ARRAY_TYPE: i32 = 1009;
-                                    const PG_NODE_TREE_TYPE: i32 = 194;
-                                    
-                                    let all_columns = vec![
-                                        ("oid", OID_TYPE),
-                                        ("relname", PgType::Text.to_oid()),
-                                        ("relnamespace", OID_TYPE),
-                                        ("reltype", OID_TYPE),
-                                        ("reloftype", OID_TYPE),
-                                        ("relowner", OID_TYPE),
-                                        ("relam", OID_TYPE),
-                                        ("relfilenode", OID_TYPE),
-                                        ("reltablespace", OID_TYPE),
-                                        ("relpages", PgType::Int4.to_oid()),
-                                        ("reltuples", PgType::Float4.to_oid()),
-                                        ("relallvisible", PgType::Int4.to_oid()),
-                                        ("reltoastrelid", OID_TYPE),
-                                        ("relhasindex", PgType::Bool.to_oid()),
-                                        ("relisshared", PgType::Bool.to_oid()),
-                                        ("relpersistence", PgType::Char.to_oid()),
-                                        ("relkind", PgType::Char.to_oid()),
-                                        ("relnatts", PgType::Int2.to_oid()),
-                                        ("relchecks", PgType::Int2.to_oid()),
-                                        ("relhasrules", PgType::Bool.to_oid()),
-                                        ("relhastriggers", PgType::Bool.to_oid()),
-                                        ("relhassubclass", PgType::Bool.to_oid()),
-                                        ("relrowsecurity", PgType::Bool.to_oid()),
-                                        ("relforcerowsecurity", PgType::Bool.to_oid()),
-                                        ("relispopulated", PgType::Bool.to_oid()),
-                                        ("relreplident", PgType::Char.to_oid()),
-                                        ("relispartition", PgType::Bool.to_oid()),
-                                        ("relrewrite", OID_TYPE),
-                                        ("relfrozenxid", XID_TYPE),
-                                        ("relminmxid", XID_TYPE),
-                                        ("relacl", ACLITEM_ARRAY_TYPE),
-                                        ("reloptions", TEXT_ARRAY_TYPE),
-                                        ("relpartbound", PG_NODE_TREE_TYPE),
-                                    ];
-                                    
-                                    for (i, (name, oid)) in all_columns.into_iter().enumerate() {
-                                        fields.push(FieldDescription {
-                                            name: name.to_string(),
-                                            table_oid: 0,
-                                            column_id: (i + 1) as i16,
-                                            type_oid: oid,
-                                            type_size: -1,
-                                            type_modifier: -1,
-                                            format: 0,
-                                        });
-                                    }
-                                } else if query.contains("pg_attribute") {
-                                    // Return all pg_attribute columns
-                                    const OID_TYPE: i32 = 26;
-                                    
-                                    let all_columns = vec![
-                                        ("attrelid", OID_TYPE),
-                                        ("attname", PgType::Text.to_oid()),
-                                        ("atttypid", OID_TYPE),
-                                        ("attstattarget", PgType::Int4.to_oid()),
-                                        ("attlen", PgType::Int2.to_oid()),
-                                        ("attnum", PgType::Int2.to_oid()),
-                                        ("attndims", PgType::Int4.to_oid()),
-                                        ("attcacheoff", PgType::Int4.to_oid()),
-                                        ("atttypmod", PgType::Int4.to_oid()),
-                                        ("attbyval", PgType::Bool.to_oid()),
-                                        ("attalign", PgType::Char.to_oid()),
-                                        ("attstorage", PgType::Char.to_oid()),
-                                        ("attcompression", PgType::Char.to_oid()),
-                                        ("attnotnull", PgType::Bool.to_oid()),
-                                        ("atthasdef", PgType::Bool.to_oid()),
-                                        ("atthasmissing", PgType::Bool.to_oid()),
-                                        ("attidentity", PgType::Char.to_oid()),
-                                        ("attgenerated", PgType::Char.to_oid()),
-                                        ("attisdropped", PgType::Bool.to_oid()),
-                                        ("attislocal", PgType::Bool.to_oid()),
-                                        ("attinhcount", PgType::Int4.to_oid()),
-                                        ("attcollation", OID_TYPE),
-                                        ("attacl", PgType::Text.to_oid()), // Simplified - actually aclitem[]
-                                        ("attoptions", PgType::Text.to_oid()), // Simplified - actually text[]
-                                        ("attfdwoptions", PgType::Text.to_oid()), // Simplified - actually text[]
-                                        ("attmissingval", PgType::Text.to_oid()), // Simplified
-                                    ];
-                                    
-                                    for (i, (name, oid)) in all_columns.into_iter().enumerate() {
-                                        fields.push(FieldDescription {
-                                            name: name.to_string(),
-                                            table_oid: 0,
-                                            column_id: (i + 1) as i16,
-                                            type_oid: oid,
-                                            type_size: -1,
-                                            type_modifier: -1,
-                                            format: 0,
-                                        });
-                                    }
-                                } else if query.contains("pg_constraint") {
-                                    // Return all pg_constraint columns
-                                    let all_columns = vec![
-                                        ("oid", PgType::Text.to_oid()), // Returned as text for now
-                                        ("conname", PgType::Text.to_oid()),
-                                        ("connamespace", PgType::Text.to_oid()), // Returned as text for now
-                                        ("contype", PgType::Char.to_oid()),
-                                        ("condeferrable", PgType::Bool.to_oid()),
-                                        ("condeferred", PgType::Bool.to_oid()),
-                                        ("convalidated", PgType::Bool.to_oid()),
-                                        ("conrelid", PgType::Text.to_oid()), // Returned as text for now
-                                        ("contypid", PgType::Text.to_oid()), // Returned as text for now
-                                        ("conindid", PgType::Text.to_oid()), // Returned as text for now
-                                        ("conparentid", PgType::Text.to_oid()), // Returned as text for now
-                                        ("confrelid", PgType::Text.to_oid()), // Returned as text for now
-                                        ("confupdtype", PgType::Char.to_oid()),
-                                        ("confdeltype", PgType::Char.to_oid()),
-                                        ("confmatchtype", PgType::Char.to_oid()),
-                                        ("conislocal", PgType::Bool.to_oid()),
-                                        ("coninhcount", PgType::Int4.to_oid()),
-                                        ("connoinherit", PgType::Bool.to_oid()),
-                                        ("conkey", PgType::Text.to_oid()), // Simplified - actually int2[]
-                                        ("confkey", PgType::Text.to_oid()), // Simplified - actually int2[]
-                                        ("conpfeqop", PgType::Text.to_oid()), // Simplified - actually oid[]
-                                        ("conppeqop", PgType::Text.to_oid()), // Simplified - actually oid[]
-                                        ("conffeqop", PgType::Text.to_oid()), // Simplified - actually oid[]
-                                        ("confdelsetcols", PgType::Text.to_oid()), // Simplified - actually int2[]
-                                        ("conexclop", PgType::Text.to_oid()), // Simplified - actually oid[]
-                                        ("conbin", PgType::Text.to_oid()), // Simplified - actually pg_node_tree
-                                    ];
-
-                                    for (i, (name, oid)) in all_columns.into_iter().enumerate() {
-                                        fields.push(FieldDescription {
-                                            name: name.to_string(),
-                                            table_oid: 0,
-                                            column_id: (i + 1) as i16,
-                                            type_oid: oid,
-                                            type_size: -1,
-                                            type_modifier: -1,
-                                            format: 0,
-                                        });
-                                    }
-                                } else if query.contains("pg_depend") {
-                                    // Return all pg_depend columns
-                                    let all_columns = vec![
-                                        ("classid", PgType::Text.to_oid()), // Returned as text for now
-                                        ("objid", PgType::Text.to_oid()), // Returned as text for now
-                                        ("objsubid", PgType::Int4.to_oid()),
-                                        ("refclassid", PgType::Text.to_oid()), // Returned as text for now
-                                        ("refobjid", PgType::Text.to_oid()), // Returned as text for now
-                                        ("refobjsubid", PgType::Int4.to_oid()),
-                                        ("deptype", PgType::Char.to_oid()),
-                                    ];
-
-                                    for (i, (name, oid)) in all_columns.into_iter().enumerate() {
-                                        fields.push(FieldDescription {
-                                            name: name.to_string(),
-                                            table_oid: 0,
-                                            column_id: (i + 1) as i16,
-                                            type_oid: oid,
-                                            type_size: -1,
-                                            type_modifier: -1,
-                                            format: 0,
-                                        });
-                                    }
-                                } else if query.contains("information_schema.schemata") {
-                                    // Return all information_schema.schemata columns
-                                    let all_columns = vec![
-                                        ("catalog_name", PgType::Text.to_oid()),
-                                        ("schema_name", PgType::Text.to_oid()),
-                                        ("schema_owner", PgType::Text.to_oid()),
-                                        ("default_character_set_catalog", PgType::Text.to_oid()),
-                                        ("default_character_set_schema", PgType::Text.to_oid()),
-                                        ("default_character_set_name", PgType::Text.to_oid()),
-                                        ("sql_path", PgType::Text.to_oid()),
-                                    ];
-                                    for (i, (name, oid)) in all_columns.into_iter().enumerate() {
-                                        fields.push(FieldDescription {
-                                            name: name.to_string(),
-                                            table_oid: 0,
-                                            column_id: (i + 1) as i16,
-                                            type_oid: oid,
-                                            type_size: -1,
-                                            type_modifier: -1,
-                                            format: 0,
-                                        });
-                                    }
-                                } else if query.contains("information_schema.tables") {
-                                    // information_schema.tables now executes against the
-                                    // information_schema_tables SQLite view (#88), but Describe
-                                    // still needs static metadata for SELECT * -- this mirrors
-                                    // the view's column list from migration v29 exactly.
-                                    let all_columns = vec![
-                                        ("table_catalog", PgType::Text.to_oid()),
-                                        ("table_schema", PgType::Text.to_oid()),
-                                        ("table_name", PgType::Text.to_oid()),
-                                        ("table_type", PgType::Text.to_oid()),
-                                        ("self_referencing_column_name", PgType::Text.to_oid()),
-                                        ("reference_generation", PgType::Text.to_oid()),
-                                        ("user_defined_type_catalog", PgType::Text.to_oid()),
-                                        ("user_defined_type_schema", PgType::Text.to_oid()),
-                                        ("user_defined_type_name", PgType::Text.to_oid()),
-                                        ("is_insertable_into", PgType::Text.to_oid()),
-                                        ("is_typed", PgType::Text.to_oid()),
-                                        ("commit_action", PgType::Text.to_oid()),
-                                    ];
-                                    for (i, (name, oid)) in all_columns.into_iter().enumerate() {
-                                        fields.push(FieldDescription {
-                                            name: name.to_string(),
-                                            table_oid: 0,
-                                            column_id: (i + 1) as i16,
-                                            type_oid: oid,
-                                            type_size: -1,
-                                            type_modifier: -1,
-                                            format: 0,
-                                        });
-                                    }
-                                } else if query.contains("information_schema.columns") {
-                                    // Return all information_schema.columns columns (44 total)
-                                    let all_columns = vec![
-                                        ("table_catalog", PgType::Text.to_oid()),
-                                        ("table_schema", PgType::Text.to_oid()),
-                                        ("table_name", PgType::Text.to_oid()),
-                                        ("column_name", PgType::Text.to_oid()),
-                                        ("ordinal_position", PgType::Int4.to_oid()),
-                                        ("column_default", PgType::Text.to_oid()),
-                                        ("is_nullable", PgType::Text.to_oid()),
-                                        ("data_type", PgType::Text.to_oid()),
-                                        ("character_maximum_length", PgType::Int4.to_oid()),
-                                        ("character_octet_length", PgType::Int4.to_oid()),
-                                        ("numeric_precision", PgType::Int4.to_oid()),
-                                        ("numeric_precision_radix", PgType::Int4.to_oid()),
-                                        ("numeric_scale", PgType::Int4.to_oid()),
-                                        ("datetime_precision", PgType::Int4.to_oid()),
-                                        ("interval_type", PgType::Text.to_oid()),
-                                        ("interval_precision", PgType::Int4.to_oid()),
-                                        ("character_set_catalog", PgType::Text.to_oid()),
-                                        ("character_set_schema", PgType::Text.to_oid()),
-                                        ("character_set_name", PgType::Text.to_oid()),
-                                        ("collation_catalog", PgType::Text.to_oid()),
-                                        ("collation_schema", PgType::Text.to_oid()),
-                                        ("collation_name", PgType::Text.to_oid()),
-                                        ("domain_catalog", PgType::Text.to_oid()),
-                                        ("domain_schema", PgType::Text.to_oid()),
-                                        ("domain_name", PgType::Text.to_oid()),
-                                        ("udt_catalog", PgType::Text.to_oid()),
-                                        ("udt_schema", PgType::Text.to_oid()),
-                                        ("udt_name", PgType::Text.to_oid()),
-                                        ("scope_catalog", PgType::Text.to_oid()),
-                                        ("scope_schema", PgType::Text.to_oid()),
-                                        ("scope_name", PgType::Text.to_oid()),
-                                        ("maximum_cardinality", PgType::Int4.to_oid()),
-                                        ("dtd_identifier", PgType::Text.to_oid()),
-                                        ("is_self_referencing", PgType::Text.to_oid()),
-                                        ("is_identity", PgType::Text.to_oid()),
-                                        ("identity_generation", PgType::Text.to_oid()),
-                                        ("identity_start", PgType::Text.to_oid()),
-                                        ("identity_increment", PgType::Text.to_oid()),
-                                        ("identity_maximum", PgType::Text.to_oid()),
-                                        ("identity_minimum", PgType::Text.to_oid()),
-                                        ("identity_cycle", PgType::Text.to_oid()),
-                                        ("is_generated", PgType::Text.to_oid()),
-                                        ("generation_expression", PgType::Text.to_oid()),
-                                        ("is_updatable", PgType::Text.to_oid()),
-                                    ];
-                                    for (i, (name, oid)) in all_columns.into_iter().enumerate() {
-                                        fields.push(FieldDescription {
-                                            name: name.to_string(),
-                                            table_oid: 0,
-                                            column_id: (i + 1) as i16,
-                                            type_oid: oid,
-                                            type_size: -1,
-                                            type_modifier: -1,
-                                            format: 0,
-                                        });
-                                    }
-                                } else if query.contains("information_schema.key_column_usage") {
-                                    // Return all information_schema.key_column_usage columns (9 total)
-                                    let all_columns = vec![
-                                        ("constraint_catalog", PgType::Text.to_oid()),
-                                        ("constraint_schema", PgType::Text.to_oid()),
-                                        ("constraint_name", PgType::Text.to_oid()),
-                                        ("table_catalog", PgType::Text.to_oid()),
-                                        ("table_schema", PgType::Text.to_oid()),
-                                        ("table_name", PgType::Text.to_oid()),
-                                        ("column_name", PgType::Text.to_oid()),
-                                        ("ordinal_position", PgType::Int4.to_oid()),
-                                        ("position_in_unique_constraint", PgType::Int4.to_oid()),
-                                    ];
-                                    for (i, (name, oid)) in all_columns.into_iter().enumerate() {
-                                        fields.push(FieldDescription {
-                                            name: name.to_string(),
-                                            table_oid: 0,
-                                            column_id: (i + 1) as i16,
-                                            type_oid: oid,
-                                            type_size: -1,
-                                            type_modifier: -1,
-                                            format: 0,
-                                        });
-                                    }
-                                } else if query.contains("information_schema.table_constraints") {
-                                    // Return all information_schema.table_constraints columns
-                                    let all_columns = vec![
-                                        ("constraint_catalog", PgType::Text.to_oid()),
-                                        ("constraint_schema", PgType::Text.to_oid()),
-                                        ("constraint_name", PgType::Text.to_oid()),
-                                        ("table_catalog", PgType::Text.to_oid()),
-                                        ("table_schema", PgType::Text.to_oid()),
-                                        ("table_name", PgType::Text.to_oid()),
-                                        ("constraint_type", PgType::Text.to_oid()),
-                                        ("is_deferrable", PgType::Text.to_oid()),
-                                        ("initially_deferred", PgType::Text.to_oid()),
-                                        ("enforced", PgType::Text.to_oid()),
-                                        ("nulls_distinct", PgType::Text.to_oid()),
-                                    ];
-                                    for (i, (name, oid)) in all_columns.into_iter().enumerate() {
-                                        fields.push(FieldDescription {
-                                            name: name.to_string(),
-                                            table_oid: 0,
-                                            column_id: (i + 1) as i16,
-                                            type_oid: oid,
-                                            type_size: -1,
-                                            type_modifier: -1,
-                                            format: 0,
-                                        });
-                                    }
-                                }
-                            } else {
-                                // Parse the projection to get column names and types
-                                for (i, proj) in select.projection.iter().enumerate() {
-                                    let (col_name, type_oid) = match proj {
-                                        sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
-                                            match expr {
-                                                sqlparser::ast::Expr::Identifier(ident) => {
-                                                    let name = ident.value.to_lowercase();
-                                                    let type_oid = Self::get_catalog_column_type(&name, query);
-                                                    (name, type_oid)
-                                                }
-                                                sqlparser::ast::Expr::CompoundIdentifier(parts) => {
-                                                    let name = parts.last().map(|p| p.value.to_lowercase()).unwrap_or_else(|| "?column?".to_string());
-                                                    let type_oid = Self::get_catalog_column_type(&name, query);
-                                                    (name, type_oid)
-                                                }
-                                                sqlparser::ast::Expr::Function(func) => {
-                                                    let fname = func.name.to_string().to_lowercase();
-                                                    // PostgreSQL names an unaliased aggregate column after
-                                                    // the function itself, e.g. `count(*)` -> "count".
-                                                    // Scoped to information_schema (#88 fall-through routing)
-                                                    // so pg_depend/pg_class COUNT(*) callers, which read the
-                                                    // result as text today, are unaffected.
-                                                    let type_oid = if fname == "count" && query.contains("information_schema") {
-                                                        PgType::Int8.to_oid()
-                                                    } else {
-                                                        PgType::Text.to_oid()
-                                                    };
-                                                    (fname, type_oid)
-                                                }
-                                                _ => ("?column?".to_string(), PgType::Text.to_oid()),
-                                            }
-                                        }
-                                        sqlparser::ast::SelectItem::ExprWithAlias { alias, expr } => {
-                                            let type_oid = match expr {
-                                                sqlparser::ast::Expr::Identifier(ident) => {
-                                                    Self::get_catalog_column_type(&ident.value.to_lowercase(), query)
-                                                }
-                                                sqlparser::ast::Expr::CompoundIdentifier(parts) => {
-                                                    let name = parts.last().map(|p| p.value.to_lowercase()).unwrap_or_else(|| "?column?".to_string());
-                                                    Self::get_catalog_column_type(&name, query)
-                                                }
-                                                sqlparser::ast::Expr::Function(func) => {
-                                                    let fname = func.name.to_string().to_lowercase();
-                                                    if fname == "count" && query.contains("information_schema") {
-                                                        PgType::Int8.to_oid()
-                                                    } else {
-                                                        PgType::Text.to_oid()
-                                                    }
-                                                }
-                                                _ => PgType::Text.to_oid(),
-                                            };
-                                            (alias.value.clone(), type_oid)
-                                        }
-                                        _ => ("?column?".to_string(), PgType::Text.to_oid()),
-                                    };
-                                    
-                                    fields.push(FieldDescription {
-                                        name: col_name,
-                                        table_oid: 0,
-                                        column_id: (i + 1) as i16,
-                                        type_oid,
-                                        type_size: -1,
-                                        type_modifier: -1,
-                                        format: 0,
-                                    });
-                                }
-                            }
-                            
-                            fields
-                        } else {
-                            Vec::new()
-                        }
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                };
+                let field_descriptions = Self::infer_catalog_describe_fields(query, stmt.translated_query.as_deref());
                 
                 if !field_descriptions.is_empty() {
                     info!("Sending RowDescription with {} catalog fields in Describe", field_descriptions.len());
@@ -2761,6 +2397,7 @@ impl ExtendedQueryHandler {
                     
                     framed.send(BackendMessage::RowDescription(field_descriptions)).await
                         .map_err(PgSqliteError::Io)?;
+                    session.described_statements.write().await.insert(name.clone());
                 } else {
                     // Fallback to NoData if we couldn't parse the query
                     info!("Could not determine catalog fields, sending NoData in Describe");
@@ -2848,13 +2485,421 @@ impl ExtendedQueryHandler {
                 
                 framed.send(BackendMessage::RowDescription(fields)).await
                     .map_err(PgSqliteError::Io)?;
+                session.described_portals.write().await.insert(name.clone());
             } else {
-                framed.send(BackendMessage::NoData).await
-                    .map_err(PgSqliteError::Io)?;
+                let statement_name = portal.statement_name.clone();
+                let result_formats = portal.result_formats.clone();
+                let mut fields = Self::infer_catalog_describe_fields(&stmt.query, stmt.translated_query.as_deref());
+                if !fields.is_empty() {
+                    for (i, field) in fields.iter_mut().enumerate() {
+                        field.format = if result_formats.is_empty() {
+                            0
+                        } else if result_formats.len() == 1 {
+                            result_formats[0]
+                        } else if i < result_formats.len() {
+                            result_formats[i]
+                        } else {
+                            0
+                        };
+                    }
+                    drop(portals);
+                    drop(statements);
+                    let mut statements = session.prepared_statements.write().await;
+                    if let Some(stmt_mut) = statements.get_mut(&statement_name) {
+                        stmt_mut.field_descriptions = fields.clone();
+                    }
+                    drop(statements);
+                    framed.send(BackendMessage::RowDescription(fields)).await
+                        .map_err(PgSqliteError::Io)?;
+                    session.described_portals.write().await.insert(name.clone());
+                } else {
+                    framed.send(BackendMessage::NoData).await
+                        .map_err(PgSqliteError::Io)?;
+                }
             }
         }
         
         Ok(())
+    }
+
+    fn infer_catalog_describe_fields(query: &str, translated_query: Option<&str>) -> Vec<FieldDescription> {
+        if query.contains("typeinfo_tree") && query.contains("attrtypoids") {
+            return crate::types::SchemaTypeMapper::typeinfo_tree_field_descriptions();
+        }
+        let query_lower = query.to_ascii_lowercase();
+        if !query_lower.contains("pg_") && !query_lower.contains("information_schema") {
+            return Vec::new();
+        }
+        if !query_starts_with_ignore_case(query, "SELECT") && !query_starts_with_ignore_case(query, "WITH") {
+            return Vec::new();
+        }
+        static PYFORMAT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r"%\([^)]+\)s").unwrap()
+        });
+        let normalized_raw = if query.contains("%(") {
+            PYFORMAT_RE.replace_all(query, "$1").into_owned()
+        } else {
+            query.to_string()
+        };
+        let parsed = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, &normalized_raw)
+            .or_else(|_| {
+                let fallback = translated_query.unwrap_or(query);
+                sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, fallback)
+            });
+        let Ok(parsed) = parsed else {
+            return Vec::new();
+        };
+        let Some(sqlparser::ast::Statement::Query(query_stmt)) = parsed.first() else {
+            return Vec::new();
+        };
+        let sqlparser::ast::SetExpr::Select(select) = &*query_stmt.body else {
+            return Vec::new();
+        };
+        let mut fields = Vec::new();
+        let is_select_star = select.projection.len() == 1
+            && matches!(&select.projection[0], sqlparser::ast::SelectItem::Wildcard(_));
+
+        if is_select_star {
+            if query.contains("pg_database") {
+                let all_columns = vec![
+                    ("oid", PgType::Int4.to_oid()),
+                    ("datname", PgType::Text.to_oid()),
+                    ("datdba", PgType::Int4.to_oid()),
+                    ("encoding", PgType::Int4.to_oid()),
+                    ("datlocprovider", PgType::Text.to_oid()),
+                    ("datistemplate", PgType::Text.to_oid()),
+                    ("datallowconn", PgType::Text.to_oid()),
+                    ("dathasloginevt", PgType::Text.to_oid()),
+                    ("datconnlimit", PgType::Int4.to_oid()),
+                    ("datfrozenxid", PgType::Text.to_oid()),
+                    ("datminmxid", PgType::Text.to_oid()),
+                    ("dattablespace", PgType::Int4.to_oid()),
+                    ("datcollate", PgType::Text.to_oid()),
+                    ("datctype", PgType::Text.to_oid()),
+                    ("datlocale", PgType::Text.to_oid()),
+                    ("daticurules", PgType::Text.to_oid()),
+                    ("datcollversion", PgType::Text.to_oid()),
+                    ("datacl", PgType::Text.to_oid()),
+                ];
+                for (i, (col_name, oid)) in all_columns.into_iter().enumerate() {
+                    fields.push(FieldDescription {
+                        name: col_name.to_string(),
+                        table_oid: 0,
+                        column_id: (i + 1) as i16,
+                        type_oid: oid,
+                        type_size: -1,
+                        type_modifier: -1,
+                        format: 0,
+                    });
+                }
+            } else if query.contains("pg_class") {
+                const OID_TYPE: i32 = 26;
+                const XID_TYPE: i32 = 28;
+                const ACLITEM_ARRAY_TYPE: i32 = 1034;
+                const TEXT_ARRAY_TYPE: i32 = 1009;
+                const PG_NODE_TREE_TYPE: i32 = 194;
+                let all_columns = vec![
+                    ("oid", OID_TYPE), ("relname", PgType::Text.to_oid()), ("relnamespace", OID_TYPE),
+                    ("reltype", OID_TYPE), ("reloftype", OID_TYPE), ("relowner", OID_TYPE),
+                    ("relam", OID_TYPE), ("relfilenode", OID_TYPE), ("reltablespace", OID_TYPE),
+                    ("relpages", PgType::Int4.to_oid()), ("reltuples", PgType::Float4.to_oid()),
+                    ("relallvisible", PgType::Int4.to_oid()), ("reltoastrelid", OID_TYPE),
+                    ("relhasindex", PgType::Bool.to_oid()), ("relisshared", PgType::Bool.to_oid()),
+                    ("relpersistence", PgType::Char.to_oid()), ("relkind", PgType::Char.to_oid()),
+                    ("relnatts", PgType::Int2.to_oid()), ("relchecks", PgType::Int2.to_oid()),
+                    ("relhasrules", PgType::Bool.to_oid()), ("relhastriggers", PgType::Bool.to_oid()),
+                    ("relhassubclass", PgType::Bool.to_oid()), ("relrowsecurity", PgType::Bool.to_oid()),
+                    ("relforcerowsecurity", PgType::Bool.to_oid()), ("relispopulated", PgType::Bool.to_oid()),
+                    ("relispartition", PgType::Bool.to_oid()), ("relrewrite", OID_TYPE),
+                    ("relfrozenxid", XID_TYPE), ("relminmxid", XID_TYPE), ("relacl", ACLITEM_ARRAY_TYPE),
+                    ("reloptions", TEXT_ARRAY_TYPE), ("relpartbound", PG_NODE_TREE_TYPE),
+                ];
+                for (i, (col_name, oid)) in all_columns.into_iter().enumerate() {
+                    fields.push(FieldDescription {
+                        name: col_name.to_string(),
+                        table_oid: 0,
+                        column_id: (i + 1) as i16,
+                        type_oid: oid,
+                        type_size: -1,
+                        type_modifier: -1,
+                        format: 0,
+                    });
+                }
+            } else if query.contains("pg_type") {
+                const OID_TYPE: i32 = 26;
+                let all_columns = vec![
+                    ("oid", OID_TYPE), ("typname", PgType::Text.to_oid()),
+                    ("typtype", PgType::Char.to_oid()), ("typelem", OID_TYPE),
+                    ("typarray", OID_TYPE), ("typbasetype", OID_TYPE),
+                    ("typnamespace", OID_TYPE), ("typcategory", PgType::Char.to_oid()),
+                    ("typlen", PgType::Int2.to_oid()), ("typbyval", PgType::Bool.to_oid()),
+                    ("typrelid", OID_TYPE),
+                ];
+                for (i, (col_name, oid)) in all_columns.into_iter().enumerate() {
+                    fields.push(FieldDescription {
+                        name: col_name.to_string(),
+                        table_oid: 0,
+                        column_id: (i + 1) as i16,
+                        type_oid: oid,
+                        type_size: -1,
+                        type_modifier: -1,
+                        format: 0,
+                    });
+                }
+            } else if query.contains("pg_namespace") {
+                const OID_TYPE: i32 = 26;
+                const ACLITEM_ARRAY_TYPE: i32 = 1034;
+                let all_columns = vec![
+                    ("oid", OID_TYPE), ("nspname", PgType::Text.to_oid()),
+                    ("nspowner", OID_TYPE), ("nspacl", ACLITEM_ARRAY_TYPE),
+                ];
+                for (i, (col_name, oid)) in all_columns.into_iter().enumerate() {
+                    fields.push(FieldDescription {
+                        name: col_name.to_string(),
+                        table_oid: 0,
+                        column_id: (i + 1) as i16,
+                        type_oid: oid,
+                        type_size: -1,
+                        type_modifier: -1,
+                        format: 0,
+                    });
+                }
+            } else if query.contains("pg_attribute") {
+                const OID_TYPE: i32 = 26;
+                const TEXT_ARRAY_TYPE: i32 = 1009;
+                const PG_NODE_TREE_TYPE: i32 = 194;
+                let all_columns = vec![
+                    ("attrelid", OID_TYPE), ("attname", PgType::Text.to_oid()), ("atttypid", OID_TYPE),
+                    ("attstattarget", PgType::Int4.to_oid()), ("attlen", PgType::Int2.to_oid()),
+                    ("attnum", PgType::Int2.to_oid()), ("attndims", PgType::Int4.to_oid()),
+                    ("attcacheoff", PgType::Int4.to_oid()), ("atttypmod", PgType::Int4.to_oid()),
+                    ("attbyval", PgType::Bool.to_oid()), ("attalign", PgType::Char.to_oid()),
+                    ("attstorage", PgType::Char.to_oid()), ("attcompression", PgType::Char.to_oid()),
+                    ("attnotnull", PgType::Bool.to_oid()), ("atthasdef", PgType::Bool.to_oid()),
+                    ("atthasmissing", PgType::Bool.to_oid()), ("attidentity", PgType::Char.to_oid()),
+                    ("attgenerated", PgType::Char.to_oid()), ("attisdropped", PgType::Bool.to_oid()),
+                    ("attislocal", PgType::Bool.to_oid()), ("attinhcount", PgType::Int4.to_oid()),
+                    ("attcollation", OID_TYPE), ("attacl", TEXT_ARRAY_TYPE),
+                    ("attoptions", TEXT_ARRAY_TYPE), ("attfdwoptions", TEXT_ARRAY_TYPE),
+                    ("attmissingval", PG_NODE_TREE_TYPE),
+                ];
+                for (i, (col_name, oid)) in all_columns.into_iter().enumerate() {
+                    fields.push(FieldDescription {
+                        name: col_name.to_string(),
+                        table_oid: 0,
+                        column_id: (i + 1) as i16,
+                        type_oid: oid,
+                        type_size: -1,
+                        type_modifier: -1,
+                        format: 0,
+                    });
+                }
+            } else if query.contains("pg_constraint") {
+                let all_columns = vec![
+                    ("conname", PgType::Text.to_oid()), ("contype", PgType::Char.to_oid()),
+                    ("condeferrable", PgType::Bool.to_oid()), ("condeferred", PgType::Bool.to_oid()),
+                    ("convalidated", PgType::Bool.to_oid()), ("conrelid", PgType::Text.to_oid()),
+                    ("contypid", PgType::Text.to_oid()), ("conindid", PgType::Text.to_oid()),
+                    ("conparentid", PgType::Text.to_oid()), ("confrelid", PgType::Text.to_oid()),
+                    ("confupdtype", PgType::Char.to_oid()), ("confdeltype", PgType::Char.to_oid()),
+                    ("confmatchtype", PgType::Char.to_oid()), ("conislocal", PgType::Bool.to_oid()),
+                    ("coninhcount", PgType::Int4.to_oid()), ("connoinherit", PgType::Bool.to_oid()),
+                    ("conkey", PgType::Text.to_oid()), ("confkey", PgType::Text.to_oid()),
+                    ("conpfeqop", PgType::Text.to_oid()), ("conppeqop", PgType::Text.to_oid()),
+                    ("conffeqop", PgType::Text.to_oid()), ("conexclop", PgType::Text.to_oid()),
+                    ("conbin", PgType::Text.to_oid()),
+                ];
+                for (i, (col_name, oid)) in all_columns.into_iter().enumerate() {
+                    fields.push(FieldDescription {
+                        name: col_name.to_string(),
+                        table_oid: 0,
+                        column_id: (i + 1) as i16,
+                        type_oid: oid,
+                        type_size: -1,
+                        type_modifier: -1,
+                        format: 0,
+                    });
+                }
+            } else if query.contains("pg_depend") {
+                let all_columns = vec![
+                    ("classid", PgType::Text.to_oid()), ("objid", PgType::Text.to_oid()),
+                    ("objsubid", PgType::Int4.to_oid()), ("refclassid", PgType::Text.to_oid()),
+                    ("refobjid", PgType::Text.to_oid()), ("refobjsubid", PgType::Int4.to_oid()),
+                    ("deptype", PgType::Char.to_oid()),
+                ];
+                for (i, (col_name, oid)) in all_columns.into_iter().enumerate() {
+                    fields.push(FieldDescription {
+                        name: col_name.to_string(),
+                        table_oid: 0,
+                        column_id: (i + 1) as i16,
+                        type_oid: oid,
+                        type_size: -1,
+                        type_modifier: -1,
+                        format: 0,
+                    });
+                }
+            } else if query.contains("information_schema.schemata") {
+                for (i, col_name) in [
+                    "catalog_name", "schema_name", "schema_owner",
+                    "default_character_set_catalog", "default_character_set_schema",
+                    "default_character_set_name", "sql_path",
+                ].into_iter().enumerate() {
+                    fields.push(FieldDescription {
+                        name: col_name.to_string(),
+                        table_oid: 0,
+                        column_id: (i + 1) as i16,
+                        type_oid: PgType::Text.to_oid(),
+                        type_size: -1,
+                        type_modifier: -1,
+                        format: 0,
+                    });
+                }
+            } else if query.contains("information_schema.tables") {
+                for (i, col_name) in [
+                    "table_catalog", "table_schema", "table_name", "table_type",
+                    "self_referencing_column_name", "reference_generation",
+                    "user_defined_type_catalog", "user_defined_type_schema",
+                    "user_defined_type_name", "is_insertable_into", "is_typed", "commit_action",
+                ].into_iter().enumerate() {
+                    fields.push(FieldDescription {
+                        name: col_name.to_string(),
+                        table_oid: 0,
+                        column_id: (i + 1) as i16,
+                        type_oid: PgType::Text.to_oid(),
+                        type_size: -1,
+                        type_modifier: -1,
+                        format: 0,
+                    });
+                }
+            } else if query.contains("information_schema.columns") {
+                let int_cols = ["ordinal_position", "character_maximum_length", "character_octet_length",
+                    "numeric_precision", "numeric_precision_radix", "numeric_scale",
+                    "datetime_precision", "interval_precision", "maximum_cardinality"];
+                for (i, col_name) in [
+                    "table_catalog", "table_schema", "table_name", "column_name", "ordinal_position",
+                    "column_default", "is_nullable", "data_type", "character_maximum_length",
+                    "character_octet_length", "numeric_precision", "numeric_precision_radix",
+                    "numeric_scale", "datetime_precision", "interval_type", "interval_precision",
+                    "character_set_catalog", "character_set_schema", "character_set_name",
+                    "collation_catalog", "collation_schema", "collation_name",
+                    "domain_catalog", "domain_schema", "domain_name",
+                    "udt_catalog", "udt_schema", "udt_name",
+                    "scope_catalog", "scope_schema", "scope_name",
+                    "maximum_cardinality", "dtd_identifier", "is_self_referencing",
+                    "is_identity", "identity_generation", "identity_start", "identity_increment",
+                    "identity_maximum", "identity_minimum", "identity_cycle",
+                    "is_generated", "generation_expression", "is_updatable",
+                ].into_iter().enumerate() {
+                    let oid = if int_cols.contains(&col_name) { PgType::Int4.to_oid() } else { PgType::Text.to_oid() };
+                    fields.push(FieldDescription {
+                        name: col_name.to_string(),
+                        table_oid: 0,
+                        column_id: (i + 1) as i16,
+                        type_oid: oid,
+                        type_size: -1,
+                        type_modifier: -1,
+                        format: 0,
+                    });
+                }
+            } else if query.contains("information_schema.key_column_usage") {
+                for (i, col_name) in [
+                    "constraint_catalog", "constraint_schema", "constraint_name",
+                    "table_catalog", "table_schema", "table_name",
+                    "column_name", "ordinal_position", "position_in_unique_constraint",
+                ].into_iter().enumerate() {
+                    let oid = if matches!(col_name, "ordinal_position" | "position_in_unique_constraint") {
+                        PgType::Int4.to_oid()
+                    } else {
+                        PgType::Text.to_oid()
+                    };
+                    fields.push(FieldDescription {
+                        name: col_name.to_string(),
+                        table_oid: 0,
+                        column_id: (i + 1) as i16,
+                        type_oid: oid,
+                        type_size: -1,
+                        type_modifier: -1,
+                        format: 0,
+                    });
+                }
+            } else if query.contains("information_schema.table_constraints") {
+                for (i, col_name) in [
+                    "constraint_catalog", "constraint_schema", "constraint_name",
+                    "table_catalog", "table_schema", "table_name", "constraint_type",
+                    "is_deferrable", "initially_deferred", "enforced", "nulls_distinct",
+                ].into_iter().enumerate() {
+                    fields.push(FieldDescription {
+                        name: col_name.to_string(),
+                        table_oid: 0,
+                        column_id: (i + 1) as i16,
+                        type_oid: PgType::Text.to_oid(),
+                        type_size: -1,
+                        type_modifier: -1,
+                        format: 0,
+                    });
+                }
+            }
+        } else {
+            for (i, proj) in select.projection.iter().enumerate() {
+                let (col_name, type_oid) = match proj {
+                    sqlparser::ast::SelectItem::UnnamedExpr(expr) => match expr {
+                        sqlparser::ast::Expr::Identifier(ident) => {
+                            let name = ident.value.to_lowercase();
+                            let type_oid = Self::get_catalog_column_type(&name, query);
+                            (name, type_oid)
+                        }
+                        sqlparser::ast::Expr::CompoundIdentifier(parts) => {
+                            let name = parts.last().map(|p| p.value.to_lowercase()).unwrap_or_else(|| "?column?".to_string());
+                            let type_oid = Self::get_catalog_column_type(&name, query);
+                            (name, type_oid)
+                        }
+                        sqlparser::ast::Expr::Function(func) => {
+                            let fname = func.name.to_string().to_lowercase();
+                            let type_oid = if fname == "count" && query.contains("information_schema") {
+                                PgType::Int8.to_oid()
+                            } else {
+                                PgType::Text.to_oid()
+                            };
+                            (fname, type_oid)
+                        }
+                        _ => ("?column?".to_string(), PgType::Text.to_oid()),
+                    },
+                    sqlparser::ast::SelectItem::ExprWithAlias { alias, expr } => {
+                        let type_oid = match expr {
+                            sqlparser::ast::Expr::Identifier(ident) => {
+                                Self::get_catalog_column_type(&ident.value.to_lowercase(), query)
+                            }
+                            sqlparser::ast::Expr::CompoundIdentifier(parts) => {
+                                let name = parts.last().map(|p| p.value.to_lowercase()).unwrap_or_else(|| "?column?".to_string());
+                                Self::get_catalog_column_type(&name, query)
+                            }
+                            sqlparser::ast::Expr::Function(func) => {
+                                let fname = func.name.to_string().to_lowercase();
+                                if fname == "count" && query.contains("information_schema") {
+                                    PgType::Int8.to_oid()
+                                } else {
+                                    PgType::Text.to_oid()
+                                }
+                            }
+                            _ => PgType::Text.to_oid(),
+                        };
+                        (alias.value.clone(), type_oid)
+                    }
+                    _ => ("?column?".to_string(), PgType::Text.to_oid()),
+                };
+                fields.push(FieldDescription {
+                    name: col_name,
+                    table_oid: 0,
+                    column_id: (i + 1) as i16,
+                    type_oid,
+                    type_size: -1,
+                    type_modifier: -1,
+                    format: 0,
+                });
+            }
+        }
+        crate::types::SchemaTypeMapper::apply_reflection_field_oids(&mut fields, query);
+        fields
     }
     
     pub async fn handle_close<T>(
@@ -2871,10 +2916,12 @@ impl ExtendedQueryHandler {
         if typ == b'S' {
             // Close statement
             session.prepared_statements.write().await.remove(&name);
+            session.described_statements.write().await.remove(&name);
         } else {
             // Close portal
             session.portal_manager.close_portal(&name);
             session.portals.write().await.remove(&name);
+            session.described_portals.write().await.remove(&name);
         }
         
         // Send CloseComplete
@@ -2925,21 +2972,17 @@ impl ExtendedQueryHandler {
         };
         
         // Get field descriptions from prepared statement if available
-        // Also check if we've already sent RowDescription with binary format
-        let (field_types, has_binary_row_desc): (Option<Vec<i32>>, bool) = {
+        let field_types: Option<Vec<i32>> = {
             let statements = session.prepared_statements.read().await;
-            if let Some(stmt) = statements.get(&statement_name) {
+            statements.get(&statement_name).and_then(|stmt| {
                 if !stmt.field_descriptions.is_empty() {
-                    // Check if any field has binary format, which means Describe(Portal) sent RowDescription
-                    let has_binary = stmt.field_descriptions.iter().any(|fd| fd.format == 1);
-                    (Some(stmt.field_descriptions.iter().map(|fd| fd.type_oid).collect()), has_binary)
+                    Some(stmt.field_descriptions.iter().map(|fd| fd.type_oid).collect())
                 } else {
-                    (None, false)
+                    None
                 }
-            } else {
-                (None, false)
-            }
+            })
         };
+        let row_desc_sent = session.described_portals.read().await.contains(portal);
         
         // Try fast path execution first
         if let Ok(Some(response)) = db.try_execute_fast_path_with_params(query, &rusqlite_params, &session.id).await {
@@ -2953,13 +2996,10 @@ impl ExtendedQueryHandler {
                 };
                 framed.send(BackendMessage::CommandComplete { tag }).await?;
             } else {
-                // SELECT operation - check if we need to send RowDescription
-                if has_binary_row_desc {
-                    // Describe(Portal) already sent RowDescription with binary format
-                    // Just send the data rows without RowDescription
+                // SELECT operation - check if RowDescription was already sent by Describe
+                if row_desc_sent {
                     Self::send_data_rows_only(framed, response, &result_formats, field_types.as_deref()).await?;
                 } else {
-                    // Send full response with RowDescription
                     Self::send_select_response(framed, response, max_rows, &result_formats, field_types.as_deref()).await?;
                 }
             }
@@ -2978,13 +3018,10 @@ impl ExtendedQueryHandler {
                 };
                 framed.send(BackendMessage::CommandComplete { tag }).await?;
             } else {
-                // SELECT operation - check if we need to send RowDescription
-                if has_binary_row_desc {
-                    // Describe(Portal) already sent RowDescription with binary format
-                    // Just send the data rows without RowDescription
+                // SELECT operation - check if RowDescription was already sent by Describe
+                if row_desc_sent {
                     Self::send_data_rows_only(framed, response, &result_formats, field_types.as_deref()).await?;
                 } else {
-                    // Send full response with RowDescription
                     Self::send_select_response(framed, response, max_rows, &result_formats, field_types.as_deref()).await?;
                 }
             }
@@ -3103,6 +3140,14 @@ impl ExtendedQueryHandler {
             }
         } else {
             // Binary format
+            if param_type == PgType::Uuid.to_oid() {
+                if bytes.len() == 16 {
+                    let uuid_str = crate::types::UuidHandler::bytes_to_uuid(bytes)?;
+                    return Ok(rusqlite::types::Value::Text(uuid_str));
+                } else if let Ok(text) = std::str::from_utf8(bytes) {
+                    return Ok(rusqlite::types::Value::Text(text.to_string()));
+                }
+            }
             if PgType::from_oid(param_type).map(|pt| pt.is_array()).unwrap_or(false) {
                 if let Ok(json_arr) = crate::protocol::binary::BinaryEncoder::decode_array(bytes) {
                     return Ok(rusqlite::types::Value::Text(json_arr));
@@ -3251,6 +3296,14 @@ impl ExtendedQueryHandler {
                                     format!("X'{}'", hex::encode(bytes))
                                 }
                             }
+                            26 /* OID */ => {
+                                if bytes.len() == 4 {
+                                    let value = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                                    value.to_string()
+                                } else {
+                                    format!("X'{}'", hex::encode(bytes))
+                                }
+                            }
                             t if t == PgType::Int8.to_oid() => {
                                 // int8
                                 if bytes.len() == 8 {
@@ -3306,8 +3359,23 @@ impl ExtendedQueryHandler {
                                     Err(_) => format!("X'{}'", hex::encode(bytes)),
                                 }
                             }
-                            t if t == PgType::Text.to_oid() || t == PgType::Varchar.to_oid() => {
-                                // TEXT/VARCHAR in binary format is just UTF-8 bytes
+                            t if t == PgType::Uuid.to_oid() => {
+                                if bytes.len() == 16 {
+                                    match crate::types::UuidHandler::bytes_to_uuid(bytes) {
+                                        Ok(uuid_str) => {
+                                            info!("Decoded binary UUID parameter {}: {}", i + 1, uuid_str);
+                                            format!("'{}'", uuid_str.replace('\'', "''"))
+                                        }
+                                        Err(_) => format!("X'{}'", hex::encode(bytes)),
+                                    }
+                                } else if let Ok(s) = std::str::from_utf8(bytes) {
+                                    format!("'{}'", s.replace('\'', "''"))
+                                } else {
+                                    format!("X'{}'", hex::encode(bytes))
+                                }
+                            }
+                            t if t == PgType::Text.to_oid() || t == PgType::Varchar.to_oid() || t == PgType::Char.to_oid() || t == 18 || t == 19 => {
+                                // TEXT/VARCHAR/CHAR/NAME in binary format is UTF-8 bytes
                                 match String::from_utf8(bytes.clone()) {
                                     Ok(s) => {
                                         
@@ -3541,6 +3609,9 @@ impl ExtendedQueryHandler {
                                             }
                                         }
                                     }
+                                    t if t == PgType::Uuid.to_oid() => {
+                                        format!("'{}'", s.replace('\'', "''"))
+                                    }
                                     t if t == PgType::Json.to_oid() || t == PgType::Jsonb.to_oid() => {
                                         if serde_json::from_str::<serde_json::Value>(&s).is_err() {
                                             return Err(PgSqliteError::Validation(crate::error::PgError::Generic {
@@ -3709,6 +3780,9 @@ impl ExtendedQueryHandler {
         const TEXT_ARRAY_TYPE: i32 = 1009;
         const PG_NODE_TREE_TYPE: i32 = 194;
         
+        if matches!(column_name.to_ascii_lowercase().as_str(), "count" | "count(*)") {
+            return PgType::Int8.to_oid();
+        }
         // Determine which catalog table based on column name patterns first, then query content
         // First check if this is a pg_attribute column (regardless of what tables are in the query)
         if column_name.starts_with("att") ||
@@ -3745,12 +3819,19 @@ impl ExtendedQueryHandler {
             match column_name {
                 "oid" | "typnamespace" | "typowner" | "typrelid" | "typelem" | "typarray" | 
                 "typinput" | "typoutput" | "typreceive" | "typsend" | "typmodin" | 
-                "typmodout" | "typanalyze" | "typbasetype" | "typcollation" => OID_TYPE,
+                "typmodout" | "typanalyze" | "typbasetype" | "typcollation" |
+                "rngsubtype" | "rngtypid" | "rngmultitypid" => OID_TYPE,
                 "typname" | "typdefault" | "typacl" => PgType::Text.to_oid(),
                 "typlen" => PgType::Int2.to_oid(),
                 "typmod" | "typndims" => PgType::Int4.to_oid(),
                 "typbyval" | "typisdefined" | "typnotnull" => PgType::Bool.to_oid(),
                 "typtype" | "typcategory" | "typalign" | "typstorage" | "typdelim" => PgType::Char.to_oid(),
+                _ => PgType::Text.to_oid(),
+            }
+        } else if query.contains("pg_enum") {
+            match column_name {
+                "oid" | "enumtypid" => OID_TYPE,
+                "enumsortorder" => PgType::Float4.to_oid(),
                 _ => PgType::Text.to_oid(),
             }
         } else if query.contains("pg_namespace") {
@@ -3801,14 +3882,19 @@ impl ExtendedQueryHandler {
                 "datlocale" | "daticurules" | "datcollversion" | "datacl" => PgType::Text.to_oid(),
                 _ => PgType::Text.to_oid(),
             }
-        } else if query.contains("information_schema.columns") {
+        } else if query.contains("information_schema.columns") || query.contains("information_schema_columns") {
             match column_name {
                 "ordinal_position" | "character_maximum_length" | "character_octet_length" |
                 "numeric_precision" | "numeric_precision_radix" | "numeric_scale" |
                 "datetime_precision" | "interval_precision" | "maximum_cardinality" => PgType::Int4.to_oid(),
                 _ => PgType::Text.to_oid(),
             }
-        } else if query.contains("information_schema.key_column_usage") {
+        } else if query.contains("pg_am") || query.contains("pg_opclass") {
+            match column_name {
+                "oid" => OID_TYPE,
+                _ => PgType::Text.to_oid(),
+            }
+        } else if query.contains("information_schema.key_column_usage") || query.contains("information_schema_key_column_usage") {
             match column_name {
                 "ordinal_position" | "position_in_unique_constraint" => PgType::Int4.to_oid(),
                 _ => PgType::Text.to_oid(),
@@ -4250,6 +4336,19 @@ impl ExtendedQueryHandler {
                                     Some(bytes.clone())
                                 }
                             }
+                            26 /* OID */ => {
+                                if let Ok(s) = String::from_utf8(bytes.clone()) {
+                                    if s.trim().is_empty() {
+                                        None
+                                    } else if let Ok(val) = s.trim().parse::<u32>() {
+                                        Some(val.to_be_bytes().to_vec())
+                                    } else {
+                                        Some(bytes.clone())
+                                    }
+                                } else {
+                                    Some(bytes.clone())
+                                }
+                            }
                             t if t == PgType::Int8.to_oid() => {
                                 // int8 - convert text to binary
                                 if let Ok(s) = String::from_utf8(bytes.clone()) {
@@ -4309,8 +4408,8 @@ impl ExtendedQueryHandler {
                                     Some(bytes.clone())
                                 }
                             }
-                            t if t == PgType::Int2Array.to_oid() => {
-                                // int2[] - encode JSON array to binary format
+                            t if t == PgType::Int2Array.to_oid() || t == 22 => {
+                                // int2[] / int2vector - encode array/vector to binary format
                                 if let Ok(s) = String::from_utf8(bytes.clone()) {
                                     if let Some(binary_data) = crate::protocol::binary::BinaryEncoder::encode_value(&rusqlite::types::Value::Text(s), type_oid, true) {
                                         Some(binary_data)
@@ -4342,6 +4441,17 @@ impl ExtendedQueryHandler {
                             }
                             t if t == PgType::Int8Array.to_oid() => {
                                 // int8[] - encode JSON array to binary format
+                                if let Ok(s) = String::from_utf8(bytes.clone()) {
+                                    if let Some(binary_data) = crate::protocol::binary::BinaryEncoder::encode_value(&rusqlite::types::Value::Text(s), type_oid, true) {
+                                        Some(binary_data)
+                                    } else {
+                                        Some(bytes.clone())
+                                    }
+                                } else {
+                                    Some(bytes.clone())
+                                }
+                            }
+                            t if t == PgType::OidArray.to_oid() => {
                                 if let Ok(s) = String::from_utf8(bytes.clone()) {
                                     if let Some(binary_data) = crate::protocol::binary::BinaryEncoder::encode_value(&rusqlite::types::Value::Text(s), type_oid, true) {
                                         Some(binary_data)
@@ -4401,13 +4511,15 @@ impl ExtendedQueryHandler {
                                 }
                             }
                             t if t == PgType::Uuid.to_oid() => {
-                                // uuid - convert text to binary (16 bytes)
+                                // uuid - convert text to binary (16 bytes), or preserve existing 16-byte raw form
                                 if let Ok(s) = String::from_utf8(bytes.clone()) {
                                     if let Ok(uuid_bytes) = crate::types::uuid::UuidHandler::uuid_to_bytes(&s) {
                                         Some(uuid_bytes)
                                     } else {
                                         Some(bytes.clone())
                                     }
+                                } else if bytes.len() == 16 {
+                                    Some(bytes.clone())
                                 } else {
                                     Some(bytes.clone())
                                 }
@@ -4609,7 +4721,7 @@ impl ExtendedQueryHandler {
                                 }
                             }
                             // Text types - these are fine as-is in binary format
-                            t if t == PgType::Text.to_oid() || t == PgType::Varchar.to_oid() || t == PgType::Char.to_oid() => {
+                            t if t == 18 || t == PgType::Text.to_oid() || t == PgType::Varchar.to_oid() || t == PgType::Char.to_oid() => {
                                 // text/varchar/char - UTF-8 encoded text
                                 Some(bytes.clone())
                             }
@@ -4666,6 +4778,16 @@ impl ExtendedQueryHandler {
                                     Some(pg_bool.as_bytes().to_vec())
                                 } else {
                                     Some(vec![b'f'])
+                                }
+                            }
+                            t if t == PgType::Uuid.to_oid() => {
+                                if bytes.len() == 16 {
+                                    match crate::types::UuidHandler::bytes_to_uuid(bytes) {
+                                        Ok(uuid_str) => Some(uuid_str.into_bytes()),
+                                        Err(_) => Some(bytes.clone()),
+                                    }
+                                } else {
+                                    Some(bytes.clone())
                                 }
                             }
                             // Date type - convert from INTEGER days to formatted string
@@ -4743,8 +4865,12 @@ impl ExtendedQueryHandler {
                                     Some(bytes.clone())
                                 }
                             }
-                            // NOTE: Array type handling removed for text format too
-                            // Arrays are returned as JSON strings with TEXT type
+                            t if PgType::from_oid(t).is_some_and(|pt| pt.is_array()) => {
+                                match crate::query::QueryExecutor::convert_json_to_pg_array_for_oid(bytes, t) {
+                                    Ok(converted) => Some(converted),
+                                    Err(_) => Some(bytes.clone()),
+                                }
+                            }
                             t if t == PgType::Text.to_oid() => {
                                 // Enhanced datetime detection for TEXT columns
                                 if let Ok(s) = String::from_utf8(bytes.clone()) {
@@ -5253,7 +5379,7 @@ impl ExtendedQueryHandler {
                 }
                 let field_types = corrected_field_types;
 
-                let fields: Vec<FieldDescription> = {
+                let mut fields: Vec<FieldDescription> = {
                     let portals = session.portals.read().await;
                     let portal = portals.get(portal_name).unwrap();
                     let result_formats = &portal.result_formats;
@@ -5283,6 +5409,7 @@ impl ExtendedQueryHandler {
                         })
                         .collect()
                 };
+                crate::types::SchemaTypeMapper::apply_reflection_field_oids(&mut fields, query);
                 
                 // Cache the field descriptions (without format, as that's per-portal)
                 let cache_fields = fields.iter().map(|f| FieldDescription {
@@ -5408,6 +5535,14 @@ impl ExtendedQueryHandler {
                                 if table_name.as_ref().map_or(false, |t| t == "__pgsqlite_metadata") && col_name == "value" {
                                     info!("EXECUTE: Column 'value' in __pgsqlite_metadata: forcing TEXT type");
                                     25 // TEXT
+                                } else if (table_name.as_ref().is_some_and(|t| t.starts_with("pg_") || t.starts_with("information_schema"))
+                                    || query.contains("pg_catalog")
+                                    || query.contains("information_schema"))
+                                    && crate::types::SchemaTypeMapper::get_aggregate_return_type_with_query(
+                                        col_name, None, None, Some(query)
+                                    ).is_none()
+                                {
+                                    Self::get_catalog_column_type(col_name, query)
                                 } else {
                                     crate::types::SchemaTypeMapper::infer_type_from_value(value.as_deref())
                                 }
@@ -5449,6 +5584,12 @@ impl ExtendedQueryHandler {
                     }
                 }
             }
+
+            crate::types::SchemaTypeMapper::apply_reflection_oids_to_columns(
+                &response.columns,
+                &mut field_types,
+                query,
+            );
 
             (portal.result_formats.clone(), field_types)
         };
@@ -5820,30 +5961,7 @@ impl ExtendedQueryHandler {
                 };
 
                 if let Some(pg_type_str) = schema_type_opt {
-                    match pg_type_str.to_uppercase().as_str() {
-                        "BOOL" | "BOOLEAN" => 16,
-                        "INT2" | "SMALLINT" => 21,
-                        "INT4" | "INTEGER" | "INT" => 23,
-                        "INT8" | "BIGINT" => 20,
-                        "FLOAT4" | "REAL" => 700,
-                        "FLOAT8" | "DOUBLE PRECISION" => 701,
-                        "TEXT" => 25,
-                        "VARCHAR" | "CHARACTER VARYING" => 1043,
-                        "CHAR" | "CHARACTER" => 1042,
-                        "UUID" => 2950,
-                        "JSON" => 114,
-                        "JSONB" => 3802,
-                        "DATE" => 1082,
-                        "TIME" | "TIME WITHOUT TIME ZONE" => 1083,
-                        "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => 1114,
-                        "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => 1184,
-                        "TIMETZ" | "TIME WITH TIME ZONE" => 1266,
-                        "INTERVAL" => 1186,
-                        "NUMERIC" | "DECIMAL" => 1700,
-                        "BYTEA" => 17,
-                        "MONEY" => 790,
-                        _ => 25, // Default to TEXT for unknown types
-                    }
+                    crate::types::SchemaTypeMapper::pg_type_string_to_oid(&pg_type_str)
                 } else {
                     25 // Default to TEXT if not found
                 }
@@ -5912,7 +6030,8 @@ impl ExtendedQueryHandler {
 
         // In PostgreSQL extended protocol, RowDescription is sent during Describe.
         // Only send RowDescription during Execute if it was not already sent during Describe.
-        if stmt_field_descriptions.is_empty() {
+        let row_desc_sent = session.described_portals.read().await.contains(portal_name);
+        if !row_desc_sent {
             framed.send(BackendMessage::RowDescription(field_descriptions.clone())).await
                 .map_err(PgSqliteError::Io)?;
         }
@@ -5952,16 +6071,31 @@ impl ExtendedQueryHandler {
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         use crate::ddl::EnumDdlHandler;
+
+        crate::cache::GLOBAL_PARAMETER_CACHE.clear();
+        crate::cache::GLOBAL_ROW_DESCRIPTION_CACHE.clear();
         
-        // Check if this is an ENUM DDL statement first
+        // Handle ENUM DDL statements using the session connection
         if EnumDdlHandler::is_enum_ddl(query) {
-            // ENUM DDL needs special handling through direct SQL execution
-            // Parse and execute the ENUM DDL as SQL statements
-            let enum_error = PgSqliteError::Protocol(
-                "ENUM DDL is not supported in the current per-session connection mode. \
-                Please create ENUMs before establishing connections.".to_string()
-            );
-            return Err(enum_error);
+            db.with_session_connection_mut(&session.id, |conn| {
+                EnumDdlHandler::handle_enum_ddl(conn, query)
+                    .map_err(|e| rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                        Some(e.to_string()),
+                    ))
+            }).await?;
+            let tag = if query_starts_with_ignore_case(query, "CREATE") {
+                "CREATE TYPE".to_string()
+            } else if query_starts_with_ignore_case(query, "ALTER") {
+                "ALTER TYPE".to_string()
+            } else if query_starts_with_ignore_case(query, "DROP") {
+                "DROP TYPE".to_string()
+            } else {
+                "OK".to_string()
+            };
+            framed.send(BackendMessage::CommandComplete { tag }).await
+                .map_err(PgSqliteError::Io)?;
+            return Ok(());
         }
         
         // Handle CREATE TABLE translation
@@ -6160,7 +6294,9 @@ impl ExtendedQueryHandler {
         // Handle other DDL with potential translation
         let translated_query = if query.to_lowercase().contains("json") || query.to_lowercase().contains("jsonb") {
             JsonTranslator::translate_statement(query)?
-        } else if query_starts_with_ignore_case(query, "CREATE INDEX") {
+        } else if query_starts_with_ignore_case(query, "CREATE INDEX")
+            || query_starts_with_ignore_case(query, "CREATE UNIQUE INDEX")
+        {
             // Translate CREATE INDEX with operator classes
             crate::translator::CreateIndexTranslator::translate(query)
         } else {
@@ -6169,12 +6305,41 @@ impl ExtendedQueryHandler {
         
         let cached_conn = Self::get_or_cache_connection(session, db).await;
         db.execute_with_session_cached(&translated_query, &session.id, cached_conn.as_ref()).await?;
+
+        if let Some(table_name) = crate::catalog::constraint_populator::extract_table_name_from_create_index(query) {
+            let _ = db.with_session_connection(&session.id, |conn| {
+                crate::catalog::constraint_populator::populate_index_for_table(conn, &table_name)
+                    .map_err(|e| rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                        Some(e.to_string()),
+                    ))
+            }).await;
+        } else if query_starts_with_ignore_case(query, "DROP TABLE") {
+            static DROP_TABLE_NAME_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                regex::Regex::new(r#"(?i)DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:"([^"]+)"|([a-zA-Z_][a-zA-Z0-9_]*))"#).unwrap()
+            });
+            if let Some(caps) = DROP_TABLE_NAME_RE.captures(query)
+                && let Some(tbl) = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str().to_string())
+            {
+                crate::query::executor::invalidate_table_schema_cache(&tbl);
+                db.get_schema_cache().invalidate(&tbl.to_lowercase());
+                let _ = db.with_session_connection_mut(&session.id, |conn| {
+                    crate::metadata::EnumTriggers::clean_enum_usage_for_table(conn, &tbl)
+                        .map_err(|e| rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                            Some(e.to_string()),
+                        ))
+                }).await;
+            }
+        }
         
         let tag = if query_starts_with_ignore_case(query, "CREATE TABLE") {
             "CREATE TABLE".to_string()
         } else if query_starts_with_ignore_case(query, "DROP TABLE") {
             "DROP TABLE".to_string()
-        } else if query_starts_with_ignore_case(query, "CREATE INDEX") {
+        } else if query_starts_with_ignore_case(query, "CREATE INDEX")
+            || query_starts_with_ignore_case(query, "CREATE UNIQUE INDEX")
+        {
             "CREATE INDEX".to_string()
         } else {
             "OK".to_string()
@@ -6228,8 +6393,25 @@ impl ExtendedQueryHandler {
     {
         let cached_conn = Self::get_or_cache_connection(session, db).await;
         db.execute_with_session_cached(query, &session.id, cached_conn.as_ref()).await?;
-        
-        framed.send(BackendMessage::CommandComplete { tag: "OK".to_string() }).await
+
+        if crate::query::is_rollback_to_savepoint(query)
+            && session.get_transaction_status().await == crate::protocol::TransactionStatus::InFailedTransaction
+        {
+            session.set_transaction_status(crate::protocol::TransactionStatus::InTransaction).await;
+        }
+
+        let trimmed_upper = query.trim_start().to_ascii_uppercase();
+        let tag = if trimmed_upper.starts_with("SAVEPOINT") {
+            "SAVEPOINT".to_string()
+        } else if trimmed_upper.starts_with("RELEASE") {
+            "RELEASE".to_string()
+        } else if crate::query::is_rollback_to_savepoint(query) {
+            "ROLLBACK".to_string()
+        } else {
+            "OK".to_string()
+        };
+
+        framed.send(BackendMessage::CommandComplete { tag }).await
             .map_err(PgSqliteError::Io)?;
         
         Ok(())
@@ -6519,6 +6701,12 @@ impl ExtendedQueryHandler {
                             param_types.push(oid);
                             info!("Found type for parameter {} from column {}: {} (OID {})", 
                                   i, column, pg_type, oid);
+                            found_type = true;
+                            break;
+                        } else if table_name.starts_with("pg_") || table_name.starts_with("information_schema") {
+                            let oid = Self::get_catalog_column_type(column, query);
+                            param_types.push(oid);
+                            info!("Resolved catalog parameter {} from {}.{} -> OID {}", i, table_name, column, oid);
                             found_type = true;
                             break;
                         } else if let Ok(pragma_types) = db.get_column_types_from_pragma(&session.id, &table_name).await {

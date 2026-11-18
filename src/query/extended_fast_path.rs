@@ -518,6 +518,16 @@ impl ExtendedFastPath {
                         Err(PgSqliteError::Protocol("Invalid INTERVAL binary format".to_string()))
                     }
                 }
+                t if t == PgType::Uuid.to_oid() => {
+                    if bytes.len() == 16 {
+                        let uuid_str = crate::types::UuidHandler::bytes_to_uuid(bytes)?;
+                        Ok(rusqlite::types::Value::Text(uuid_str))
+                    } else if let Ok(text) = std::str::from_utf8(bytes) {
+                        Ok(rusqlite::types::Value::Text(text.to_string()))
+                    } else {
+                        Err(PgSqliteError::Protocol(format!("Invalid UUID binary format: {} bytes", bytes.len())))
+                    }
+                }
                 t if t == PgType::Macaddr.to_oid() || t == PgType::Macaddr8.to_oid() || t == PgType::Inet.to_oid() ||
                      t == PgType::Cidr.to_oid() || t == PgType::Int4range.to_oid() || t == PgType::Int8range.to_oid() ||
                      t == PgType::Numrange.to_oid() || t == PgType::Bit.to_oid() || t == PgType::Varbit.to_oid() => {
@@ -606,37 +616,47 @@ impl ExtendedFastPath {
             },
         };
         
-        // Check if we need to send RowDescription
-        let send_row_desc = {
+        // Check if RowDescription was already sent via Describe('S') or Describe('P')
+        let portal_described = session.described_portals.read().await.contains(portal_name);
+        let send_row_desc = if portal_described {
+            false
+        } else {
             let portals = session.portals.read().await;
             let portal = portals.get(portal_name).unwrap();
-            let statements = session.prepared_statements.read().await;
-            let stmt = statements.get(&portal.statement_name).unwrap();
-            
-            // Check if field descriptions are empty OR suspiciously all TEXT for non-parameter columns
-            let is_empty = stmt.field_descriptions.is_empty();
-            let looks_suspicious = if !is_empty && !stmt.field_descriptions.is_empty() {
-                // Check if all non-parameter columns are TEXT (OID 25)
-                let non_param_types: Vec<_> = stmt.field_descriptions.iter()
-                    .filter(|fd| !fd.name.starts_with('$') && fd.name != "?column?" && fd.name != "NULL")
-                    .map(|fd| fd.type_oid)
-                    .collect();
-                
-                // If we have non-parameter columns and they're ALL TEXT, that's suspicious
-                !non_param_types.is_empty() && non_param_types.iter().all(|&oid| oid == 25)
-            } else {
+            let statement_name = portal.statement_name.clone();
+            drop(portals);
+            let stmt_described = session.described_statements.read().await.contains(&statement_name);
+            if stmt_described {
                 false
-            };
-            
-            if looks_suspicious {
-                if query.contains("orders") && query.contains("customer_id") {
-                    info!("Fast path: SUSPICIOUS field descriptions detected for orders query!");
-                    info!("Fast path: Field descriptions: {:?}", stmt.field_descriptions);
+            } else {
+                let statements = session.prepared_statements.read().await;
+                let stmt = statements.get(&statement_name).unwrap();
+
+                // Check if field descriptions are empty OR suspiciously all TEXT for non-parameter columns
+                let is_empty = stmt.field_descriptions.is_empty();
+                let looks_suspicious = if !is_empty {
+                    // Check if all non-parameter columns are TEXT (OID 25)
+                    let non_param_types: Vec<_> = stmt.field_descriptions.iter()
+                        .filter(|fd| !fd.name.starts_with('$') && fd.name != "?column?" && fd.name != "NULL")
+                        .map(|fd| fd.type_oid)
+                        .collect();
+
+                    // If we have non-parameter columns and they're ALL TEXT, that's suspicious
+                    !non_param_types.is_empty() && non_param_types.iter().all(|&oid| oid == 25)
+                } else {
+                    false
+                };
+
+                if looks_suspicious {
+                    if query.contains("orders") && query.contains("customer_id") {
+                        info!("Fast path: SUSPICIOUS field descriptions detected for orders query!");
+                        info!("Fast path: Field descriptions: {:?}", stmt.field_descriptions);
+                    }
+                    debug!("Fast path: Existing field descriptions look suspicious (all TEXT), will override");
                 }
-                debug!("Fast path: Existing field descriptions look suspicious (all TEXT), will override");
+
+                (is_empty || looks_suspicious) && !response.columns.is_empty()
             }
-            
-            (is_empty || looks_suspicious) && !response.columns.is_empty()
         };
         
         let mut sent_fields: Option<Vec<crate::protocol::FieldDescription>> = None;

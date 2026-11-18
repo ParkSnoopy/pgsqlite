@@ -95,7 +95,13 @@ impl<'a> UnifiedProcessor<'a> {
         
         if memchr::memchr(b'[', query_bytes).is_some() ||
            memchr::memmem::find(query_bytes, b"ANY(").is_some() ||
+           memchr::memmem::find(query_bytes, b"ANY (").is_some() ||
+           memchr::memmem::find(query_bytes, b"any(").is_some() ||
+           memchr::memmem::find(query_bytes, b"any (").is_some() ||
            memchr::memmem::find(query_bytes, b"ALL(").is_some() ||
+           memchr::memmem::find(query_bytes, b"ALL (").is_some() ||
+           memchr::memmem::find(query_bytes, b"all(").is_some() ||
+           memchr::memmem::find(query_bytes, b"all (").is_some() ||
            memchr::memmem::find(query_bytes, b" @> ").is_some() ||
            memchr::memmem::find(query_bytes, b" <@ ").is_some() ||
            memchr::memmem::find(query_bytes, b" && ").is_some() {
@@ -258,7 +264,13 @@ fn has_any_special_pattern_fast(bytes: &[u8]) -> bool {
     memchr::memmem::find(bytes, b"cast(").is_some() ||
     memchr::memchr(b'[', bytes).is_some() ||
     memchr::memmem::find(bytes, b"ANY(").is_some() ||
+    memchr::memmem::find(bytes, b"ANY (").is_some() ||
+    memchr::memmem::find(bytes, b"any(").is_some() ||
+    memchr::memmem::find(bytes, b"any (").is_some() ||
     memchr::memmem::find(bytes, b"ALL(").is_some() ||
+    memchr::memmem::find(bytes, b"ALL (").is_some() ||
+    memchr::memmem::find(bytes, b"all(").is_some() ||
+    memchr::memmem::find(bytes, b"all (").is_some() ||
     memchr::memmem::find(bytes, b" @> ").is_some() ||
     memchr::memmem::find(bytes, b" <@ ").is_some() ||
     memchr::memmem::find(bytes, b" && ").is_some() ||

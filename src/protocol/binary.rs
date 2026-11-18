@@ -352,6 +352,12 @@ impl BinaryEncoder {
                         .and_then(|v| v.try_into().ok())
                         .map(|v: i32| v.to_be_bytes().to_vec())
                 }
+                t if t == PgType::Oid.to_oid() => {
+                    elem.as_u64()
+                        .and_then(|v| u32::try_from(v).ok())
+                        .or_else(|| elem.as_str().and_then(|s| s.parse::<u32>().ok()))
+                        .map(|v| v.to_be_bytes().to_vec())
+                }
                 t if t == PgType::Int8.to_oid() => {
                     elem.as_i64()
                         .map(|v| v.to_be_bytes().to_vec())
@@ -371,6 +377,12 @@ impl BinaryEncoder {
                 }
                 t if t == PgType::Bool.to_oid() => {
                     elem.as_bool()
+                        .or_else(|| elem.as_i64().map(|v| v != 0))
+                        .or_else(|| elem.as_str().and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                            "t" | "true" | "1" => Some(true),
+                            "f" | "false" | "0" => Some(false),
+                            _ => None,
+                        }))
                         .map(|v| vec![if v { 1 } else { 0 }])
                 }
                 t if t == PgType::Text.to_oid() || t == PgType::Varchar.to_oid() => {
@@ -476,6 +488,14 @@ impl BinaryEncoder {
                 t if t == PgType::Int4.to_oid() => {
                     if elem_bytes.len() == 4 {
                         let num = i32::from_be_bytes([elem_bytes[0], elem_bytes[1], elem_bytes[2], elem_bytes[3]]);
+                        serde_json::Value::Number(num.into())
+                    } else {
+                        serde_json::Value::Null
+                    }
+                }
+                t if t == PgType::Oid.to_oid() => {
+                    if elem_bytes.len() == 4 {
+                        let num = u32::from_be_bytes([elem_bytes[0], elem_bytes[1], elem_bytes[2], elem_bytes[3]]);
                         serde_json::Value::Number(num.into())
                     } else {
                         serde_json::Value::Null
@@ -1249,6 +1269,23 @@ impl BinaryEncoder {
                     _ => None,
                 }
             }
+            22 /* int2vector */ => {
+                match value {
+                    rusqlite::types::Value::Text(s) => {
+                        let trimmed = s.trim();
+                        let arr_str = if trimmed.starts_with('[') || trimmed.starts_with('{') {
+                            trimmed.to_string()
+                        } else if trimmed.is_empty() {
+                            "[]".to_string()
+                        } else {
+                            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                            format!("[{}]", parts.join(","))
+                        };
+                        Self::encode_array(&arr_str, PgType::Int2.to_oid()).ok()
+                    }
+                    _ => None,
+                }
+            }
             t if t == PgType::Int4Array.to_oid() => {
                 // INT4 array
                 match value {
@@ -1269,6 +1306,14 @@ impl BinaryEncoder {
                 match value {
                     rusqlite::types::Value::Text(s) => {
                         Self::encode_array(s, PgType::Int8.to_oid()).ok()
+                    }
+                    _ => None,
+                }
+            }
+            t if t == PgType::OidArray.to_oid() => {
+                match value {
+                    rusqlite::types::Value::Text(s) => {
+                        Self::encode_array(s, PgType::Oid.to_oid()).ok()
                     }
                     _ => None,
                 }

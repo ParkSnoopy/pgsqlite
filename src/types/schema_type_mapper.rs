@@ -126,6 +126,7 @@ impl SchemaTypeMapper {
                 "integer" | "int4" | "int" => 1007, // INTEGER[]
                 "bigint" | "int8" => 1016,        // BIGINT[]
                 "smallint" | "int2" => 1005,      // SMALLINT[]
+                "oid" => 1028,                    // OID[]
                 "text" => 1009,                   // TEXT[]
                 "varchar" => 1015,                // VARCHAR[]
                 "real" | "float4" => 1021,        // REAL[]
@@ -168,6 +169,10 @@ impl SchemaTypeMapper {
             "uuid" | "UUID" => return PgType::Uuid.to_oid(),
             "json" | "JSON" => return PgType::Json.to_oid(),
             "jsonb" | "JSONB" => return PgType::Jsonb.to_oid(),
+            "oid" | "OID" => return PgType::Oid.to_oid(),
+            "name" | "NAME" => return 19,
+            "regclass" | "REGCLASS" => return 2205,
+            "regtype" | "REGTYPE" => return 2206,
             _ => {}
         }
         
@@ -597,6 +602,144 @@ impl SchemaTypeMapper {
             Some(PgType::Numeric.to_oid()) // numeric
         } else {
             None
+        }
+    }
+
+    /// True when the SQL is a SQLAlchemy/PG reflection catalog query executed via SQLite views.
+    pub fn is_reflection_query(query: &str) -> bool {
+        if query.contains("typeinfo_tree") {
+            return false;
+        }
+        (query.contains("pg_class")
+            || query.contains("pg_constraint")
+            || query.contains("pg_index")
+            || query.contains("pg_type")
+            || query.contains("pg_opclass")
+            || query.contains("pg_am"))
+            && (query.contains("pg_description")
+                || query.contains("pg_sequence")
+                || query.contains("pg_collation")
+                || query.contains("pg_opclass")
+                || query.contains("pg_am")
+                || query.contains("generate_subscripts")
+                || query.contains("_pgi_je")
+                || query.contains("indnullsnotdistinct")
+                || query.contains("indnkeyatts")
+                || query.contains("elements_opclass")
+                || query.contains("indoption")
+                || query.contains("lbl_agg")
+                || query.contains("pg_type_is_visible")
+                || query.contains("pg_table_is_visible")
+                || (query.contains("pg_class") && (query.contains("pg_namespace") || query.contains("pg_attribute"))))
+    }
+
+    fn reflection_column_oid(col_name: &str) -> Option<i32> {
+        match col_name.to_ascii_lowercase().as_str() {
+            "oid" | "conrelid" | "indrelid" | "relam" => Some(26), // OID
+            "indnkeyatts" => Some(PgType::Int2.to_oid()),
+            "not_null" | "attnotnull" | "atthasdef" | "attisdropped" | "visible"
+            | "indisunique" | "indisvalid" | "has_constraint" | "indnullsnotdistinct" => {
+                Some(PgType::Bool.to_oid())
+            }
+            "cols" | "labels" | "elements" | "reloptions" => Some(PgType::TextArray.to_oid()),
+            "elements_is_expr" => Some(PgType::BoolArray.to_oid()),
+            "elements_opclass" => Some(PgType::Int8Array.to_oid()),
+            "indoption" => Some(22), // int2vector: text "0" for psycopg, binary int2[] for asyncpg
+            "identity_options" | "collation" => Some(PgType::Json.to_oid()),
+            _ => None,
+        }
+    }
+
+    fn typeinfo_tree_column_oid(col_name: &str) -> Option<i32> {
+        match col_name.to_ascii_lowercase().as_str() {
+            "oid" | "basetype" | "elemtype" | "range_subtype" => Some(PgType::Oid.to_oid()),
+            // PostgreSQL "char" (OID 18, single-byte internal char) is a built-in scalar codec in asyncpg
+            "kind" | "elemdelim" => Some(18),
+            "attrtypoids" => Some(PgType::OidArray.to_oid()),
+            "attrnames" => Some(PgType::TextArray.to_oid()),
+            "depth" => Some(PgType::Int4.to_oid()),
+            "ns" | "name" | "basetype_name" | "elemtype_name" | "range_subtype_name" => {
+                Some(PgType::Text.to_oid())
+            }
+            _ => None,
+        }
+    }
+
+    pub fn typeinfo_tree_field_descriptions() -> Vec<crate::protocol::FieldDescription> {
+        let cols: [(&str, i32); 14] = [
+            ("oid", PgType::Oid.to_oid()),
+            ("ns", PgType::Text.to_oid()),
+            ("name", PgType::Text.to_oid()),
+            ("kind", 18),
+            ("basetype", PgType::Oid.to_oid()),
+            ("elemtype", PgType::Oid.to_oid()),
+            ("elemdelim", 18),
+            ("range_subtype", PgType::Oid.to_oid()),
+            ("attrtypoids", PgType::OidArray.to_oid()),
+            ("attrnames", PgType::TextArray.to_oid()),
+            ("depth", PgType::Int4.to_oid()),
+            ("basetype_name", PgType::Text.to_oid()),
+            ("elemtype_name", PgType::Text.to_oid()),
+            ("range_subtype_name", PgType::Text.to_oid()),
+        ];
+        cols.into_iter()
+            .enumerate()
+            .map(|(i, (name, type_oid))| crate::protocol::FieldDescription {
+                name: name.to_string(),
+                table_oid: 0,
+                column_id: (i + 1) as i16,
+                type_oid,
+                type_size: -1,
+                type_modifier: -1,
+                format: 0,
+            })
+            .collect()
+    }
+
+    /// Override `FieldDescription.type_oid` for SQLAlchemy reflection result columns so
+    /// binary and typed drivers (`asyncpg`, `psycopg3`, `psycopg2`) decode lists, booleans,
+    /// OIDs, and JSON accurately.
+    pub fn apply_reflection_field_oids(fields: &mut [crate::protocol::FieldDescription], query: &str) {
+        if query.contains("typeinfo_tree") && query.contains("attrtypoids") {
+            for fd in fields.iter_mut() {
+                if let Some(oid) = Self::typeinfo_tree_column_oid(&fd.name) {
+                    fd.type_oid = oid;
+                }
+            }
+            return;
+        }
+        if !Self::is_reflection_query(query) {
+            return;
+        }
+        for fd in fields.iter_mut() {
+            if let Some(oid) = Self::reflection_column_oid(&fd.name) {
+                fd.type_oid = oid;
+            }
+        }
+    }
+
+    /// Override parallel `field_types` OID vector for SQLAlchemy reflection queries using
+    /// result column names.
+    pub fn apply_reflection_oids_to_columns(columns: &[String], field_types: &mut [i32], query: &str) {
+        if query.contains("typeinfo_tree") && query.contains("attrtypoids") {
+            for (i, col_name) in columns.iter().enumerate() {
+                if i < field_types.len()
+                    && let Some(oid) = Self::typeinfo_tree_column_oid(col_name)
+                {
+                    field_types[i] = oid;
+                }
+            }
+            return;
+        }
+        if !Self::is_reflection_query(query) {
+            return;
+        }
+        for (i, col_name) in columns.iter().enumerate() {
+            if i < field_types.len()
+                && let Some(oid) = Self::reflection_column_oid(col_name)
+            {
+                field_types[i] = oid;
+            }
         }
     }
 }

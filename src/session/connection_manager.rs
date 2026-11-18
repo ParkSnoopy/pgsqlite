@@ -77,6 +77,12 @@ impl ConnectionManager {
         let mut conn = Connection::open_with_flags(&self.db_path, flags)
             .map_err(PgSqliteError::Sqlite)?;
         conn.busy_handler(Some(|count| {
+            if count >= 5
+                && let Some(session_id) = crate::session::get_current_session()
+                && crate::session::ADVISORY_LOCK_MANAGER.is_deadlocked_with_sqlite_writer(&session_id)
+            {
+                return false;
+            }
             if count < 10 {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             } else if count < 50 {

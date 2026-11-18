@@ -478,14 +478,7 @@ where
                             session.set_transaction_status(TransactionStatus::InFailedTransaction).await;
                         }
                         
-                        let err = match &e {
-                            PgSqliteError::Validation(pg_err) => pg_err.to_error_response(),
-                            _ => ErrorResponse::new(
-                                "ERROR".to_string(),
-                                "42000".to_string(),
-                                format!("Query execution failed: {e}"),
-                            ),
-                        };
+                        let err = e.to_error_response("Query execution failed");
                         framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
                     }
                 }
@@ -564,14 +557,7 @@ where
                         if session.in_transaction().await {
                             session.set_transaction_status(TransactionStatus::InFailedTransaction).await;
                         }
-                        let err = match &e {
-                            PgSqliteError::Validation(pg_err) => pg_err.to_error_response(),
-                            _ => ErrorResponse::new(
-                                "ERROR".to_string(),
-                                "42000".to_string(),
-                                format!("Bind failed: {e}"),
-                            ),
-                        };
+                        let err = e.to_error_response("Bind failed");
                         framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
                     }
                 }
@@ -593,14 +579,7 @@ where
                         if session.in_transaction().await {
                             session.set_transaction_status(TransactionStatus::InFailedTransaction).await;
                         }
-                        let err = match &e {
-                            PgSqliteError::Validation(pg_err) => pg_err.to_error_response(),
-                            _ => ErrorResponse::new(
-                                "ERROR".to_string(),
-                                "42000".to_string(),
-                                format!("Execute failed: {e}"),
-                            ),
-                        };
+                        let err = e.to_error_response("Execute failed");
                         framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
                     }
                 }

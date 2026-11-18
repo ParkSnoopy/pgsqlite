@@ -33,6 +33,7 @@ pub enum PgType {
     Macaddr8 = 774,
     Bit = 1560,
     Varbit = 1562,
+    Oid = 26,
     Unknown = 705,
     // Full-text search types
     Tsvector = 3614,
@@ -43,6 +44,7 @@ pub enum PgType {
     Int2Array = 1005,
     Int4Array = 1007,
     Int8Array = 1016,
+    OidArray = 1028,
     Float4Array = 1021,
     Float8Array = 1022,
     TextArray = 1009,
@@ -104,6 +106,7 @@ impl PgType {
             774 => Some(PgType::Macaddr8),
             1560 => Some(PgType::Bit),
             1562 => Some(PgType::Varbit),
+            26 => Some(PgType::Oid),
             705 => Some(PgType::Unknown),
             // Full-text search types
             3614 => Some(PgType::Tsvector),
@@ -114,6 +117,7 @@ impl PgType {
             1005 => Some(PgType::Int2Array),
             1007 => Some(PgType::Int4Array),
             1016 => Some(PgType::Int8Array),
+            1028 => Some(PgType::OidArray),
             1021 => Some(PgType::Float4Array),
             1022 => Some(PgType::Float8Array),
             1009 => Some(PgType::TextArray),
@@ -180,6 +184,7 @@ impl PgType {
             PgType::Macaddr8 => "macaddr8",
             PgType::Bit => "bit",
             PgType::Varbit => "varbit",
+            PgType::Oid => "oid",
             PgType::Unknown => "unknown",
             // Full-text search types
             PgType::Tsvector => "tsvector",
@@ -190,6 +195,7 @@ impl PgType {
             PgType::Int2Array => "_int2",
             PgType::Int4Array => "_int4",
             PgType::Int8Array => "_int8",
+            PgType::OidArray => "_oid",
             PgType::Float4Array => "_float4",
             PgType::Float8Array => "_float8",
             PgType::TextArray => "_text",
@@ -223,11 +229,12 @@ impl PgType {
     pub fn is_array(&self) -> bool {
         matches!(self,
             PgType::BoolArray | PgType::Int2Array | PgType::Int4Array | PgType::Int8Array |
-            PgType::Float4Array | PgType::Float8Array | PgType::TextArray | PgType::VarcharArray |
-            PgType::CharArray | PgType::UuidArray | PgType::JsonArray | PgType::JsonbArray |
-            PgType::DateArray | PgType::TimeArray | PgType::TimestampArray | PgType::TimestamptzArray |
-            PgType::TimetzArray | PgType::IntervalArray | PgType::NumericArray | PgType::ByteaArray |
-            PgType::MoneyArray | PgType::Int4rangeArray | PgType::Int8rangeArray | PgType::NumrangeArray |
+            PgType::OidArray | PgType::Float4Array | PgType::Float8Array | PgType::TextArray |
+            PgType::VarcharArray | PgType::CharArray | PgType::UuidArray | PgType::JsonArray |
+            PgType::JsonbArray | PgType::DateArray | PgType::TimeArray | PgType::TimestampArray |
+            PgType::TimestamptzArray | PgType::TimetzArray | PgType::IntervalArray |
+            PgType::NumericArray | PgType::ByteaArray | PgType::MoneyArray |
+            PgType::Int4rangeArray | PgType::Int8rangeArray | PgType::NumrangeArray |
             PgType::CidrArray | PgType::InetArray | PgType::MacaddrArray | PgType::Macaddr8Array |
             PgType::BitArray | PgType::VarbitArray
         )
@@ -249,6 +256,7 @@ impl PgType {
             PgType::Int2Array => Some(PgType::Int2),
             PgType::Int4Array => Some(PgType::Int4),
             PgType::Int8Array => Some(PgType::Int8),
+            PgType::OidArray => Some(PgType::Oid),
             PgType::Float4Array => Some(PgType::Float4),
             PgType::Float8Array => Some(PgType::Float8),
             PgType::TextArray => Some(PgType::Text),
@@ -286,6 +294,7 @@ impl PgType {
             PgType::Int2 => Some(PgType::Int2Array),
             PgType::Int4 => Some(PgType::Int4Array),
             PgType::Int8 => Some(PgType::Int8Array),
+            PgType::Oid => Some(PgType::OidArray),
             PgType::Float4 => Some(PgType::Float4Array),
             PgType::Float8 => Some(PgType::Float8Array),
             PgType::Text => Some(PgType::TextArray),

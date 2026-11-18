@@ -532,8 +532,12 @@ impl DbHandler {
         } else {
             query.to_string()
         };
-        crate::session::ADVISORY_LOCK_MANAGER.on_write_executed(session_id);
-        crate::session::ADVISORY_LOCK_MANAGER.on_write_start(session_id);
+        let query_type = QueryTypeDetector::detect_query_type(query);
+        let is_write_query = Self::is_sqlite_write_query_type(query_type);
+        if is_write_query {
+            crate::session::ADVISORY_LOCK_MANAGER.on_write_executed(session_id);
+            crate::session::ADVISORY_LOCK_MANAGER.on_write_start(session_id);
+        }
         let result = self.connection_manager.execute_with_session(session_id, |conn| {
             // Process query with fast path optimization
             let processed_query = process_query(&numbered_query, conn, &self.schema_cache)?;
@@ -577,8 +581,6 @@ impl DbHandler {
                 })
                 .collect();
             
-            let query_type = QueryTypeDetector::detect_query_type(query);
-            
             let result = match query_type {
                 QueryType::Select => {
                     let column_count = stmt.column_count();
@@ -617,13 +619,7 @@ impl DbHandler {
                             Ok(rows) => break rows,
                             Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
                                 if msg.contains("database is locked") || msg.contains("busy") => {
-                                retry_count += 1;
-                                if !conn.is_autocommit() && !crate::session::ADVISORY_LOCK_MANAGER.has_written(session_id) {
-                                    let _ = conn.execute("ROLLBACK", []);
-                                    let _ = conn.execute("BEGIN", []);
-                                }
-                                let delay = std::cmp::min(retry_count * 5, 50);
-                                std::thread::sleep(std::time::Duration::from_millis(delay as u64));
+                                Self::retry_after_busy(Some(session_id), conn, &mut retry_count, true)?;
                             }
                             Err(e) => return Err(e),
                         }
@@ -649,11 +645,12 @@ impl DbHandler {
             
             Ok(result)
         });
-        crate::session::ADVISORY_LOCK_MANAGER.on_write_end(session_id);
+        if is_write_query {
+            crate::session::ADVISORY_LOCK_MANAGER.on_write_end(session_id);
+        }
         let result = result?;
         
         // After the closure completes, check if we need WAL refresh
-        let query_type = QueryTypeDetector::detect_query_type(query);
         if query_type != QueryType::Select && result.rows_affected > 0 {
             // Check if we're in autocommit mode
             let is_autocommit = self.connection_manager.execute_with_session(session_id, |conn| {
@@ -1017,7 +1014,9 @@ impl DbHandler {
         }
 
         // Handle pg_tablespace queries
-        if lower_query.contains("pg_tablespace") || lower_query.contains("pg_catalog.pg_tablespace") {
+        if !crate::types::SchemaTypeMapper::is_reflection_query(query)
+            && (lower_query.contains("pg_tablespace") || lower_query.contains("pg_catalog.pg_tablespace"))
+        {
             use crate::catalog::query_interceptor::CatalogInterceptor;
             let parsed_query = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, query);
             if let Ok(mut statements) = parsed_query
@@ -1034,7 +1033,9 @@ impl DbHandler {
         }
 
         // Handle pg_collation queries
-        if lower_query.contains("pg_collation") || lower_query.contains("pg_catalog.pg_collation") {
+        if !crate::types::SchemaTypeMapper::is_reflection_query(query)
+            && (lower_query.contains("pg_collation") || lower_query.contains("pg_catalog.pg_collation"))
+        {
             use crate::catalog::query_interceptor::CatalogInterceptor;
             let parsed_query = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, query);
             if let Ok(mut statements) = parsed_query
@@ -1344,7 +1345,9 @@ impl DbHandler {
         }
 
         // Handle pg_tablespace queries
-        if lower_query.contains("pg_tablespace") || lower_query.contains("pg_catalog.pg_tablespace") {
+        if !crate::types::SchemaTypeMapper::is_reflection_query(query)
+            && (lower_query.contains("pg_tablespace") || lower_query.contains("pg_catalog.pg_tablespace"))
+        {
             use crate::catalog::query_interceptor::CatalogInterceptor;
             let parsed_query = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, query);
             if let Ok(mut statements) = parsed_query
@@ -1361,7 +1364,9 @@ impl DbHandler {
         }
 
         // Handle pg_collation queries
-        if lower_query.contains("pg_collation") || lower_query.contains("pg_catalog.pg_collation") {
+        if !crate::types::SchemaTypeMapper::is_reflection_query(query)
+            && (lower_query.contains("pg_collation") || lower_query.contains("pg_catalog.pg_collation"))
+        {
             use crate::catalog::query_interceptor::CatalogInterceptor;
             let parsed_query = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, query);
             if let Ok(mut statements) = parsed_query
@@ -1863,9 +1868,8 @@ impl DbHandler {
                     Ok(rows) => break rows,
                     Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
                         if msg.contains("database is locked") || msg.contains("busy") => {
-                        retry_count += 1;
-                        let delay = std::cmp::min(retry_count * 5, 50);
-                        std::thread::sleep(std::time::Duration::from_millis(delay as u64));
+                        let current_sid = crate::session::get_current_session();
+                        Self::retry_after_busy(current_sid.as_ref(), &conn, &mut retry_count, false)?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -1987,7 +1991,9 @@ impl DbHandler {
         match cached_conn {
             Some(conn) => {
                 let _guard = crate::session::set_current_session(*session_id);
-                crate::session::ADVISORY_LOCK_MANAGER.on_write_executed(session_id);
+                if Self::is_sqlite_write_query_type(QueryTypeDetector::detect_query_type(query)) {
+                    crate::session::ADVISORY_LOCK_MANAGER.on_write_executed(session_id);
+                }
                 self.connection_manager.execute_with_cached_connection(conn, |conn| {
                     // Process query with fast path optimization
                     let processed_query = process_query(query, conn, &self.schema_cache)?;
@@ -1998,13 +2004,7 @@ impl DbHandler {
                             Ok(rows) => break rows,
                             Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
                                 if msg.contains("database is locked") || msg.contains("busy") => {
-                                retry_count += 1;
-                                if !conn.is_autocommit() && !crate::session::ADVISORY_LOCK_MANAGER.has_written(session_id) {
-                                    let _ = conn.execute("ROLLBACK", []);
-                                    let _ = conn.execute("BEGIN", []);
-                                }
-                                let delay = std::cmp::min(retry_count * 5, 50);
-                                std::thread::sleep(std::time::Duration::from_millis(delay as u64));
+                                Self::retry_after_busy(Some(session_id), conn, &mut retry_count, true)?;
                             }
                             Err(e) => return Err(e),
                         }
@@ -2073,8 +2073,11 @@ impl DbHandler {
             });
         }
 
-        crate::session::ADVISORY_LOCK_MANAGER.on_write_executed(session_id);
-        crate::session::ADVISORY_LOCK_MANAGER.on_write_start(session_id);
+        let is_write_query = Self::is_sqlite_write_query_type(QueryTypeDetector::detect_query_type(query));
+        if is_write_query {
+            crate::session::ADVISORY_LOCK_MANAGER.on_write_executed(session_id);
+            crate::session::ADVISORY_LOCK_MANAGER.on_write_start(session_id);
+        }
         let res = self.connection_manager.execute_with_session(session_id, |conn| {
             let (processed_query, type_mappings, _array_columns, _enum_columns) =
                 if query.trim_start().to_uppercase().starts_with("CREATE TABLE") {
@@ -2106,9 +2109,8 @@ impl DbHandler {
                     Ok(rows) => break rows,
                     Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
                         if msg.contains("database is locked") || msg.contains("busy") => {
-                        retry_count += 1;
-                        let delay = std::cmp::min(retry_count * 5, 50);
-                        std::thread::sleep(std::time::Duration::from_millis(delay as u64));
+                        let current_sid = crate::session::get_current_session();
+                        Self::retry_after_busy(current_sid.as_ref(), &conn, &mut retry_count, false)?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -2216,8 +2218,53 @@ impl DbHandler {
                 rows_affected,
             })
         });
-        crate::session::ADVISORY_LOCK_MANAGER.on_write_end(session_id);
+        if is_write_query {
+            crate::session::ADVISORY_LOCK_MANAGER.on_write_end(session_id);
+        }
         res
+    }
+
+    #[inline]
+    fn is_sqlite_write_query_type(qt: QueryType) -> bool {
+        matches!(
+            qt,
+            QueryType::Insert
+                | QueryType::Update
+                | QueryType::Delete
+                | QueryType::Create
+                | QueryType::Drop
+                | QueryType::Alter
+                | QueryType::Truncate
+                | QueryType::Comment
+        )
+    }
+
+    fn retry_after_busy(
+        session_id: Option<&Uuid>,
+        conn: &rusqlite::Connection,
+        retry_count: &mut u32,
+        refresh_unwritten_tx: bool,
+    ) -> Result<(), rusqlite::Error> {
+        if let Some(sid) = session_id
+            && crate::session::ADVISORY_LOCK_MANAGER.is_deadlocked_with_sqlite_writer(sid)
+        {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some("deadlock detected while waiting for SQLite write lock".to_string()),
+            ));
+        }
+        *retry_count += 1;
+        if refresh_unwritten_tx
+            && let Some(sid) = session_id
+            && !conn.is_autocommit()
+            && !crate::session::ADVISORY_LOCK_MANAGER.has_written(sid)
+        {
+            let _ = conn.execute("ROLLBACK", []);
+            let _ = conn.execute("BEGIN", []);
+        }
+        let delay = std::cmp::min(*retry_count * 5, 50);
+        std::thread::sleep(std::time::Duration::from_millis(delay as u64));
+        Ok(())
     }
     
     /// Transaction control methods
@@ -2230,13 +2277,7 @@ impl DbHandler {
                     Ok(_) => break Ok(()),
                     Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
                         if msg.contains("database is locked") || msg.contains("busy") => {
-                        retry_count += 1;
-                        if !conn.is_autocommit() && !crate::session::ADVISORY_LOCK_MANAGER.has_written(session_id) {
-                            let _ = conn.execute("ROLLBACK", []);
-                            let _ = conn.execute("BEGIN", []);
-                        }
-                        let delay = std::cmp::min(retry_count * 5, 50);
-                        std::thread::sleep(std::time::Duration::from_millis(delay as u64));
+                        Self::retry_after_busy(Some(session_id), conn, &mut retry_count, true)?;
                     }
                     Err(e) => break Err(e),
                 }
@@ -2279,13 +2320,7 @@ impl DbHandler {
                     Ok(_) => break Ok(()),
                     Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
                         if msg.contains("database is locked") || msg.contains("busy") => {
-                        retry_count += 1;
-                        if !conn.is_autocommit() && !crate::session::ADVISORY_LOCK_MANAGER.has_written(session_id) {
-                            let _ = conn.execute("ROLLBACK", []);
-                            let _ = conn.execute("BEGIN", []);
-                        }
-                        let delay = std::cmp::min(retry_count * 5, 50);
-                        std::thread::sleep(std::time::Duration::from_millis(delay as u64));
+                        Self::retry_after_busy(Some(session_id), conn, &mut retry_count, true)?;
                     }
                     Err(e) => break Err(e),
                 }

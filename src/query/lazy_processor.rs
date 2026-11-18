@@ -28,10 +28,16 @@ impl<'a> LazyQueryProcessor<'a> {
         // Fast path for simple queries - check if query contains any special characters
         // that might require translation
         let quick_check = query.contains("::") || query.contains(" ~ ") || query.contains("pg_catalog") ||
-                         query.contains("PG_CATALOG") || query.contains("[") || query.contains("ANY(") ||
-                         query.contains("ALL(") || query.contains("@>") || query.contains("<@") ||
+                         query.contains("PG_CATALOG") || query.contains("information_schema") ||
+                         query.contains("INFORMATION_SCHEMA") || query.contains("[") ||
+                         query.contains("ANY(") || query.contains("ANY (") ||
+                         query.contains("any(") || query.contains("any (") ||
+                         query.contains("ALL(") || query.contains("ALL (") ||
+                         query.contains("all(") || query.contains("all (") ||
+                         query.contains("@>") || query.contains("<@") ||
                          query.contains("&&") || query.contains("DELETE") || query.contains("UPDATE") ||
                          query.contains("AT TIME ZONE") || query.contains("pg_table_is_visible") ||
+                         query.contains("pg_attribute") || query.contains("pg_constraint") || query.contains("pg_index") ||
                          query.contains("current_user") || query.contains("session_user") ||
                          query.contains("CURRENT_USER") || query.contains("SESSION_USER");
         
@@ -62,9 +68,14 @@ impl<'a> LazyQueryProcessor<'a> {
             needs_decimal_rewrite: None,
             needs_regex_translation: query.contains(" ~ ") || query.contains(" !~ ") || 
                                      query.contains(" ~* ") || query.contains(" !~* "),
-            needs_schema_translation: query.contains("pg_catalog.") || query.contains("PG_CATALOG."),
+            needs_schema_translation: query.contains("pg_catalog.") || query.contains("PG_CATALOG.") ||
+                                     query.contains("information_schema.") || query.contains("INFORMATION_SCHEMA.") ||
+                                     query.contains("pg_attribute") || query.contains("pg_constraint") || query.contains("pg_index"),
             needs_numeric_cast_translation: crate::translator::NumericCastTranslator::needs_translation(query),
-            needs_array_translation: query.contains("[") || query.contains("ANY(") || query.contains("ALL(") ||
+            needs_array_translation: query.contains("[") || query.contains("ANY(") || query.contains("ANY (") ||
+                                    query.contains("any(") || query.contains("any (") ||
+                                    query.contains("ALL(") || query.contains("ALL (") ||
+                                    query.contains("all(") || query.contains("all (") ||
                                     query.contains("@>") || query.contains("<@") || query.contains("&&"),
             needs_delete_using_translation: BatchDeleteTranslator::contains_batch_delete(query),
             needs_batch_update_translation: BatchUpdateTranslator::contains_batch_update(query),
@@ -171,10 +182,11 @@ impl<'a> LazyQueryProcessor<'a> {
         
         let mut current_query = Cow::Borrowed(self.original_query);
         
-        // Step 1: pg_table_is_visible removal if needed (must come before array translation)
+        // Step 1: pg_table_is_visible visibility rewrite for pg_class (must run before generic removal)
         if self.needs_pg_table_is_visible_translation {
             tracing::debug!("Before pg_table_is_visible translation: {}", current_query);
-            let translated = crate::translator::PgTableIsVisibleTranslator::translate(&current_query);
+            let with_vis = crate::translator::SchemaPrefixTranslator::translate_pg_table_is_visible_for_pg_class(&current_query);
+            let translated = crate::translator::PgTableIsVisibleTranslator::translate(&with_vis);
             tracing::debug!("After pg_table_is_visible translation: {}", translated);
             current_query = Cow::Owned(translated);
         }
@@ -187,10 +199,11 @@ impl<'a> LazyQueryProcessor<'a> {
             current_query = Cow::Owned(translated);
         }
 
-        // Step 2: Schema prefix removal if needed
+        // Step 2: Schema prefix removal and catalog reflection SQL compatibility if needed
         if self.needs_schema_translation {
             tracing::debug!("Before schema translation: {}", current_query);
             let translated = crate::translator::SchemaPrefixTranslator::translate_query(&current_query);
+            let translated = crate::translator::SchemaPrefixTranslator::translate_reflection_sql(&translated);
             tracing::debug!("After schema translation: {}", translated);
             current_query = Cow::Owned(translated);
         }

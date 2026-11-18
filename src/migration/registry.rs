@@ -36,6 +36,8 @@ lazy_static! {
         register_v27_fix_pg_proc_types(&mut registry);
         register_v28_pg_class_full_columns(&mut registry);
         register_v29_information_schema_namespace(&mut registry);
+        register_v30_sqlalchemy_reflection_support(&mut registry);
+        register_v31_pg_type_collation_and_range(&mut registry);
 
         registry
     };
@@ -3260,5 +3262,251 @@ fn register_v29_information_schema_namespace(registry: &mut BTreeMap<u32, Migrat
             "#,
         ])),
         dependencies: vec![28],
+    });
+}
+
+/// Version 30: SQLAlchemy schema reflection views and schema-aware pg_attribute types
+fn register_v30_sqlalchemy_reflection_support(registry: &mut BTreeMap<u32, Migration>) {
+    registry.insert(30, Migration {
+        version: 30,
+        name: "sqlalchemy_reflection_support",
+        description: "Add pg_opclass, pg_collation, pg_sequence views, pg_index.indnullsnotdistinct, and schema-aware pg_attribute",
+        up: MigrationAction::SqlBatch(&[
+            r#"ALTER TABLE pg_index ADD COLUMN indnullsnotdistinct BOOLEAN DEFAULT 0;"#,
+
+            r#"
+            CREATE VIEW IF NOT EXISTS pg_opclass AS
+            SELECT
+                10027 AS oid,
+                'btree_ops' AS opcname,
+                1 AS opcdefault
+            WHERE 0;
+            "#,
+
+            r#"
+            CREATE VIEW IF NOT EXISTS pg_collation AS
+            SELECT 100 AS oid, 'default' AS collname, 11 AS collnamespace, 10 AS collowner, 'd' AS collprovider, 1 AS collisdeterministic, -1 AS collencoding, NULL AS collcollate, NULL AS collctype, NULL AS colliculocale, NULL AS collicurules, NULL AS collversion
+            UNION ALL SELECT 950, 'C', 11, 10, 'c', 1, -1, 'C', 'C', NULL, NULL, NULL
+            UNION ALL SELECT 951, 'POSIX', 11, 10, 'c', 1, -1, 'POSIX', 'POSIX', NULL, NULL, NULL;
+            "#,
+
+            r#"
+            CREATE VIEW IF NOT EXISTS pg_sequence AS
+            SELECT
+                0 AS seqrelid,
+                20 AS seqtypid,
+                1 AS seqstart,
+                1 AS seqincrement,
+                9223372036854775807 AS seqmax,
+                1 AS seqmin,
+                1 AS seqcache,
+                0 AS seqcycle
+            WHERE 0;
+            "#,
+
+            r#"DROP VIEW IF EXISTS pg_attribute;"#,
+
+            r#"
+            CREATE VIEW IF NOT EXISTS pg_attribute AS
+            SELECT
+                CAST(
+                    (
+                        (unicode(substr(m.name, 1, 1)) * 1000000) +
+                        (unicode(substr(m.name || ' ', 2, 1)) * 10000) +
+                        (unicode(substr(m.name || '  ', 3, 1)) * 100) +
+                        (length(m.name) * 7)
+                    ) % 1000000 + 16384
+                AS TEXT) as attrelid,
+                p.cid + 1 as attnum,
+                p.name as attname,
+                COALESCE(
+                    et.type_oid,
+                    CASE WHEN s.pg_type IS NOT NULL THEN __pgsqlite_type_oid(s.pg_type) ELSE NULL END,
+                    CASE
+                        WHEN UPPER(p.type) LIKE '%INT%' THEN 23
+                        WHEN UPPER(p.type) = 'TEXT' THEN 25
+                        WHEN UPPER(p.type) = 'REAL' THEN 700
+                        WHEN UPPER(p.type) = 'BLOB' THEN 17
+                        WHEN UPPER(p.type) LIKE '%CHAR%' THEN 1043
+                        WHEN UPPER(p.type) LIKE '%BOOL%' THEN 16
+                        WHEN UPPER(p.type) = 'DATE' THEN 1082
+                        WHEN UPPER(p.type) LIKE 'TIME%' THEN 1083
+                        WHEN UPPER(p.type) LIKE 'TIMESTAMP%' THEN 1114
+                        ELSE 25
+                    END
+                ) as atttypid,
+                -1 as attstattarget,
+                0 as attlen,
+                0 as attndims,
+                -1 as attcacheoff,
+                CASE WHEN s.pg_type IS NOT NULL THEN __pgsqlite_type_mod(s.pg_type) ELSE -1 END as atttypmod,
+                CASE WHEN p."notnull" = 1 OR p.pk > 0 THEN 't' ELSE 'f' END as attnotnull,
+                CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM pg_attrdef def
+                        WHERE def.adrelid = CAST(
+                            (
+                                (unicode(substr(m.name, 1, 1)) * 1000000) +
+                                (unicode(substr(m.name || ' ', 2, 1)) * 10000) +
+                                (unicode(substr(m.name || '  ', 3, 1)) * 100) +
+                                (length(m.name) * 7)
+                            ) % 1000000 + 16384
+                        AS TEXT)
+                        AND def.adnum = CAST(p.cid + 1 AS TEXT)
+                    ) THEN 't'
+                    ELSE 'f'
+                END as atthasdef,
+                'f' as atthasmissing,
+                CASE
+                    WHEN UPPER(p.type) LIKE '%INT%' AND p.pk = 1 THEN 'd'
+                    ELSE ''
+                END as attidentity,
+                '' as attgenerated,
+                'f' as attisdropped,
+                't' as attislocal,
+                0 as attinhcount,
+                0 as attcollation,
+                '' as attacl,
+                '' as attoptions,
+                '' as attfdwoptions,
+                '' as attmissingval
+            FROM pragma_table_info(m.name) p
+            JOIN sqlite_master m ON m.type = 'table'
+            LEFT JOIN __pgsqlite_schema s ON lower(s.table_name) = lower(m.name) AND lower(s.column_name) = lower(p.name)
+            LEFT JOIN __pgsqlite_enum_types et ON lower(et.type_name) = lower(s.pg_type)
+            WHERE m.type = 'table'
+              AND m.name NOT LIKE 'sqlite_%'
+              AND m.name NOT LIKE '__pgsqlite_%';
+            "#,
+
+            r#"
+            UPDATE __pgsqlite_metadata
+            SET value = '30', updated_at = strftime('%s', 'now')
+            WHERE key = 'schema_version';
+            "#,
+        ]),
+        down: None,
+        dependencies: vec![29],
+    });
+}
+
+/// Version 31: Add typcollation, typlen, typdelim to pg_type and add pg_range view
+fn register_v31_pg_type_collation_and_range(registry: &mut BTreeMap<u32, Migration>) {
+    registry.insert(31, Migration {
+        version: 31,
+        name: "pg_type_collation_and_range",
+        description: "Add typcollation, typlen, typdelim and extra OIDs to pg_type and create pg_range view",
+        up: MigrationAction::SqlBatch(&[
+            r#"DROP VIEW IF EXISTS pg_type;"#,
+
+            r#"
+            CREATE VIEW pg_type AS
+            SELECT
+                oid,
+                typname,
+                typtype,
+                typelem,
+                typarray,
+                typbasetype,
+                typnamespace,
+                typcategory,
+                typcollation,
+                typlen,
+                typdelim
+            FROM (
+                -- Basic types (oid, typname, typtype, typelem, typarray, typbasetype, typnamespace, typcategory, typcollation, typlen, typdelim)
+                SELECT 16 as oid, 'bool' as typname, 'b' as typtype, 0 as typelem, 1000 as typarray, 0 as typbasetype, 11 as typnamespace, 'B' as typcategory, 0 as typcollation, 1 as typlen, ',' as typdelim
+                UNION ALL SELECT 17, 'bytea', 'b', 0, 1001, 0, 11, 'U', 0, -1, ','
+                UNION ALL SELECT 19, 'name', 'b', 18, 1003, 0, 11, 'S', 100, 64, ','
+                UNION ALL SELECT 20, 'int8', 'b', 0, 1016, 0, 11, 'N', 0, 8, ','
+                UNION ALL SELECT 21, 'int2', 'b', 0, 1005, 0, 11, 'N', 0, 2, ','
+                UNION ALL SELECT 22, 'int2vector', 'b', 21, 1006, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 23, 'int4', 'b', 0, 1007, 0, 11, 'N', 0, 4, ','
+                UNION ALL SELECT 24, 'regproc', 'b', 0, 1008, 0, 11, 'N', 0, 4, ','
+                UNION ALL SELECT 25, 'text', 'b', 0, 1009, 0, 11, 'S', 100, -1, ','
+                UNION ALL SELECT 26, 'oid', 'b', 0, 1028, 0, 11, 'N', 0, 4, ','
+                UNION ALL SELECT 114, 'json', 'b', 0, 199, 0, 11, 'U', 0, -1, ','
+                UNION ALL SELECT 700, 'float4', 'b', 0, 1021, 0, 11, 'N', 0, 4, ','
+                UNION ALL SELECT 701, 'float8', 'b', 0, 1022, 0, 11, 'N', 0, 8, ','
+                UNION ALL SELECT 1042, 'char', 'b', 0, 1014, 0, 11, 'S', 100, -1, ','
+                UNION ALL SELECT 1043, 'varchar', 'b', 0, 1015, 0, 11, 'S', 100, -1, ','
+                UNION ALL SELECT 1082, 'date', 'b', 0, 1182, 0, 11, 'D', 0, 4, ','
+                UNION ALL SELECT 1083, 'time', 'b', 0, 1183, 0, 11, 'D', 0, 8, ','
+                UNION ALL SELECT 1114, 'timestamp', 'b', 0, 1115, 0, 11, 'D', 0, 8, ','
+                UNION ALL SELECT 1184, 'timestamptz', 'b', 0, 1185, 0, 11, 'D', 0, 8, ','
+                UNION ALL SELECT 1186, 'interval', 'b', 0, 1187, 0, 11, 'T', 0, 16, ','
+                UNION ALL SELECT 1266, 'timetz', 'b', 0, 1270, 0, 11, 'D', 0, 12, ','
+                UNION ALL SELECT 1560, 'bit', 'b', 0, 1561, 0, 11, 'V', 0, -1, ','
+                UNION ALL SELECT 1562, 'varbit', 'b', 0, 1563, 0, 11, 'V', 0, -1, ','
+                UNION ALL SELECT 1700, 'numeric', 'b', 0, 1231, 0, 11, 'N', 0, -1, ','
+                UNION ALL SELECT 2205, 'regclass', 'b', 0, 2210, 0, 11, 'N', 0, 4, ','
+                UNION ALL SELECT 2206, 'regtype', 'b', 0, 2211, 0, 11, 'N', 0, 4, ','
+                UNION ALL SELECT 2950, 'uuid', 'b', 0, 2951, 0, 11, 'U', 0, 16, ','
+                UNION ALL SELECT 3614, 'tsvector', 'b', 0, 3643, 0, 11, 'U', 0, -1, ','
+                UNION ALL SELECT 3615, 'tsquery', 'b', 0, 3645, 0, 11, 'U', 0, -1, ','
+                UNION ALL SELECT 3734, 'regconfig', 'b', 0, 3735, 0, 11, 'U', 0, 4, ','
+                UNION ALL SELECT 3802, 'jsonb', 'b', 0, 3807, 0, 11, 'U', 0, -1, ','
+                -- Array types
+                UNION ALL SELECT 1000, '_bool', 'b', 16, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1001, '_bytea', 'b', 17, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1005, '_int2', 'b', 21, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1007, '_int4', 'b', 23, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1009, '_text', 'b', 25, 0, 0, 11, 'A', 100, -1, ','
+                UNION ALL SELECT 1014, '_char', 'b', 1042, 0, 0, 11, 'A', 100, -1, ','
+                UNION ALL SELECT 1015, '_varchar', 'b', 1043, 0, 0, 11, 'A', 100, -1, ','
+                UNION ALL SELECT 1016, '_int8', 'b', 20, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1021, '_float4', 'b', 700, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1022, '_float8', 'b', 701, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1028, '_oid', 'b', 26, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1115, '_timestamp', 'b', 1114, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1182, '_date', 'b', 1082, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1183, '_time', 'b', 1083, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1185, '_timestamptz', 'b', 1184, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1187, '_interval', 'b', 1186, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1231, '_numeric', 'b', 1700, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1270, '_timetz', 'b', 1266, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1561, '_bit', 'b', 1560, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 1563, '_varbit', 'b', 1562, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 2951, '_uuid', 'b', 2950, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 3643, '_tsvector', 'b', 3614, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 3645, '_tsquery', 'b', 3615, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 3735, '_regconfig', 'b', 3734, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 3807, '_jsonb', 'b', 3802, 0, 0, 11, 'A', 0, -1, ','
+                UNION ALL SELECT 199, '_json', 'b', 114, 0, 0, 11, 'A', 0, -1, ','
+                -- ENUM types from __pgsqlite_enum_types
+                UNION ALL
+                SELECT
+                    e.type_oid as oid,
+                    e.type_name as typname,
+                    'e' as typtype,
+                    0 as typelem,
+                    0 as typarray,
+                    0 as typbasetype,
+                    e.namespace_oid as typnamespace,
+                    'E' as typcategory,
+                    0 as typcollation,
+                    4 as typlen,
+                    ',' as typdelim
+                FROM __pgsqlite_enum_types e
+            );
+            "#,
+
+            r#"
+            CREATE VIEW IF NOT EXISTS pg_range AS
+            SELECT
+                0 AS rngtypid,
+                0 AS rngsubtype,
+                0 AS rngmultitypid
+            WHERE 0;
+            "#,
+
+            r#"
+            UPDATE __pgsqlite_metadata
+            SET value = '31', updated_at = strftime('%s', 'now')
+            WHERE key = 'schema_version';
+            "#,
+        ]),
+        down: None,
+        dependencies: vec![30],
     });
 }

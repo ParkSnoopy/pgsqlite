@@ -96,15 +96,19 @@ impl QueryAnalyzer {
         }
         
         // Check for array operations (more expensive check)
-        if query.contains("@>") || query.contains("<@") || query.contains("&&") || 
-           query.contains("||") || query.contains("[") || query.contains("ARRAY[") || 
-           query.contains("array[") || query.contains(" ANY(") || query.contains(" any(") ||
-           query.contains(" ALL(") || query.contains(" all(") {
+        if query.contains("@>") || query.contains("<@") || query.contains("&&") ||
+           query.contains("||") || query.contains("[") || query_lower.contains("array[") ||
+           query_lower.contains(" any(") || query_lower.contains(" any (") ||
+           query_lower.contains("=any(") || query_lower.contains("=any (") ||
+           query_lower.contains(" all(") || query_lower.contains(" all (") ||
+           query_lower.contains("=all(") || query_lower.contains("=all (") {
             // Additional checks for array functions
             if query_lower.contains("array_") || query_lower.contains("unnest") ||
-               query.contains("ARRAY[") || query.contains("array[") ||
-               query.contains(" ANY(") || query.contains(" any(") ||
-               query.contains(" ALL(") || query.contains(" all(") {
+               query_lower.contains("array[") ||
+               query_lower.contains(" any(") || query_lower.contains(" any (") ||
+               query_lower.contains("=any(") || query_lower.contains("=any (") ||
+               query_lower.contains(" all(") || query_lower.contains(" all (") ||
+               query_lower.contains("=all(") || query_lower.contains("=all (") {
                 flags |= TranslationFlags::ARRAY;
             }
         }

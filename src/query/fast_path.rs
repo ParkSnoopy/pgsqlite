@@ -88,16 +88,19 @@ pub struct WhereClause {
 pub fn can_use_fast_path_enhanced(query: &str) -> Option<FastPathQuery> {
     // Remove any trailing semicolon and trim
     let query = query.trim().trim_end_matches(';');
-    
+    let upper = query.to_ascii_uppercase();
+
     // Check for complex patterns that disqualify fast path
-    if query.contains("JOIN") || 
-       query.contains("UNION") ||
-       query.contains("(SELECT") ||
-       query.contains("CASE") ||
-       query.contains("LIMIT") ||
-       query.contains("ORDER BY") ||
-       query.contains("GROUP BY") ||
-       query.contains("HAVING") {
+    if upper.contains("JOIN") ||
+       upper.contains("UNION") ||
+       upper.contains("(SELECT") ||
+       upper.contains("CASE") ||
+       upper.contains("LIMIT") ||
+       upper.contains("ORDER BY") ||
+       upper.contains("GROUP BY") ||
+       upper.contains("HAVING") ||
+       upper.contains("RETURNING") ||
+       upper.contains("ON CONFLICT") {
         return None;
     }
     
@@ -259,6 +262,11 @@ pub fn can_batch_insert_use_fast_path(query: &str) -> Option<String> {
 
 /// Check if a query is simple enough for fast path execution (legacy function)
 pub fn can_use_fast_path(query: &str) -> Option<String> {
+    let upper = query.to_ascii_uppercase();
+    if upper.contains("RETURNING") || upper.contains("ON CONFLICT") {
+        return None;
+    }
+
     // Check for batch INSERT first
     if let Some(table) = can_batch_insert_use_fast_path(query) {
         return Some(table);

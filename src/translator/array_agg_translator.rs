@@ -7,15 +7,15 @@ use tracing::debug;
 
 /// Regex patterns for array_agg function variants
 static ARRAY_AGG_DISTINCT_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)array_agg\s*\(\s*DISTINCT\s+([^)]+)\s*\)").unwrap()
+    Regex::new(r"(?i)array_agg\s*\(\s*DISTINCT\s+((?:[^()]+|\([^()]*\))+)\s*\)").unwrap()
 });
 
 static ARRAY_AGG_ORDER_BY_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)array_agg\s*\(\s*([^)]+?)\s+ORDER\s+BY\s+([^)]+)\s*\)").unwrap()
+    Regex::new(r"(?i)array_agg\s*\(\s*((?:[^()]+|\([^()]*\))+?)\s+ORDER\s+BY\s+((?:[^()]+|\([^()]*\))+)\s*\)").unwrap()
 });
 
 static ARRAY_AGG_DISTINCT_ORDER_BY_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)array_agg\s*\(\s*DISTINCT\s+([^)]+?)\s+ORDER\s+BY\s+([^)]+)\s*\)").unwrap()
+    Regex::new(r"(?i)array_agg\s*\(\s*DISTINCT\s+((?:[^()]+|\([^()]*\))+?)\s+ORDER\s+BY\s+((?:[^()]+|\([^()]*\))+)\s*\)").unwrap()
 });
 
 /// Translates PostgreSQL array_agg functions with ORDER BY and DISTINCT

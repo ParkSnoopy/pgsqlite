@@ -29,6 +29,67 @@ static INSERT_SELECT_NO_COLUMNS_PATTERN: Lazy<Regex> = Lazy::new(|| {
 });
 
 impl InsertTranslator {
+    /// Split the slice beginning after `VALUES ` into the parenthesized tuple list
+    /// and any trailing clause (`ON CONFLICT ...`, `RETURNING ...`, trailing `;`).
+    fn split_values_and_suffix(after_values: &str) -> (&str, &str) {
+        let mut in_quotes = false;
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut saw_tuple = false;
+        let mut last_tuple_end = 0usize;
+        let mut chars = after_values.char_indices().peekable();
+
+        while let Some((idx, ch)) = chars.next() {
+            if in_quotes {
+                if ch == '\'' {
+                    if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                        chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                }
+                continue;
+            }
+
+            if paren_depth == 0 && bracket_depth == 0 {
+                if ch == '\'' {
+                    if saw_tuple {
+                        return (&after_values[..last_tuple_end], &after_values[last_tuple_end..]);
+                    }
+                    in_quotes = true;
+                } else if ch == '(' {
+                    paren_depth = 1;
+                    saw_tuple = true;
+                } else if ch.is_whitespace() || (saw_tuple && ch == ',') {
+                    continue;
+                } else if saw_tuple {
+                    return (&after_values[..last_tuple_end], &after_values[last_tuple_end..]);
+                }
+                continue;
+            }
+
+            match ch {
+                '\'' => in_quotes = true,
+                '(' => paren_depth += 1,
+                ')' => {
+                    paren_depth -= 1;
+                    if paren_depth == 0 && bracket_depth == 0 {
+                        last_tuple_end = idx + ch.len_utf8();
+                    }
+                }
+                '[' => bracket_depth += 1,
+                ']' if bracket_depth > 0 => bracket_depth -= 1,
+                _ => {}
+            }
+        }
+
+        if saw_tuple && last_tuple_end > 0 {
+            (&after_values[..last_tuple_end], &after_values[last_tuple_end..])
+        } else {
+            (after_values, "")
+        }
+    }
+
     /// Check if the query is an INSERT that might need datetime, array, or VALUES translation
     pub fn needs_translation(query: &str) -> bool {
         // Skip if already processed by CastTranslator
@@ -65,7 +126,8 @@ impl InsertTranslator {
         if let Some(caps) = INSERT_PATTERN.captures(query) {
             let table_name = &caps[1];
             let columns_str = &caps[2];
-            let values_str = &caps[3];
+            let after_values = &query[caps.get(3).unwrap().start()..];
+            let (values_str, suffix_clause) = Self::split_values_and_suffix(after_values);
             
             // Parse column names
             let columns: Vec<&str> = columns_str.split(',')
@@ -103,22 +165,16 @@ impl InsertTranslator {
                 &column_types
             )?;
             
-            // Check if there's a RETURNING clause
-            let returning_clause = if let Some(idx) = query.to_uppercase().find(" RETURNING ") {
-                &query[idx..]
-            } else {
-                ""
-            };
-            
-            // Reconstruct the INSERT query
+            // Reconstruct the INSERT query, preserving ON CONFLICT / RETURNING / suffix
             let result = format!(
-                "INSERT INTO {table_name} ({columns_str}) VALUES {converted_values}{returning_clause}"
+                "INSERT INTO {table_name} ({columns_str}) VALUES {converted_values}{suffix_clause}"
             );
             Ok(result)
         } else if let Some(caps) = INSERT_NO_COLUMNS_PATTERN.captures(query) {
             // INSERT without explicit columns - need to get all columns from schema
             let table_name = &caps[1];
-            let values_str = &caps[2];
+            let after_values = &query[caps.get(2).unwrap().start()..];
+            let (values_str, suffix_clause) = Self::split_values_and_suffix(after_values);
             
             // Get all columns and types from __pgsqlite_schema
             let (columns, column_types) = Self::get_all_columns_and_types(db, table_name).await?;
@@ -148,16 +204,9 @@ impl InsertTranslator {
                 &column_types
             )?;
             
-            // Check if there's a RETURNING clause
-            let returning_clause = if let Some(idx) = query.to_uppercase().find(" RETURNING ") {
-                &query[idx..]
-            } else {
-                ""
-            };
-            
-            // Reconstruct the INSERT query  
+            // Reconstruct the INSERT query, preserving ON CONFLICT / RETURNING / suffix
             Ok(format!(
-                "INSERT INTO {table_name} VALUES {converted_values}{returning_clause}"
+                "INSERT INTO {table_name} VALUES {converted_values}{suffix_clause}"
             ))
         } else if let Some(caps) = INSERT_SELECT_PATTERN.captures(query) {
             // Handle INSERT INTO table (...) SELECT ...
@@ -393,12 +442,14 @@ impl InsertTranslator {
         }
     }
     
-    /// Parse comma-separated values, handling quoted strings
+    /// Parse comma-separated values, handling quoted strings and nested parens/brackets
     fn parse_values(values_str: &str) -> Result<Vec<String>, String> {
         let mut values = Vec::new();
         let mut current = String::new();
         let mut in_quotes = false;
         let mut escape_next = false;
+        let mut paren_depth: usize = 0;
+        let mut bracket_depth: usize = 0;
         let mut chars = values_str.chars().peekable();
         
         while let Some(ch) = chars.next() {
@@ -423,7 +474,23 @@ impl InsertTranslator {
                     current.push(ch);
                     escape_next = true;
                 }
-                ',' if !in_quotes => {
+                '(' if !in_quotes => {
+                    paren_depth += 1;
+                    current.push(ch);
+                }
+                ')' if !in_quotes => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                    current.push(ch);
+                }
+                '[' if !in_quotes => {
+                    bracket_depth += 1;
+                    current.push(ch);
+                }
+                ']' if !in_quotes => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                    current.push(ch);
+                }
+                ',' if !in_quotes && paren_depth == 0 && bracket_depth == 0 => {
                     values.push(current.trim().to_string());
                     current.clear();
                 }
@@ -866,7 +933,8 @@ impl InsertTranslator {
         let mut current_row = Vec::new();
         let mut current_value = String::new();
         let mut in_quotes = false;
-        let mut paren_depth = 0;
+        let mut paren_depth: usize = 0;
+        let mut bracket_depth: usize = 0;
         let mut in_row = false;
         
         let chars: Vec<char> = values_content.chars().collect();
@@ -895,7 +963,7 @@ impl InsertTranslator {
                     paren_depth += 1;
                 }
                 ')' if !in_quotes => {
-                    paren_depth -= 1;
+                    paren_depth = paren_depth.saturating_sub(1);
                     if paren_depth == 0 && in_row {
                         // End of row
                         if !current_value.trim().is_empty() {
@@ -909,7 +977,15 @@ impl InsertTranslator {
                         current_value.push(ch);
                     }
                 }
-                ',' if !in_quotes && in_row => {
+                '[' if !in_quotes && in_row => {
+                    bracket_depth += 1;
+                    current_value.push(ch);
+                }
+                ']' if !in_quotes && in_row => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                    current_value.push(ch);
+                }
+                ',' if !in_quotes && in_row && paren_depth == 1 && bracket_depth == 0 => {
                     // End of value within row
                     current_row.push(current_value.trim().to_string());
                     current_value.clear();

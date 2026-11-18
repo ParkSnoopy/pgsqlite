@@ -1,3 +1,27 @@
+/// Returns true if a ROLLBACK command is rolling back to a SAVEPOINT
+/// (e.g. `ROLLBACK TO SAVEPOINT sp1`, `ROLLBACK WORK TO sp1`, `ROLLBACK TRANSACTION TO SAVEPOINT sp1`).
+#[inline]
+pub fn is_rollback_to_savepoint(query: &str) -> bool {
+    let mut tokens = query.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    if !first.eq_ignore_ascii_case("ROLLBACK") {
+        return false;
+    }
+    match tokens.next() {
+        Some(next) if next.eq_ignore_ascii_case("TO") => true,
+        Some(next)
+            if next.eq_ignore_ascii_case("WORK") || next.eq_ignore_ascii_case("TRANSACTION") =>
+        {
+            tokens
+                .next()
+                .is_some_and(|t| t.eq_ignore_ascii_case("TO"))
+        }
+        _ => false,
+    }
+}
+
 /// Optimized query type detection utilities to avoid expensive to_uppercase() calls
 pub struct QueryTypeDetector;
 
@@ -77,7 +101,12 @@ impl QueryTypeDetector {
         
         if bytes.len() >= 8 {
             match &bytes[0..8] {
-                b"ROLLBACK" | b"rollback" | b"Rollback" => return QueryType::Rollback,
+                b"ROLLBACK" | b"rollback" | b"Rollback" => {
+                    if is_rollback_to_savepoint(trimmed) {
+                        return QueryType::Other;
+                    }
+                    return QueryType::Rollback;
+                }
                 b"TRUNCATE" | b"truncate" | b"Truncate" => return QueryType::Truncate,
                 _ => {}
             }
@@ -111,7 +140,11 @@ impl QueryTypeDetector {
             && (trimmed.len() == 3 || trimmed.as_bytes()[3].is_ascii_whitespace()) {
             QueryType::Commit
         } else if trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("ROLLBACK") {
-            QueryType::Rollback
+            if is_rollback_to_savepoint(trimmed) {
+                QueryType::Other
+            } else {
+                QueryType::Rollback
+            }
         } else if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("COMMENT") {
             QueryType::Comment
         } else if trimmed.len() >= 2 && trimmed[..2].eq_ignore_ascii_case("DO")

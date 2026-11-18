@@ -31,7 +31,7 @@ static ARRAY_SLICE_REGEX: Lazy<Regex> = Lazy::new(|| {
 });
 
 static ANY_OPERATOR_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?i)('[^']+'|"[^"]+"|\$\d+(?:::[\w\[\]]+)?|[\w\.]+)\s*(=|@>)\s*ANY\s*\(\s*('[^']+'|"[^"]+"|\$\d+(?:::[\w\[\]]+)?|ARRAY\s*\[[^\]]*\]|[\w\.]+)\s*\)"#).unwrap()
+    Regex::new(r#"(?i)(CAST\s*\((?:[^()]|\([^()]*\))*\)|'[^']*'|"[^"]+"(?:\s*\.\s*"[^"]+")?|\$\d+(?:::[\w\[\]]+)?|[\w\.]+)\s*(=|@>)\s*ANY\s*\(\s*('[^']*'|"[^"]+"(?:\s*\.\s*"[^"]+")?|\$\d+(?:::[\w\[\]]+)?|ARRAY\s*\[[^\]]*\]|[\w\.]+)\s*\)"#).unwrap()
 });
 
 static ALL_OPERATOR_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -136,16 +136,17 @@ impl ArrayTranslator {
         
         let mut result = sql.to_string();
         
-        // Translate ARRAY[...] literals first (most specific)
+        // Translate ANY/ALL operators BEFORE ARRAY[...] literals so `= ANY(ARRAY[...])`
+        // converts cleanly to `IN (...)` instead of `ANY(json_array(...))`.
+        result = Self::translate_any_operator(&result)?;
+        result = Self::translate_all_operator(&result)?;
+        
+        // Translate ARRAY[...] literals
         result = Self::translate_array_literals(&result)?;
         
         // Translate array subscript access
         result = Self::translate_array_subscript(&result)?;
         result = Self::translate_array_slice(&result)?;
-        
-        // Translate ANY/ALL operators
-        result = Self::translate_any_operator(&result)?;
-        result = Self::translate_all_operator(&result)?;
         
         // Translate array operators
         result = Self::translate_contains_operator(&result)?;
@@ -166,16 +167,17 @@ impl ArrayTranslator {
         let mut result = sql.to_string();
         let mut metadata = TranslationMetadata::new();
         
-        // Translate ARRAY[...] literals first (most specific)
+        // Translate ANY/ALL operators BEFORE ARRAY[...] literals so `= ANY(ARRAY[...])`
+        // converts cleanly to `IN (...)` instead of `ANY(json_array(...))`.
+        result = Self::translate_any_operator(&result)?;
+        result = Self::translate_all_operator(&result)?;
+        
+        // Translate ARRAY[...] literals
         result = Self::translate_array_literals(&result)?;
         
         // Translate array subscript access
         result = Self::translate_array_subscript(&result)?;
         result = Self::translate_array_slice(&result)?;
-        
-        // Translate ANY/ALL operators
-        result = Self::translate_any_operator(&result)?;
-        result = Self::translate_all_operator(&result)?;
         
         // Translate array operators
         result = Self::translate_contains_operator(&result)?;
@@ -329,25 +331,134 @@ impl ArrayTranslator {
         Ok(result)
     }
     
+    /// Scan a balanced pair of delimiters (`open`..`close`) starting at `open_pos`, ignoring quoted strings.
+    fn find_balanced_delimiter(s: &str, open_pos: usize, open: u8, close: u8) -> Option<usize> {
+        let bytes = s.as_bytes();
+        if open_pos >= bytes.len() || bytes[open_pos] != open {
+            return None;
+        }
+        let mut depth = 0usize;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut i = open_pos;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_single {
+                if b == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_single = false;
+                }
+            } else if in_double {
+                if b == b'"' {
+                    in_double = false;
+                }
+            } else {
+                match b {
+                    b'\'' => in_single = true,
+                    b'"' => in_double = true,
+                    x if x == open => depth += 1,
+                    x if x == close => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Rewrite `<lhs> = ANY (ARRAY[...])` or `<lhs> = ANY (json_array(...))` to `<lhs> IN (...)`.
+    fn rewrite_eq_any_list(sql: &str) -> String {
+        static EQ_ANY_PREFIX: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(
+                r#"(?i)(CAST\s*\((?:[^()]|\([^()]*\))*\)|'(?:[^']|'')*'|"(?:[^"]|"")+"(?:\s*\.\s*"(?:[^"]|"")+")*|\w+(?:\.\w+)*|\$\d+(?:::[\w\[\]]+)?|%\([^)]+\)s(?:::[\w\[\]]+)?)\s*=\s*ANY\s*\("#,
+            )
+            .unwrap()
+        });
+
+        let mut out = String::with_capacity(sql.len());
+        let mut pos = 0usize;
+
+        while let Some(m) = EQ_ANY_PREFIX.captures(&sql[pos..]) {
+            let full = m.get(0).unwrap();
+            let abs_start = pos + full.start();
+            let abs_open_paren = pos + full.end() - 1;
+
+            if Self::is_inside_string(sql, abs_start) {
+                out.push_str(&sql[pos..abs_open_paren + 1]);
+                pos = abs_open_paren + 1;
+                continue;
+            }
+
+            let Some(abs_close_paren) = Self::find_balanced_delimiter(sql, abs_open_paren, b'(', b')') else {
+                out.push_str(&sql[pos..abs_open_paren + 1]);
+                pos = abs_open_paren + 1;
+                continue;
+            };
+
+            let inner = &sql[abs_open_paren + 1..abs_close_paren];
+            let inner_trimmed = inner.trim();
+            let inner_upper = inner_trimmed.to_ascii_uppercase();
+
+            let list_contents = if inner_upper.starts_with("ARRAY") {
+                let after_kw = inner_trimmed[5..].trim_start();
+                if let Some(bracket_rel) = after_kw.find('[')
+                    && bracket_rel == 0
+                    && let Some(end_bracket) = Self::find_balanced_delimiter(after_kw, 0, b'[', b']')
+                    && after_kw[end_bracket + 1..].trim().is_empty()
+                {
+                    Some(after_kw[1..end_bracket].trim())
+                } else {
+                    None
+                }
+            } else if inner_upper.starts_with("JSON_ARRAY") {
+                let after_kw = inner_trimmed[10..].trim_start();
+                if after_kw.starts_with('(')
+                    && let Some(end_paren) = Self::find_balanced_delimiter(after_kw, 0, b'(', b')')
+                    && after_kw[end_paren + 1..].trim().is_empty()
+                {
+                    Some(after_kw[1..end_paren].trim())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(items) = list_contents {
+                let lhs = m.get(1).unwrap().as_str();
+                out.push_str(&sql[pos..abs_start]);
+                let replacement = format!("{lhs} IN ({items})");
+                debug!(
+                    "ArrayTranslator: Converting ANY(...) list to IN: {} -> {}",
+                    &sql[abs_start..=abs_close_paren],
+                    replacement
+                );
+                out.push_str(&replacement);
+                pos = abs_close_paren + 1;
+            } else {
+                out.push_str(&sql[pos..abs_open_paren + 1]);
+                pos = abs_open_paren + 1;
+            }
+        }
+
+        out.push_str(&sql[pos..]);
+        out
+    }
+
     /// Translate ANY operator: value = ANY(array) -> EXISTS(SELECT 1 FROM json_each(array) WHERE value = ?)
     fn translate_any_operator(sql: &str) -> Result<String, PgSqliteError> {
-        let mut result = sql.to_string();
+        // First handle `= ANY(ARRAY[...])` and `= ANY(json_array(...))` -> `IN (...)`
+        let mut result = Self::rewrite_eq_any_list(sql);
         
-        // First handle ANY(ARRAY[...]) patterns - common in catalog queries
-        // Example: pg_class.relkind = ANY (ARRAY['r', 'p', 'f', 'v', 'm'])
-        // Also handle parameter placeholders like $1, $2, etc (already converted from %(param)s)
-        let any_array_regex = Regex::new(r#"(\w+(?:\.\w+)*)\s*=\s*ANY\s*\(\s*ARRAY\s*\[((?:'[^']*'(?:\s*,\s*'[^']*')*)|(?:\$\d+(?:\s*,\s*\$\d+)*)|(?:%\([^)]+\)s(?:\s*,\s*%\([^)]+\)s)*))\]\s*\)"#).unwrap();
-        while let Some(captures) = any_array_regex.captures(&result) {
-            let column = &captures[1];
-            let values = &captures[2];
-            
-            // Convert to IN clause for better performance
-            let replacement = format!("{column} IN ({values})");
-            debug!("ArrayTranslator: Converting ANY(ARRAY[...]) to IN: {} -> {}", &captures[0], &replacement);
-            result = result.replace(&captures[0], &replacement);
-        }
-        
-        // Then handle regular ANY(column) patterns
+        // Then handle regular ANY(column/param) patterns
         while let Some(captures) = ANY_OPERATOR_REGEX.captures(&result) {
             let mut value = captures[1].to_string();
             let op = &captures[2];

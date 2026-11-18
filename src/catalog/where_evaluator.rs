@@ -55,6 +55,7 @@ impl WhereEvaluator {
                     true
                 }
             }
+            Expr::Nested(inner) => Self::evaluate(inner, row_data, column_mapping),
             _ => {
                 debug!("Unsupported WHERE expression type: {:?}", expr);
                 true // Default to including the row if we can't evaluate
@@ -297,6 +298,9 @@ impl WhereEvaluator {
             },
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 Self::get_column_value(expr, row_data)
+            }
+            Expr::Cast { expr, .. } | Expr::Nested(expr) => {
+                Self::get_expression_value(expr, row_data)
             }
             _ => None,
         }

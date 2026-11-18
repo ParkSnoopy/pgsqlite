@@ -82,7 +82,7 @@ impl EnumMetadata {
         // Ensure metadata tables exist
         Self::init(conn)?;
         
-        let tx = conn.transaction()?;
+        let tx = conn.savepoint()?;
         
         // Generate type OID
         let type_oid = Self::generate_type_oid(type_name);
@@ -119,7 +119,7 @@ impl EnumMetadata {
         before_value: Option<&str>,
         after_value: Option<&str>,
     ) -> Result<()> {
-        let tx = conn.transaction()?;
+        let tx = conn.savepoint()?;
         
         // Get type OID
         let type_oid: i32 = tx.query_row(
@@ -309,7 +309,7 @@ impl EnumMetadata {
     
     /// Drop an ENUM type and all its values
     pub fn drop_enum_type(conn: &mut Connection, type_name: &str) -> Result<()> {
-        let tx = conn.transaction()?;
+        let tx = conn.savepoint()?;
         
         // Get type OID
         let type_oid: i32 = tx.query_row(

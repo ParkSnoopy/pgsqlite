@@ -162,7 +162,7 @@ class SQLAlchemyTestSuite:
             
             # Create connection string based on driver
             if self.driver == "psycopg2":
-                connection_string = f"postgresql://postgres:postgres@localhost:{self.port}/main"
+                connection_string = f"postgresql+psycopg2://postgres:postgres@localhost:{self.port}/main"
             elif self.driver in ["psycopg3-text", "psycopg3-binary"]:
                 # Use psycopg3 driver URL scheme
                 connection_string = f"postgresql+psycopg://postgres:postgres@localhost:{self.port}/main"

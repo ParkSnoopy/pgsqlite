@@ -25,6 +25,8 @@ pub struct SessionState {
     pub parameters: RwLock<HashMap<String, String>>,
     pub prepared_statements: RwLock<HashMap<String, PreparedStatement>>,
     pub portals: RwLock<HashMap<String, Portal>>,
+    pub described_statements: RwLock<std::collections::HashSet<String>>,
+    pub described_portals: RwLock<std::collections::HashSet<String>>,
     pub transaction_status: RwLock<TransactionStatus>,
     pub portal_manager: Arc<super::PortalManager>,
     pub python_param_mapping: RwLock<HashMap<String, Vec<String>>>, // Maps statement name to Python parameter names
@@ -74,6 +76,8 @@ impl SessionState {
             parameters: RwLock::new(parameters),
             prepared_statements: RwLock::new(HashMap::new()),
             portals: RwLock::new(HashMap::new()),
+            described_statements: RwLock::new(std::collections::HashSet::new()),
+            described_portals: RwLock::new(std::collections::HashSet::new()),
             transaction_status: RwLock::new(TransactionStatus::Idle),
             portal_manager: Arc::new(super::PortalManager::new(100)), // Allow up to 100 concurrent portals
             python_param_mapping: RwLock::new(HashMap::new()),

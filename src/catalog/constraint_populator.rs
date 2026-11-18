@@ -6,7 +6,7 @@ use regex::Regex;
 
 // Pre-compiled regex patterns for constraint parsing
 static PK_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(\w+)\s+[^,\)]*\bPRIMARY\s+KEY\b").unwrap()
+    Regex::new(r"(?i)(?:[(,]\s*)([a-zA-Z_]\w*)\s+(?:[^,\(\)]+|\([^()]*\))*\bPRIMARY\s+KEY\b").unwrap()
 });
 
 static TABLE_PK_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -18,15 +18,11 @@ static UNIQUE_REGEX: Lazy<Regex> = Lazy::new(|| {
 });
 
 static TABLE_UNIQUE_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)UNIQUE\s*\(\s*([^)]+)\s*\)").unwrap()
+    Regex::new(r"(?i)(?:CONSTRAINT\s+(\w+)\s+)?UNIQUE\s*\(\s*([^)]+)\s*\)").unwrap()
 });
 
-static CHECK_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)CHECK\s*\(\s*([^)]+)\s*\)").unwrap()
-});
-
-static NOT_NULL_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(\w+)\s+[^,\)]*\bNOT\s+NULL\b").unwrap()
+static CHECK_START_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:CONSTRAINT\s+(\w+)\s+)?CHECK\s*\(").unwrap()
 });
 
 static DEFAULT_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -34,7 +30,7 @@ static DEFAULT_REGEX: Lazy<Regex> = Lazy::new(|| {
 });
 
 static FOREIGN_KEY_REGEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)FOREIGN\s+KEY\s*\(\s*([^)]+)\s*\)\s+REFERENCES\s+(\w+)\s*\(\s*([^)]+)\s*\)").unwrap()
+    Regex::new(r"(?i)(?:CONSTRAINT\s+(\w+)\s+)?FOREIGN\s+KEY\s*\(\s*([^)]+)\s*\)\s+REFERENCES\s+(\w+)\s*\(\s*([^)]+)\s*\)").unwrap()
 });
 
 static INLINE_FOREIGN_KEY_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -71,6 +67,23 @@ pub fn populate_constraints_for_table(conn: &Connection, table_name: &str) -> Re
 
     info!("Successfully populated constraints for table: {}", table_name);
     Ok(())
+}
+
+/// Refresh `pg_index` and constraint index links for a table (e.g. after `CREATE INDEX`).
+pub fn populate_index_for_table(conn: &Connection, table_name: &str) -> Result<()> {
+    let table_oid = generate_table_oid(table_name);
+    populate_table_indexes(conn, table_name, &table_oid)
+}
+
+/// Extract target table name from `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table_name (...)`.
+pub fn extract_table_name_from_create_index(query: &str) -> Option<String> {
+    static CREATE_INDEX_TABLE_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(?i)CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"[^"]+"|\w+)\s+ON\s+(?:"([^"]+)"|([a-zA-Z_][a-zA-Z0-9_]*))"#).unwrap()
+    });
+    let caps = CREATE_INDEX_TABLE_RE.captures(query)?;
+    caps.get(1)
+        .or_else(|| caps.get(2))
+        .map(|m| m.as_str().to_string())
 }
 
 /// Get the CREATE TABLE statement for a table from sqlite_master
@@ -150,9 +163,9 @@ fn populate_table_constraints(conn: &Connection, table_name: &str, create_sql: &
                      constraint.oid, constraint.name, table_oid, ref_table_oid, col_nums.join(","), "1");
             let result = conn.execute(
                 "INSERT OR IGNORE INTO pg_constraint (
-                    oid, conname, contype, conrelid, confrelid, conkey, confkey,
+                    oid, conname, contype, conrelid, confrelid, conkey, confkey, consrc,
                     confupdtype, confdeltype, confmatchtype, conislocal, convalidated
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![
                     constraint.oid,                           // oid as TEXT
                     constraint.name,
@@ -161,6 +174,7 @@ fn populate_table_constraints(conn: &Connection, table_name: &str, create_sql: &
                     ref_table_oid,                           // confrelid as TEXT (to match pg_class.oid)
                     col_nums.join(","),    // Column numbers as comma-separated list (no braces for LIKE pattern)
                     "1".to_string(),       // Default to column 1 of referenced table
+                    constraint.definition,
                     "a".to_string(),   // NO ACTION (default)
                     "a".to_string(),   // NO ACTION (default)
                     "s".to_string(),   // SIMPLE (default)
@@ -211,12 +225,13 @@ fn populate_column_defaults(conn: &Connection, table_name: &str, create_sql: &st
     for default in defaults {
         conn.execute(
             "INSERT OR IGNORE INTO pg_attrdef (
-                oid, adrelid, adnum, adsrc
-            ) VALUES (?1, ?2, ?3, ?4)",
+                oid, adrelid, adnum, adbin, adsrc
+            ) VALUES (?1, ?2, ?3, ?4, ?5)",
             [
                 &default.oid,
                 table_oid,
                 &default.column_num.to_string(),
+                &default.default_expr,
                 &default.default_expr,
             ]
         )?;
@@ -257,14 +272,11 @@ fn populate_table_indexes(conn: &Connection, table_name: &str, table_oid: &str) 
         Ok((seq, name, is_unique, origin, partial))
     })?;
 
+    let mut constraint_indexes: Vec<(String, String, bool, bool)> = Vec::new();
+
     for index_result in index_rows {
         let (_seq, index_name, is_unique, origin, _partial) = index_result?;
-        let index_oid = generate_constraint_oid(&index_name, "i");
-
-        // Skip auto-indexes created by SQLite for unique constraints
-        if index_name.starts_with("sqlite_") {
-            continue;
-        }
+        let index_oid = crate::utils::generate_table_oid(&index_name).to_string();
 
         // Get column information for this index using PRAGMA index_info
         let query = format!("PRAGMA index_info({})", index_name);
@@ -288,34 +300,112 @@ fn populate_table_indexes(conn: &Connection, table_name: &str, table_oid: &str) 
             }
         }
 
-        // Build indkey field (space-separated column numbers, PostgreSQL format)
+        let indkey_csv = column_numbers.join(",");
         let indkey = column_numbers.join(" ");
+        let indoption = vec!["0"; column_count.max(1)].join(" ");
 
         // Determine if this is a primary key index
         let is_primary = origin == "pk" || index_name.contains("primary") || index_name.contains("pkey");
+        if is_primary || origin == "u" {
+            constraint_indexes.push((index_oid.clone(), indkey_csv.clone(), is_primary, is_unique));
+        }
+
+        // Skip sqlite_autoindex rows from user-index queries ONLY if not backing a constraint?
+        // Actually SQLAlchemy keeps constraint-backed indexes linked via conindid (`has_constraint`),
+        // except sqlite_autoindex should only be recorded when backing PK/UNIQUE constraints so
+        // get_indexes() returns explicit indexes while get_unique_constraints()/get_pk_constraint() work.
+        if index_name.starts_with("sqlite_") && !is_primary && origin != "u" {
+            continue;
+        }
 
         conn.execute(
-            "INSERT OR IGNORE INTO pg_index (
+            "INSERT OR REPLACE INTO pg_index (
                 indexrelid, indrelid, indnatts, indnkeyatts,
                 indisunique, indisprimary, indkey,
                 indisexclusion, indimmediate, indisclustered,
                 indisvalid, indcheckxmin, indisready, indislive,
                 indisreplident, indcollation, indclass, indoption,
                 indexprs, indpred
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1, 0, 1, 0, 1, 1, 0, '', '', '', '', '')",
-            [
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1, 0, 1, 0, 1, 1, 0, '', '', ?8, '', '')",
+            rusqlite::params![
                 &index_oid,
                 table_oid,
-                &column_count.to_string(),
-                &column_count.to_string(), // For regular indexes, indnkeyatts = indnatts
-                &(is_unique as i32).to_string(),
-                &(is_primary as i32).to_string(),
+                column_count as i32,
+                column_count as i32, // For regular indexes, indnkeyatts = indnatts
+                is_unique as i32,
+                is_primary as i32,
                 &indkey,
+                &indoption,
             ]
         )?;
 
         debug!("Inserted index: {} (unique: {}, primary: {}, columns: {}) for table: {}",
                index_name, is_unique, is_primary, indkey, table_name);
+    }
+
+    // Link pg_constraint PK/UNIQUE rows to matching pg_index entries, creating synthetic pg_index
+    // rows for INTEGER PRIMARY KEY (which SQLite backs via rowid rather than sqlite_autoindex).
+    let mut con_stmt = conn.prepare(
+        "SELECT oid, conname, contype, conkey FROM pg_constraint WHERE conrelid = ?1 AND contype IN ('p', 'u')"
+    )?;
+    let con_rows: Vec<(String, String, String, String)> = con_stmt
+        .query_map([table_oid], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3).unwrap_or_default(),
+            ))
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    drop(con_stmt);
+
+    for (con_oid, con_name, contype, conkey_csv) in con_rows {
+        let is_pk = contype == "p";
+        let matched_idx_oid = constraint_indexes
+            .iter()
+            .find(|(_, idx_csv, pk, _)| *pk == is_pk && *idx_csv == conkey_csv)
+            .map(|(oid, _, _, _)| oid.clone());
+
+        let idx_oid = if let Some(oid) = matched_idx_oid {
+            oid
+        } else {
+            let synthetic_oid = crate::utils::generate_table_oid(&format!("__idx_{table_name}_{con_name}")).to_string();
+            let col_nums: Vec<&str> = conkey_csv
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            let n_cols = col_nums.len().max(1) as i32;
+            let indkey = col_nums.join(" ");
+            let indoption = vec!["0"; n_cols.max(1) as usize].join(" ");
+            conn.execute(
+                "INSERT OR IGNORE INTO pg_index (
+                    indexrelid, indrelid, indnatts, indnkeyatts,
+                    indisunique, indisprimary, indkey,
+                    indisexclusion, indimmediate, indisclustered,
+                    indisvalid, indcheckxmin, indisready, indislive,
+                    indisreplident, indcollation, indclass, indoption,
+                    indexprs, indpred
+                ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, 0, 1, 0, 1, 0, 1, 1, 0, '', '', ?7, '', '')",
+                rusqlite::params![
+                    &synthetic_oid,
+                    table_oid,
+                    n_cols,
+                    n_cols,
+                    is_pk as i32,
+                    &indkey,
+                    &indoption,
+                ]
+            )?;
+            synthetic_oid
+        };
+
+        let _ = conn.execute(
+            "UPDATE pg_constraint SET conindid = CAST(?1 AS INTEGER) WHERE oid = ?2",
+            rusqlite::params![&idx_oid, &con_oid],
+        );
     }
 
     Ok(())
@@ -348,30 +438,40 @@ fn parse_table_constraints(table_name: &str, create_sql: &str) -> Vec<Constraint
     // Look for both inline PRIMARY KEY and table-level PRIMARY KEY
     for cap in PK_REGEX.captures_iter(create_sql) {
         if let Some(column_name) = cap.get(1) {
+            let col = column_name.as_str();
+            if matches!(
+                col.to_ascii_uppercase().as_str(),
+                "CREATE" | "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN"
+            ) {
+                continue;
+            }
             constraints.push(ConstraintInfo {
                 oid: generate_constraint_oid(&format!("{table_name}_pkey"), "p"),
                 name: format!("{table_name}_pkey"),
                 contype: "p".to_string(),
-                columns: vec![column_name.as_str().to_string()],
+                columns: vec![col.to_string()],
                 definition: "PRIMARY KEY".to_string(),
             });
         }
     }
     
-    // Parse table-level PRIMARY KEY constraints
+    // Parse table-level PRIMARY KEY constraints (avoid duplicating inline PK if already captured)
     for cap in TABLE_PK_REGEX.captures_iter(create_sql) {
         if let Some(columns_str) = cap.get(1) {
             let columns: Vec<String> = columns_str.as_str()
                 .split(',')
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())
                 .collect();
-            constraints.push(ConstraintInfo {
-                oid: generate_constraint_oid(&format!("{table_name}_pkey"), "p"),
-                name: format!("{table_name}_pkey"),
-                contype: "p".to_string(),
-                columns,
-                definition: "PRIMARY KEY".to_string(),
-            });
+            if !columns.is_empty() && !constraints.iter().any(|c| c.contype == "p") {
+                constraints.push(ConstraintInfo {
+                    oid: generate_constraint_oid(&format!("{table_name}_pkey"), "p"),
+                    name: format!("{table_name}_pkey"),
+                    contype: "p".to_string(),
+                    columns,
+                    definition: "PRIMARY KEY".to_string(),
+                });
+            }
         }
     }
     
@@ -390,12 +490,15 @@ fn parse_table_constraints(table_name: &str, create_sql: &str) -> Vec<Constraint
     
     // Parse table-level UNIQUE constraints
     for cap in TABLE_UNIQUE_REGEX.captures_iter(create_sql) {
-        if let Some(columns_str) = cap.get(1) {
+        if let Some(columns_str) = cap.get(2) {
             let columns: Vec<String> = columns_str.as_str()
                 .split(',')
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim().trim_matches('"').to_string())
                 .collect();
-            let constraint_name = format!("{}_{}_key", table_name, columns.join("_"));
+            let constraint_name = cap
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| format!("{}_{}_key", table_name, columns.join("_")));
             constraints.push(ConstraintInfo {
                 oid: generate_constraint_oid(&constraint_name, "u"),
                 name: constraint_name,
@@ -406,30 +509,40 @@ fn parse_table_constraints(table_name: &str, create_sql: &str) -> Vec<Constraint
         }
     }
     
-    // Parse CHECK constraints
-    for (i, cap) in CHECK_REGEX.captures_iter(create_sql).enumerate() {
-        if let Some(check_expr) = cap.get(1) {
-            let constraint_name = format!("{}_check{}", table_name, i + 1);
-            constraints.push(ConstraintInfo {
-                oid: generate_constraint_oid(&constraint_name, "c"),
-                name: constraint_name,
-                contype: "c".to_string(),
-                columns: vec![], // CHECK constraints don't have specific columns
-                definition: format!("CHECK ({})", check_expr.as_str()),
-            });
+    // Parse CHECK constraints using balanced parenthesis matching
+    for (i, cap) in CHECK_START_REGEX.captures_iter(create_sql).enumerate() {
+        let m = cap.get(0).unwrap();
+        let open_paren_pos = m.end() - 1;
+        let rest = &create_sql[open_paren_pos..];
+        let mut depth = 0usize;
+        let mut in_sq = false;
+        let mut end_idx = None;
+        for (idx, ch) in rest.char_indices() {
+            match ch {
+                '\'' => in_sq = !in_sq,
+                '(' if !in_sq => depth += 1,
+                ')' if !in_sq => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_idx = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
         }
-    }
-    
-    // Parse NOT NULL constraints (treated as check constraints in PostgreSQL)
-    for cap in NOT_NULL_REGEX.captures_iter(create_sql) {
-        if let Some(column_name) = cap.get(1) {
-            let constraint_name = format!("{}_{}_not_null", table_name, column_name.as_str());
+        if let Some(end) = end_idx {
+            let expr = rest[1..end].trim();
+            let constraint_name = cap
+                .get(1)
+                .map(|g| g.as_str().to_string())
+                .unwrap_or_else(|| format!("{}_check{}", table_name, i + 1));
             constraints.push(ConstraintInfo {
                 oid: generate_constraint_oid(&constraint_name, "c"),
                 name: constraint_name,
                 contype: "c".to_string(),
-                columns: vec![column_name.as_str().to_string()],
-                definition: format!("{} IS NOT NULL", column_name.as_str()),
+                columns: vec![],
+                definition: format!("CHECK ({expr})"),
             });
         }
     }
@@ -437,24 +550,31 @@ fn parse_table_constraints(table_name: &str, create_sql: &str) -> Vec<Constraint
     // Parse table-level FOREIGN KEY constraints
     for cap in FOREIGN_KEY_REGEX.captures_iter(create_sql) {
         if let (Some(local_columns), Some(ref_table), Some(ref_columns)) =
-            (cap.get(1), cap.get(2), cap.get(3)) {
+            (cap.get(2), cap.get(3), cap.get(4)) {
             let local_cols: Vec<String> = local_columns.as_str()
                 .split(',')
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim().trim_matches('"').to_string())
                 .collect();
             let ref_cols: Vec<String> = ref_columns.as_str()
                 .split(',')
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim().trim_matches('"').to_string())
                 .collect();
 
-            let constraint_name = format!("{}_{}_fkey", table_name, local_cols.join("_"));
+            let constraint_name = cap
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| format!("{}_{}_fkey", table_name, local_cols.join("_")));
             constraints.push(ConstraintInfo {
                 oid: generate_constraint_oid(&constraint_name, "f"),
                 name: constraint_name,
                 contype: "f".to_string(),
-                columns: local_cols,
-                definition: format!("FOREIGN KEY REFERENCES {}({})",
-                                  ref_table.as_str(), ref_cols.join(", ")),
+                columns: local_cols.clone(),
+                definition: format!(
+                    "FOREIGN KEY ({}) REFERENCES {}({})",
+                    local_cols.join(", "),
+                    ref_table.as_str(),
+                    ref_cols.join(", ")
+                ),
             });
         }
     }
@@ -471,8 +591,12 @@ fn parse_table_constraints(table_name: &str, create_sql: &str) -> Vec<Constraint
                 name: constraint_name,
                 contype: "f".to_string(),
                 columns: vec![column_name.as_str().to_string()],
-                definition: format!("FOREIGN KEY REFERENCES {}({})",
-                                  ref_table.as_str(), ref_column.as_str()),
+                definition: format!(
+                    "FOREIGN KEY ({}) REFERENCES {}({})",
+                    column_name.as_str(),
+                    ref_table.as_str(),
+                    ref_column.as_str()
+                ),
             });
         }
     }
@@ -501,8 +625,18 @@ fn parse_column_defaults(table_name: &str, create_sql: &str) -> Vec<DefaultInfo>
     defaults
 }
 
+fn first_col_ident(col_def: &str) -> &str {
+    col_def
+        .trim_start()
+        .trim_start_matches('"')
+        .split(|c: char| c.is_whitespace() || c == '"')
+        .next()
+        .unwrap_or("")
+}
+
 /// Get the column number (1-based) for a given column name in a CREATE TABLE statement
 fn get_column_number(create_sql: &str, target_column: &str) -> Option<i16> {
+    let target_clean = target_column.trim().trim_matches('"');
     // Extract the column definitions from CREATE TABLE
     if let Some(cap) = TABLE_REGEX.captures(create_sql)
         && let Some(columns_part) = cap.get(1) {
@@ -527,7 +661,7 @@ fn get_column_number(create_sql: &str, target_column: &str) -> Option<i16> {
                     ',' if paren_depth == 0 => {
                         // End of column definition
                         column_count += 1;
-                        if current_column.trim().starts_with(target_column) {
+                        if first_col_ident(&current_column).eq_ignore_ascii_case(target_clean) {
                             return Some(column_count);
                         }
                         current_column.clear();
@@ -541,7 +675,7 @@ fn get_column_number(create_sql: &str, target_column: &str) -> Option<i16> {
             // Check the last column
             if !current_column.trim().is_empty() {
                 column_count += 1;
-                if current_column.trim().starts_with(target_column) {
+                if first_col_ident(&current_column).eq_ignore_ascii_case(target_clean) {
                     return Some(column_count);
                 }
             }

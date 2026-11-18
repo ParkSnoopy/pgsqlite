@@ -80,6 +80,29 @@ impl PgSqliteError {
             },
         }
     }
+
+    /// Build a PostgreSQL `ErrorResponse` preserving constraint and type SQLSTATE codes.
+    pub fn to_error_response(&self, context: &str) -> protocol::ErrorResponse {
+        match self {
+            PgSqliteError::Validation(pg_err) => pg_err.to_error_response(),
+            PgSqliteError::Sqlite(sqlite_err) => error::sqlite_error_to_pg(sqlite_err, ""),
+            other => {
+                let msg = format!("{context}: {other}");
+                let code = if msg.contains("UNIQUE constraint failed") {
+                    "23505"
+                } else if msg.contains("FOREIGN KEY constraint failed") {
+                    "23503"
+                } else if msg.contains("NOT NULL constraint failed") {
+                    "23502"
+                } else if msg.contains("CHECK constraint failed") {
+                    "23514"
+                } else {
+                    "42000"
+                };
+                protocol::ErrorResponse::new("ERROR".to_string(), code.to_string(), msg)
+            }
+        }
+    }
 }
 
 // Test helper to expose connection handler
@@ -219,14 +242,7 @@ pub async fn handle_test_connection_with_pool(
                                 session.set_transaction_status(TransactionStatus::InFailedTransaction).await;
                             }
                             
-                            let err = match &e {
-                                PgSqliteError::Validation(pg_err) => pg_err.to_error_response(),
-                                _ => ErrorResponse::new(
-                                    "ERROR".to_string(),
-                                    "42000".to_string(),
-                                    format!("Query execution failed: {e}"),
-                                ),
-                            };
+                            let err = e.to_error_response("Query execution failed");
                             framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
                         }
                     }
@@ -259,14 +275,7 @@ pub async fn handle_test_connection_with_pool(
                             if session.in_transaction().await {
                                 session.set_transaction_status(TransactionStatus::InFailedTransaction).await;
                             }
-                            let err = match &e {
-                                PgSqliteError::Validation(pg_err) => pg_err.to_error_response(),
-                                _ => ErrorResponse::new(
-                                    "ERROR".to_string(),
-                                    "42000".to_string(),
-                                    format!("Bind failed: {e}"),
-                                ),
-                            };
+                            let err = e.to_error_response("Bind failed");
                             framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
                         }
                     }
@@ -279,14 +288,7 @@ pub async fn handle_test_connection_with_pool(
                             if session.in_transaction().await {
                                 session.set_transaction_status(TransactionStatus::InFailedTransaction).await;
                             }
-                            let err = match &e {
-                                PgSqliteError::Validation(pg_err) => pg_err.to_error_response(),
-                                _ => ErrorResponse::new(
-                                    "ERROR".to_string(),
-                                    "42000".to_string(),
-                                    format!("Execute failed: {e}"),
-                                ),
-                            };
+                            let err = e.to_error_response("Execute failed");
                             framed.send(BackendMessage::ErrorResponse(Box::new(err))).await?;
                         }
                     }

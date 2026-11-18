@@ -319,6 +319,19 @@ pub(crate) fn preprocess_query(query: &str) -> String {
         rewritten = JSON_CONCAT_3_RE.replace_all(&rewritten, "json_concat($1, $2, $3)").to_string();
         rewritten = JSON_CONCAT_2_RE.replace_all(&rewritten, "json_concat($1, $2)").to_string();
     }
+    if crate::types::SchemaTypeMapper::is_reflection_query(&rewritten)
+        || rewritten.contains("generate_subscripts")
+        || rewritten.contains("pg_table_is_visible")
+        || rewritten.contains("atthasdef")
+        || rewritten.contains("attisdropped")
+        || (rewritten.contains("format_type(") && rewritten.contains("pg_attribute"))
+        || rewritten.contains("pg_get_constraintdef(")
+    {
+        rewritten = crate::translator::CatalogFunctionTranslator::translate(&rewritten);
+        rewritten = crate::translator::SchemaPrefixTranslator::translate_pg_table_is_visible_for_pg_class(&rewritten);
+        rewritten = crate::translator::SchemaPrefixTranslator::translate_query(&rewritten);
+        rewritten = crate::translator::SchemaPrefixTranslator::translate_reflection_sql(&rewritten);
+    }
     if rewritten.contains("unnest") || rewritten.contains("UNNEST") {
         rewritten = crate::translator::UnnestTranslator::translate_unnest(&rewritten).unwrap_or(rewritten);
     }
@@ -930,9 +943,11 @@ impl QueryExecutor {
         
         // Check if we're in a failed transaction
         if session.get_transaction_status().await == TransactionStatus::InFailedTransaction {
-            // Only ROLLBACK is allowed in a failed transaction
+            // Only ROLLBACK (including ROLLBACK TO SAVEPOINT) is allowed in a failed transaction
             use crate::query::{QueryTypeDetector, QueryType};
-            if !matches!(QueryTypeDetector::detect_query_type(query), QueryType::Rollback) {
+            if !matches!(QueryTypeDetector::detect_query_type(query), QueryType::Rollback)
+                && !crate::query::is_rollback_to_savepoint(query)
+            {
                 return Err(PgSqliteError::Protocol(
                     "current transaction is aborted, commands ignored until end of transaction block".to_string()
                 ));
@@ -1088,11 +1103,13 @@ impl QueryExecutor {
                         }
                     }
                     
-                    let fields: Vec<FieldDescription> = response.columns.iter()
+                    let mut fields: Vec<FieldDescription> = response.columns.iter()
                         .enumerate()
                         .map(|(i, name)| {
-                            // We need to determine type OID before creating the closure
-                            let type_oid = if let Some(pg_type) = column_types.get(name) {
+                            // Resolve column type through direct name or alias-to-column mapping
+                            let pg_type_opt = column_types.get(name)
+                                .or_else(|| column_mappings.get(name).and_then(|real_col| column_types.get(real_col)));
+                            let type_oid = if let Some(pg_type) = pg_type_opt {
                                 // Try to get enum-aware type OID, fall back to basic type if fails
                                 crate::types::SchemaTypeMapper::pg_type_string_to_oid(pg_type)
                             } else {
@@ -1111,6 +1128,7 @@ impl QueryExecutor {
                         })
                         .collect();
                     
+                    crate::types::SchemaTypeMapper::apply_reflection_field_oids(&mut fields, query);
                     framed.send(BackendMessage::RowDescription(fields)).await
                         .map_err(PgSqliteError::Io)?;
                     
@@ -1174,8 +1192,22 @@ impl QueryExecutor {
                                             eprintln!("  As string: {:?}", std::str::from_utf8(&data));
                                         }
                                         
-                                        // Check for boolean columns
-                                        if boolean_columns.contains(col_name) {
+                                        // Convert JSON arrays in TEXT/VARCHAR/etc. array columns to PostgreSQL {a,b} text format
+                                        let col_pg_type = column_types.get(col_name)
+                                            .or_else(|| column_mappings.get(col_name).and_then(|real_col| column_types.get(real_col)));
+                                        if let Some(pg_type) = col_pg_type
+                                            && let Some(pt) = crate::types::PgType::from_oid(crate::types::SchemaTypeMapper::pg_type_string_to_oid(pg_type))
+                                                && pt.is_array()
+                                        {
+                                            match Self::convert_json_to_pg_array_for_oid(&data, pt.to_oid()) {
+                                                Ok(converted) => Some(converted),
+                                                Err(_) => Some(data),
+                                            }
+                                        }
+                                        // Check for boolean columns (direct or aliased via column_mappings)
+                                        else if boolean_columns.contains(col_name)
+                                            || column_mappings.get(col_name).is_some_and(|real_col| boolean_columns.contains(real_col))
+                                        {
                                             // Check if this looks like a boolean value
                                             match std::str::from_utf8(&data) {
                                                 Ok(s) => match s.trim() {
@@ -1485,11 +1517,14 @@ impl QueryExecutor {
             debug!("Query after JSON translation ($ placeholders preserved): {}", translated_query);
         }
         
-        // Translate catalog functions (remove pg_catalog prefix)
+        // Translate catalog functions, schema prefixes, and reflection SQL
         {
-            use crate::translator::{CatalogFunctionTranslator, PgTableIsVisibleTranslator};
+            use crate::translator::{CatalogFunctionTranslator, PgTableIsVisibleTranslator, SchemaPrefixTranslator};
             translated_query = CatalogFunctionTranslator::translate(&translated_query);
+            translated_query = SchemaPrefixTranslator::translate_pg_table_is_visible_for_pg_class(&translated_query);
             translated_query = PgTableIsVisibleTranslator::translate(&translated_query);
+            translated_query = SchemaPrefixTranslator::translate_query(&translated_query);
+            translated_query = SchemaPrefixTranslator::translate_reflection_sql(&translated_query);
         }
         
         // Translate array operators with metadata
@@ -2012,6 +2047,8 @@ impl QueryExecutor {
                 .collect();
             
             // Cache the field descriptions
+            let mut fields = fields;
+            crate::types::SchemaTypeMapper::apply_reflection_field_oids(&mut fields, query);
             GLOBAL_ROW_DESCRIPTION_CACHE.insert(cache_key, fields.clone());
             
             fields
@@ -2593,6 +2630,9 @@ impl QueryExecutor {
         use crate::ddl::EnumDdlHandler;
         use tracing::info;
 
+        crate::cache::GLOBAL_PARAMETER_CACHE.clear();
+        crate::cache::GLOBAL_ROW_DESCRIPTION_CACHE.clear();
+
         // Check if this is a CREATE DATABASE statement
         if matches!(QueryTypeDetector::detect_query_type(query), QueryType::Create) &&
            query.trim_start()[6..].trim_start().to_uppercase().starts_with("DATABASE") {
@@ -3147,6 +3187,13 @@ fn extract_trigger_function_body(query: &str) -> Option<(String, String)> {
                 }
                 Ok(())
             }).await?;
+        } else if let Some(table_name) = crate::catalog::constraint_populator::extract_table_name_from_create_index(query) {
+            db.with_session_connection(&session.id, |conn| {
+                if let Err(e) = crate::catalog::constraint_populator::populate_index_for_table(conn, &table_name) {
+                    debug!("Failed to populate indexes for table {}: {}", table_name, e);
+                }
+                Ok(())
+            }).await?;
         }
         
         // Handle cache invalidation for ALTER operations
@@ -3300,8 +3347,25 @@ fn extract_trigger_function_body(query: &str) -> Option<(String, String)> {
             let cached_conn = Self::get_or_cache_connection(session, db).await;
             db.execute_with_session_cached(query, &session.id, cached_conn.as_ref()).await?;
         }
-        
-        framed.send(BackendMessage::CommandComplete { tag: "OK".to_string() }).await
+
+        if crate::query::is_rollback_to_savepoint(query)
+            && session.get_transaction_status().await == crate::protocol::TransactionStatus::InFailedTransaction
+        {
+            session.set_transaction_status(crate::protocol::TransactionStatus::InTransaction).await;
+        }
+
+        let trimmed_upper = query.trim_start().to_ascii_uppercase();
+        let tag = if trimmed_upper.starts_with("SAVEPOINT") {
+            "SAVEPOINT".to_string()
+        } else if trimmed_upper.starts_with("RELEASE") {
+            "RELEASE".to_string()
+        } else if crate::query::is_rollback_to_savepoint(query) {
+            "ROLLBACK".to_string()
+        } else {
+            "OK".to_string()
+        };
+
+        framed.send(BackendMessage::CommandComplete { tag }).await
             .map_err(PgSqliteError::Io)?;
         
         Ok(())
@@ -3421,7 +3485,7 @@ fn extract_trigger_function_body(query: &str) -> Option<(String, String)> {
                     // Check if this is an array type that needs conversion
                     if PgType::from_oid(type_oid).is_some_and(|t| t.is_array()) {
                         // Try to convert JSON array to PostgreSQL array format
-                        match Self::convert_json_to_pg_array(&data) {
+                        match Self::convert_json_to_pg_array_for_oid(&data, type_oid) {
                             Ok(converted_data) => Some(converted_data),
                             Err(_) => Some(data), // Keep original data if conversion fails
                         }
@@ -3496,6 +3560,37 @@ fn extract_trigger_function_body(query: &str) -> Option<(String, String)> {
         Ok(converted_rows)
     }
     
+    /// Convert JSON array string to PostgreSQL array format respecting element type OID (`bool[]` uses `t`/`f`).
+    pub fn convert_json_to_pg_array_for_oid(json_data: &[u8], type_oid: i32) -> Result<Vec<u8>, String> {
+        if type_oid == PgType::BoolArray.to_oid() {
+            Self::convert_json_to_pg_bool_array(json_data)
+        } else {
+            Self::convert_json_to_pg_array(json_data)
+        }
+    }
+
+    /// Convert JSON array of 0/1/bools to PostgreSQL bool[] literal format (`{t,f}`).
+    fn convert_json_to_pg_bool_array(json_data: &[u8]) -> Result<Vec<u8>, String> {
+        let s = std::str::from_utf8(json_data).map_err(|_| "Invalid UTF-8")?;
+        let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(s) else {
+            return Ok(json_data.to_vec());
+        };
+        let elements: Vec<&str> = arr
+            .iter()
+            .map(|elem| match elem {
+                serde_json::Value::Null => "NULL",
+                serde_json::Value::Bool(true) => "t",
+                serde_json::Value::Bool(false) => "f",
+                serde_json::Value::Number(n) if n.as_i64() == Some(0) => "f",
+                serde_json::Value::Number(_) => "t",
+                serde_json::Value::String(st) if matches!(st.as_str(), "t" | "true" | "TRUE" | "1") => "t",
+                serde_json::Value::String(st) if matches!(st.as_str(), "f" | "false" | "FALSE" | "0") => "f",
+                _ => "f",
+            })
+            .collect();
+        Ok(format!("{{{}}}", elements.join(",")).into_bytes())
+    }
+
     /// Convert JSON array string to PostgreSQL array format
     pub fn convert_json_to_pg_array(json_data: &[u8]) -> Result<Vec<u8>, String> {
         // Convert bytes to string
